@@ -27,5 +27,12 @@
     "clean": "rimraf dist",
     "lint": "tsc -p tsconfig.json --noEmit",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.10.0",
+    "ignore": "^7.0.5",
+    "minimatch": "^10.1.1",
+    "sqlite-vec": "^0.1.9",
+    "typescript": "^5.9.3"
   }
 }

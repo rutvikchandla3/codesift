@@ -1,0 +1,78 @@
+import { extname } from 'node:path'
+
+const LANGUAGE_BY_EXTENSION: Record<string, string> = {
+  '.cjs': 'javascript',
+  '.cts': 'typescript',
+  '.go': 'go',
+  '.java': 'java',
+  '.js': 'javascript',
+  '.json': 'json',
+  '.jsx': 'javascript',
+  '.md': 'markdown',
+  '.mdx': 'markdown',
+  '.mjs': 'javascript',
+  '.py': 'python',
+  '.rb': 'ruby',
+  '.rs': 'rust',
+  '.sh': 'shell',
+  '.ts': 'typescript',
+  '.tsx': 'typescript',
+  '.txt': 'text',
+  '.yaml': 'yaml',
+  '.yml': 'yaml'
+}
+
+const TEXT_FILE_NAMES = new Set(['Dockerfile', 'Makefile'])
+const BINARY_EXTENSIONS = new Set([
+  '.avif',
+  '.bmp',
+  '.class',
+  '.dll',
+  '.dylib',
+  '.exe',
+  '.gif',
+  '.ico',
+  '.jar',
+  '.jpeg',
+  '.jpg',
+  '.lockb',
+  '.mov',
+  '.mp3',
+  '.mp4',
+  '.pdf',
+  '.png',
+  '.so',
+  '.svgz',
+  '.tar',
+  '.tgz',
+  '.wasm',
+  '.webm',
+  '.webp',
+  '.zip'
+])
+
+export function detectLanguage(filePath: string): string | undefined {
+  const extension = extname(filePath).toLowerCase()
+  if (extension && LANGUAGE_BY_EXTENSION[extension]) {
+    return LANGUAGE_BY_EXTENSION[extension]
+  }
+
+  const basename = filePath.split('/').at(-1)
+  if (basename && TEXT_FILE_NAMES.has(basename)) {
+    return 'text'
+  }
+
+  return undefined
+}
+
+export function isBinaryPath(filePath: string): boolean {
+  return BINARY_EXTENSIONS.has(extname(filePath).toLowerCase())
+}
+
+export function isTypeScriptLike(language: string): boolean {
+  return language === 'typescript' || language === 'javascript'
+}
+
+export function isPythonLike(language: string): boolean {
+  return language === 'python'
+}

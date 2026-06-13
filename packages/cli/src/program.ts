@@ -34,7 +34,7 @@ export function formatStatus(status: RepoStatus): string {
 
 export function formatHits(hits: SearchHit[]): string {
   if (hits.length === 0) {
-    return 'No hits yet. The search pipeline lands in M1.'
+    return 'No hits found.'
   }
 
   return hits
@@ -48,7 +48,7 @@ export function formatHits(hits: SearchHit[]): string {
 
 export function formatSymbols(definitions: SymbolDefinition[]): string {
   if (definitions.length === 0) {
-    return 'No symbol matches yet. Symbol indexing lands in M2.'
+    return 'No symbol matches found.'
   }
 
   return definitions
@@ -76,7 +76,9 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
       const repo = await openRepo(path)
       const result = await repo.sync(options.rebuild ? { rebuild: true } : undefined)
 
-      io.stdout(`Scaffold only: indexed ${result.indexedFiles} files in ${repo.root}.`)
+      io.stdout(
+        `Indexed ${result.indexedFiles} files (${result.skippedFiles} skipped) in ${result.durationMs}ms at ${repo.root}.`
+      )
       if (options.watch) {
         io.stdout('Watch mode is reserved for M4.')
       }

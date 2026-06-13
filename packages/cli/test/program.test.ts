@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { formatHits, formatStatus, formatSymbols } from '../src/program.js'
 
-describe('codesift CLI scaffold formatters', () => {
+describe('codesift CLI formatters', () => {
   it('renders placeholder status output', () => {
     expect(
       formatStatus({
@@ -17,8 +17,8 @@ describe('codesift CLI scaffold formatters', () => {
     ).toContain('provider: unconfigured')
   })
 
-  it('renders placeholder empty states', () => {
-    expect(formatHits([])).toContain('M1')
-    expect(formatSymbols([])).toContain('M2')
+  it('renders empty states', () => {
+    expect(formatHits([])).toContain('No hits found')
+    expect(formatSymbols([])).toContain('No symbol matches found')
   })
 })
