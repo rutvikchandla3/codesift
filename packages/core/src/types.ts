@@ -20,12 +20,17 @@ export interface Range {
   endLine: number
 }
 
+export type SearchReasonTag = '=' | '~' | '+'
+
 export interface SearchHit {
   id: string
   file: string
   range: Range
   score: number
+  reason: SearchReasonTag
   snippet: string
+  snippetRange: Range
+  tokensReturned: number
   language?: string
   symbol?: string
   kind?: SymbolKind
@@ -58,6 +63,8 @@ export interface SearchOptions {
   lang?: string[]
   pathGlob?: string
   kind?: SymbolKind | SymbolKind[]
+  maxTokens?: number
+  singleBest?: boolean
 }
 
 export interface GrepOptions {

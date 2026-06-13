@@ -113,6 +113,9 @@ Verified in the working tree — M2 builds on, not re-implements, these:
 - **Daemon decision.** Per-spawn stdio = no resident model. The cheap half (zero-model lexical fast-path)
   already exists from M1. Decide in M2 whether the persistent per-machine daemon lands in M2 or slips to
   M4; either way publish **cold-first-query** as the headline latency metric in M2-5 (not "warm p50").
+  **Resolved:** daemon slips to M4; cold stdio is accepted as a measured one-time repo/client-session
+  startup tax because normal MCP clients keep the server process alive, so it is not treated as per-search
+  latency.
 - **Accept.** M2-5 reports cold-vs-warm latency split; a documented decision (with the measured crossover)
   on `vec0`/ANN and on daemon timing is recorded in `PLAN.md` §12.
 

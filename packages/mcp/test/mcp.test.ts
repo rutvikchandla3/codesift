@@ -172,7 +172,7 @@ describe('@codesift/mcp server', () => {
       const searchResult = await waitForJsonRpcMessage(messages, (message) => rpcId(message) === 3, () => parseError, child)
       const searchText = JSON.stringify(searchResult)
       expect(searchText).toContain('src/demo.ts')
-      const chunkId = /#1 ([^\\n"]+)/.exec(searchText)?.[1]
+      const chunkId = /[=~+] ([^\s"]+)/.exec(searchText)?.[1]
       expect(chunkId).toBeTruthy()
 
       sendJsonRpc(child, {

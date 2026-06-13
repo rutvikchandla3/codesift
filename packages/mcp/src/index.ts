@@ -49,6 +49,8 @@ export interface SearchCodeArgs {
   lang?: string[] | undefined
   path_glob?: string | undefined
   kind?: SearchOptions['kind'] | undefined
+  max_tokens?: number | undefined
+  single_best?: boolean | undefined
 }
 
 export interface FindSymbolArgs {
@@ -111,7 +113,7 @@ export interface McpRouter {
 export const MCP_SERVER_INSTRUCTIONS = [
   'codesift is the repo search tool. Prefer it before host grep/read-file flows because results are compact and include stable ids for follow-up reads.',
   'Routing policy: use find_symbol for exact identifiers/definitions; use grep_code for literal strings, env vars, error messages, operators, or regex; use search_code for concepts/behaviors/natural language.',
-  'For search_code, start with k=5-8 and read_chunk only for the best id. For grep_code, keep context_lines small unless the user asks for surrounding code.',
+  'For search_code, start with k=5-8, set max_tokens when context is tight, and read_chunk only for the best id. For grep_code, keep context_lines small unless the user asks for surrounding code.',
   'If index_status reports no index or stale data, suggest running codesift index before relying on results.'
 ].join('\n')
 
@@ -123,7 +125,9 @@ const searchCodeInputSchema = {
   k: z.number().int().positive().max(50).optional().describe('Maximum hits to return. Default is 8.'),
   lang: z.array(z.string().min(1)).optional().describe('Language filter, e.g. ["typescript"], ["python"].'),
   path_glob: z.string().min(1).optional().describe('Repo-relative glob, e.g. "src/**".'),
-  kind: kindFilterSchema.optional().describe('Symbol kind filter for matching chunks.')
+  kind: kindFilterSchema.optional().describe('Symbol kind filter for matching chunks.'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Maximum approximate tokens to return across compact hits. Default 700.'),
+  single_best: z.boolean().optional().describe('Return only the highest-confidence answer, useful for identifier-exact lookups.')
 }
 
 const findSymbolInputSchema = {
@@ -214,7 +218,9 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
         k: { type: 'integer', minimum: 1, maximum: 50, default: DEFAULT_SEARCH_K },
         lang: { type: 'array', items: { type: 'string' } },
         path_glob: { type: 'string' },
-        kind: kindJsonSchema()
+        kind: kindJsonSchema(),
+        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: 700 },
+        single_best: { type: 'boolean' }
       })
     },
     {
@@ -276,6 +282,11 @@ export function createRouter(repo: Repo): McpRouter {
 
       if (args.kind) {
         options.kind = args.kind
+      }
+
+      options.maxTokens = args.max_tokens ?? 700
+      if (args.single_best !== undefined) {
+        options.singleBest = args.single_best
       }
 
       return repo.search(args.query, options)
@@ -386,14 +397,16 @@ function formatMcpSearchHits(hits: SearchHit[]): string {
     return 'no_hits'
   }
 
-  return hits
-    .map((hit, index) => {
-      const range = formatRange(hit.range.startLine, hit.range.endLine)
+  const tokensReturned = hits.reduce((sum, hit) => sum + hit.tokensReturned, 0)
+  const body = hits
+    .map((hit) => {
       const symbol = hit.symbol ? ` ${hit.symbol}` : ''
       const snippet = compactSnippet(hit.snippet, 4)
-      return `#${index + 1} ${hit.id}\n${hit.file}:${range}${symbol}\n${snippet}`
+      return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${snippet ? ` | ${snippet}` : ''}`
     })
     .join('\n')
+
+  return `${body}\ntokensReturned=${tokensReturned}`
 }
 
 function formatMcpSymbols(definitions: SymbolDefinition[]): string {
@@ -412,12 +425,16 @@ function formatMcpGrepHits(hits: GrepHit[]): string {
   }
 
   return hits
-    .map((hit, index) => {
+    .map((hit) => {
       const range = formatRange(hit.range.startLine, hit.range.endLine)
       const snippet = compactSnippet(hit.snippet, 5)
-      return `#${index + 1} ${hit.file}:${range}:${hit.column} | ${snippet}`
+      return `${hit.file}:${range}:${hit.column} | ${snippet}`
     })
     .join('\n')
+}
+
+function formatChunkId(id: string): string {
+  return id.replace(/@[a-f0-9]{8,64}$/i, '')
 }
 
 function compactSnippet(snippet: string, maxLines: number): string {

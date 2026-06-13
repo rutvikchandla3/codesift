@@ -2,7 +2,7 @@
   "name": "@codesift/eval",
   "private": true,
   "version": "0.0.0",
-  "description": "Evaluation harness types and helpers for codesift.",
+  "description": "Evaluation harness and ripgrep parity gate for codesift.",
   "type": "module",
   "license": "MIT",
   "sideEffects": false,
@@ -20,9 +20,19 @@
   "files": [
     "dist"
   ],
+  "dependencies": {
+    "@codesift/core": "workspace:*",
+    "better-sqlite3": "^12.10.0",
+    "ignore": "^7.0.5",
+    "minimatch": "^10.1.1",
+    "sqlite-vec": "^0.1.9",
+    "typescript": "^5.9.3"
+  },
   "scripts": {
     "build": "tsup",
     "clean": "rimraf dist",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "bench": "pnpm --dir ../.. --filter @codesift/core build && pnpm --dir ../.. --filter @codesift/mcp build && pnpm --dir ../.. --filter codesift build && pnpm build && node ./dist/bench.js",
+    "bench:update": "pnpm --dir ../.. --filter @codesift/core build && pnpm --dir ../.. --filter @codesift/mcp build && pnpm --dir ../.. --filter codesift build && pnpm build && node ./dist/bench.js --update-losses"
   }
 }

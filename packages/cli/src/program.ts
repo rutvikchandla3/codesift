@@ -63,7 +63,7 @@ export function formatHits(hits: SearchHit[]): string {
     .map((hit) => {
       const range = `${hit.range.startLine}-${hit.range.endLine}`
       const symbol = hit.symbol ? ` · ${hit.symbol}` : ''
-      return `${hit.file}:${range}${symbol} · score=${hit.score.toFixed(4)}\n${hit.snippet}`
+      return `${hit.file}:${range}${symbol} · ${hit.reason} score=${hit.score.toFixed(4)}\n${hit.snippet}`
     })
     .join('\n\n')
 }
@@ -75,7 +75,6 @@ export function formatCompactHits(hits: SearchHit[]): string {
 
   return hits
     .map((hit) => {
-      const range = `${hit.range.startLine}-${hit.range.endLine}`
       const symbol = hit.symbol ? ` · ${hit.symbol}` : ''
       const snippet = hit.snippet
         .split('\n')
@@ -84,9 +83,13 @@ export function formatCompactHits(hits: SearchHit[]): string {
         .slice(0, 3)
         .join(' ↩ ')
 
-      return `${hit.file}:${range}${symbol} · ${hit.score.toFixed(4)}${snippet ? ` | ${snippet}` : ''}`
+      return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${snippet ? ` | ${snippet}` : ''}`
     })
     .join('\n')
+}
+
+export function formatChunkId(id: string): string {
+  return id.replace(/@[a-f0-9]{8,64}$/i, '')
 }
 
 export function formatSymbols(definitions: SymbolDefinition[]): string {
@@ -208,12 +211,13 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
     .option('--lang <langs>', 'comma-separated language filter, e.g. ts,typescript,python')
     .option('--path <glob>', 'path glob filter, e.g. src/**')
     .option('--kind <kind>', 'symbol kind filter for matching chunks')
+    .option('--max-tokens <tokens>', 'token budget for compact snippets')
     .option('--json', 'print JSON results')
     .option('--compact', 'print token-efficient compact results')
     .action(
       async (
         query: string,
-        options: { k: string; repo: string; lang?: string; path?: string; kind?: string; json?: boolean; compact?: boolean }
+        options: { k: string; repo: string; lang?: string; path?: string; kind?: string; maxTokens?: string; json?: boolean; compact?: boolean }
       ) => {
         await withCompatibilityHandling(io, async () => {
           const repo = await openRepo(options.repo)
@@ -223,6 +227,7 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
             lang?: string[]
             pathGlob?: string
             kind?: SymbolKind
+            maxTokens?: number
           } = {
             k: Number(options.k)
           }
@@ -237,6 +242,10 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
 
           if (options.kind) {
             searchOptions.kind = options.kind as SymbolKind
+          }
+
+          if (options.maxTokens !== undefined) {
+            searchOptions.maxTokens = Number(options.maxTokens)
           }
 
           const hits = await repo.search(query, searchOptions)

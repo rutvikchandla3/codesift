@@ -351,3 +351,25 @@ OQ#5), enforced by a network-egress CI test.
   `maxTokens` budget; report `tokensReturned`.
 - **OQ#5** (telemetry) → **none**, enforced by a network-egress CI test.
 - Default local `index` / `search` / `sym` / `status` flows are expected to remain fully offline; any outbound network use on that path is treated as a regression.
+
+### 12.8 M2 latency decisions recorded (2026-06-13)
+
+**Measured M2 corpus.** The M2 benchmark now clones pinned OSS repos at fixed refs (`jshttp/cookie`,
+`pallets/itsdangerous`, `sindresorhus/escape-string-regexp`) instead of local-only fixtures. Current
+indexed sizes are small (8 / 74 / 162 chunks), so M2 proves the agent path and publishes the cold gap; it
+is not a monorepo-scale vector benchmark.
+
+**`vec0` / ANN crossover.** Decision: when a learned embedding provider becomes a default-supported path,
+the vector arm moves off blob-column `ORDER BY vec_distance_cosine(...)` and onto sqlite-vec `vec0` for
+all learned-vector indexes. Brute-force `vec0` is the v0.1 local backend through **50k chunks**. At
+**100k chunks** (or earlier if the 50k synthetic warm vector p50 exceeds 150 ms), ANN becomes mandatory
+before claiming semantic/vector support for that repo size. Until then, large repos may keep exact/lexical
+search enabled while vector search is reported as degraded in `index_status`.
+
+**Daemon timing.** Decision: the persistent daemon does **not** land in M2. M2 now measures the honest
+stdio path (`codesift mcp` spawn → JSON-RPC initialize → first tool result) and records the cold latency
+startup tax in `packages/eval/losses.json`; this is accepted for M2 because MCP clients are expected to
+keep the stdio server alive, so the cost is paid once per repo/client session rather than once per
+search. Warm in-process queries are already faster than `rg` on the M2 set. The daemon is pulled into the
+M4 freshness/watch work so it can share the same long-lived process, prepared statements, model
+residency, and background sync lifecycle.

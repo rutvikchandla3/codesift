@@ -1,0 +1,68 @@
+{
+  "losses": [
+    {
+      "repoId": "cookie",
+      "queryId": "cookie-parse-identifier",
+      "queryType": "exact-identifier",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
+      "repoId": "cookie",
+      "queryId": "cookie-samesite-literal",
+      "queryType": "string-literal",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
+      "repoId": "escape-string-regexp",
+      "queryId": "escape-regexp-concept",
+      "queryType": "nl-concept",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
+      "repoId": "escape-string-regexp",
+      "queryId": "escape-regexp-type-error",
+      "queryType": "error-trace",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
+      "repoId": "itsdangerous",
+      "queryId": "itsdangerous-loads-unsafe-identifier",
+      "queryType": "exact-identifier",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
+      "repoId": "itsdangerous",
+      "queryId": "itsdangerous-timestamp-missing-literal",
+      "queryType": "string-literal",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
+      "repoId": "itsdangerous",
+      "queryId": "itsdangerous-timestamp-signer-symbol",
+      "queryType": "symbol-def",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
+      "repoId": "itsdangerous",
+      "queryId": "itsdangerous-unsign-concept",
+      "queryType": "nl-concept",
+      "axes": [
+        "latency.cold"
+      ]
+    }
+  ]
+}

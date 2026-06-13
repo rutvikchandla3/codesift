@@ -1,0 +1,128 @@
+{
+  "repos": [
+    {
+      "id": "cookie",
+      "language": "typescript",
+      "gitUrl": "https://github.com/jshttp/cookie.git",
+      "ref": "f86808f562122b3129b03c8ecb46e14bc7234738"
+    },
+    {
+      "id": "itsdangerous",
+      "language": "python",
+      "gitUrl": "https://github.com/pallets/itsdangerous.git",
+      "ref": "672971d66a2ef9f85151e53283113f33d642dabd"
+    },
+    {
+      "id": "escape-string-regexp",
+      "language": "javascript",
+      "gitUrl": "https://github.com/sindresorhus/escape-string-regexp.git",
+      "ref": "cbc42403142c96923b482604e1f3d627b1956aff"
+    }
+  ],
+  "queries": [
+    {
+      "id": "cookie-parse-concept",
+      "repoId": "cookie",
+      "queryType": "nl-concept",
+      "query": "parse Cookie header into keys and values",
+      "grepPattern": "Parse a `Cookie` header",
+      "expected": [{ "file": "src/index.ts", "symbol": "parseCookie" }],
+      "expectedLineRange": { "startLine": 109, "endLine": 141 }
+    },
+    {
+      "id": "cookie-parse-identifier",
+      "repoId": "cookie",
+      "queryType": "exact-identifier",
+      "query": "parseCookie",
+      "grepPattern": "parseCookie",
+      "pathGlob": "src/index.ts",
+      "expected": [{ "file": "src/index.ts", "symbol": "parseCookie" }],
+      "expectedLineRange": { "startLine": 109, "endLine": 141 }
+    },
+    {
+      "id": "cookie-samesite-literal",
+      "repoId": "cookie",
+      "queryType": "string-literal",
+      "query": "option sameSite is invalid",
+      "grepPattern": "option sameSite is invalid",
+      "expected": [{ "file": "src/index.ts" }],
+      "expectedLineRange": { "startLine": 398, "endLine": 398 }
+    },
+    {
+      "id": "cookie-value-error",
+      "repoId": "cookie",
+      "queryType": "error-trace",
+      "query": "cookie val is invalid",
+      "grepPattern": "cookie val is invalid",
+      "expected": [{ "file": "src/index.ts" }],
+      "expectedLineRange": { "startLine": 310, "endLine": 310 }
+    },
+    {
+      "id": "itsdangerous-timestamp-signer-symbol",
+      "repoId": "itsdangerous",
+      "queryType": "symbol-def",
+      "query": "TimestampSigner",
+      "grepPattern": "TimestampSigner",
+      "pathGlob": "src/itsdangerous/timed.py",
+      "expected": [{ "file": "src/itsdangerous/timed.py", "symbol": "TimestampSigner" }],
+      "expectedLineRange": { "startLine": 22, "endLine": 168 }
+    },
+    {
+      "id": "itsdangerous-unsign-concept",
+      "repoId": "itsdangerous",
+      "queryType": "nl-concept",
+      "query": "validate signed timestamp max age expiration",
+      "grepPattern": "validate the time",
+      "pathGlob": "src/itsdangerous/timed.py",
+      "expected": [{ "file": "src/itsdangerous/timed.py" }],
+      "expectedLineRange": { "startLine": 72, "endLine": 158 }
+    },
+    {
+      "id": "itsdangerous-loads-unsafe-identifier",
+      "repoId": "itsdangerous",
+      "queryType": "exact-identifier",
+      "query": "loads_unsafe",
+      "grepPattern": "loads_unsafe",
+      "pathGlob": "src/itsdangerous/serializer.py",
+      "expected": [{ "file": "src/itsdangerous/serializer.py", "symbol": "loads_unsafe" }],
+      "expectedLineRange": { "startLine": 349, "endLine": 365 }
+    },
+    {
+      "id": "itsdangerous-timestamp-missing-literal",
+      "repoId": "itsdangerous",
+      "queryType": "string-literal",
+      "query": "timestamp missing",
+      "grepPattern": "timestamp missing",
+      "pathGlob": "src/itsdangerous/timed.py",
+      "expected": [{ "file": "src/itsdangerous/timed.py" }],
+      "expectedLineRange": { "startLine": 106, "endLine": 106 }
+    },
+    {
+      "id": "escape-regexp-symbol",
+      "repoId": "escape-string-regexp",
+      "queryType": "symbol-def",
+      "query": "escapeStringRegexp",
+      "grepPattern": "escapeStringRegexp",
+      "expected": [{ "file": "index.js", "symbol": "escapeStringRegexp" }],
+      "expectedLineRange": { "startLine": 1, "endLine": 11 }
+    },
+    {
+      "id": "escape-regexp-concept",
+      "repoId": "escape-string-regexp",
+      "queryType": "nl-concept",
+      "query": "escape characters with special meaning unicode patterns",
+      "grepPattern": "Escape characters with special meaning",
+      "expected": [{ "file": "index.js", "symbol": "escapeStringRegexp" }],
+      "expectedLineRange": { "startLine": 1, "endLine": 11 }
+    },
+    {
+      "id": "escape-regexp-type-error",
+      "repoId": "escape-string-regexp",
+      "queryType": "error-trace",
+      "query": "Expected a string",
+      "grepPattern": "Expected a string",
+      "expected": [{ "file": "index.js" }],
+      "expectedLineRange": { "startLine": 3, "endLine": 3 }
+    }
+  ]
+}

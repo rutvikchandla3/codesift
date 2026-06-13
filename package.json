@@ -15,7 +15,8 @@
     "test:offline": "node --require ./scripts/block-network.cjs ./scripts/offline-check.mjs",
     "test:smoke-install": "node scripts/smoke-pack-install.mjs",
     "typecheck": "pnpm -r --filter './packages/**' typecheck",
-    "ci": "pnpm build && pnpm typecheck && pnpm test && pnpm run test:offline"
+    "bench": "pnpm --filter @codesift/eval run bench",
+    "ci": "pnpm build && pnpm typecheck && pnpm test && pnpm run test:offline && pnpm bench"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

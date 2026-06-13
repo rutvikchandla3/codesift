@@ -57,7 +57,26 @@ importers:
         specifier: ^5.9.3
         version: 5.9.3
 
-  packages/eval: {}
+  packages/eval:
+    dependencies:
+      '@codesift/core':
+        specifier: workspace:*
+        version: link:../core
+      better-sqlite3:
+        specifier: ^12.10.0
+        version: 12.10.0
+      ignore:
+        specifier: ^7.0.5
+        version: 7.0.5
+      minimatch:
+        specifier: ^10.1.1
+        version: 10.2.5
+      sqlite-vec:
+        specifier: ^0.1.9
+        version: 0.1.9
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
 
   packages/mcp:
     dependencies:

@@ -11,7 +11,7 @@ import { buildChunks, type ChunkRecord } from './chunking.js'
 import { getDefaultEmbeddingProvider, isLearnedEmbeddingProvider } from './embedding.js'
 import { isCodeLanguage, isDocumentationLanguage } from './languages.js'
 import { scanRepository } from './scan.js'
-import { DEFAULT_SEARCH_K, type FindSymbolOptions, type GrepHit, type GrepOptions, type IndexCompatibilitySnapshot, type IndexCompatibilityStatus, type ReadChunkOptions, type ReadRangeOptions, type Repo, type RepoStatus, type SearchHit, type SearchOptions, type StopWatching, type SymbolDefinition, type SymbolKind, type SyncOptions, type SyncResult, type VectorSearchStatus, type WatchOptions } from './types.js'
+import { DEFAULT_SEARCH_K, type FindSymbolOptions, type GrepHit, type GrepOptions, type IndexCompatibilitySnapshot, type IndexCompatibilityStatus, type ReadChunkOptions, type ReadRangeOptions, type Repo, type RepoStatus, type SearchHit, type SearchOptions, type SearchReasonTag, type StopWatching, type SymbolDefinition, type SymbolKind, type SyncOptions, type SyncResult, type VectorSearchStatus, type WatchOptions } from './types.js'
 
 interface ChunkRow {
   id: string
@@ -50,12 +50,17 @@ interface SymbolRow {
 interface RankedChunkRow {
   row: ChunkRow
   score: number
+  reasons: Set<SearchReasonTag>
 }
 
-const SCHEMA_VERSION = '4'
+const SCHEMA_VERSION = '5'
 const DEFAULT_RRF_K = 60
 const DEFAULT_VECTOR_LIMIT = 50
 const DEFAULT_PATH_FILTERED_LIMIT = 200
+const DEFAULT_SNIPPET_TOKEN_BUDGET = 48
+const DEFAULT_SNIPPET_CONTEXT_LINES = 0
+const DEFAULT_SNIPPET_LINE_CHAR_LIMIT = 40
+const SEARCH_HIT_TOKEN_OVERHEAD = 12
 const VECTOR_SEARCH_UNAVAILABLE_MESSAGE = 'vector search unavailable (native dep), lexical/symbol still works'
 
 let vectorExtensionLoader: (db: Database.Database) => void = (db) => sqliteVec.load(db)
@@ -238,7 +243,7 @@ export class SqliteRepo implements Repo {
               row.kind ?? null,
               row.parent ?? null,
               row.signature ?? null,
-              row.snippet,
+              row.content,
               embedding
             )
 
@@ -367,9 +372,11 @@ export class SqliteRepo implements Repo {
         : []
     }
 
-    return fuseRankedRows(query, exactRows, vectorRows, lexicalRows)
-      .slice(0, requestedK)
-      .map(({ row, score }) => buildSearchHit(row, score, query))
+    const fusedRows = fuseRankedRows(query, exactRows, vectorRows, lexicalRows)
+    const distinctRows = dedupeContainedRows(fusedRows)
+    const effectiveK = (options?.singleBest ?? (exactRows.length > 0 && isSingleBestIdentifierQuery(query))) ? 1 : requestedK
+
+    return buildBudgetedSearchHits(query, distinctRows, effectiveK, options?.maxTokens)
   }
 
   async grep(pattern: string, options?: GrepOptions): Promise<GrepHit[]> {
@@ -823,8 +830,54 @@ function normalizeKinds(kind: SearchOptions['kind'] | FindSymbolOptions['kind'] 
   return Array.isArray(kind) ? kind : [kind]
 }
 
-function buildSearchHit(row: ChunkRow, baseScore: number, query: string): SearchHit {
-  const score = baseScore * scoreBoostForRow(row, query)
+function buildBudgetedSearchHits(
+  query: string,
+  rows: RankedChunkRow[],
+  requestedK: number,
+  maxTokens: number | undefined
+): SearchHit[] {
+  const tokenBudget = normalizeSearchTokenBudget(maxTokens)
+  const hits: SearchHit[] = []
+  let tokensUsed = 0
+
+  for (const ranked of rows) {
+    if (hits.length >= requestedK) {
+      break
+    }
+
+    const remainingTokens = tokenBudget === undefined ? undefined : tokenBudget - tokensUsed
+    if (remainingTokens !== undefined && remainingTokens <= SEARCH_HIT_TOKEN_OVERHEAD) {
+      break
+    }
+
+    const snippetTokenBudget = remainingTokens === undefined
+      ? DEFAULT_SNIPPET_TOKEN_BUDGET
+      : Math.max(8, Math.min(DEFAULT_SNIPPET_TOKEN_BUDGET, remainingTokens - SEARCH_HIT_TOKEN_OVERHEAD))
+    const hit = buildSearchHit(ranked, query, snippetTokenBudget)
+
+    if (tokenBudget !== undefined && tokensUsed + hit.tokensReturned > tokenBudget) {
+      if (hits.length > 0) {
+        break
+      }
+
+      const forcedSnippetBudget = Math.max(0, tokenBudget - SEARCH_HIT_TOKEN_OVERHEAD)
+      const forcedHit = buildSearchHit(ranked, query, forcedSnippetBudget)
+      hits.push(forcedHit)
+      break
+    }
+
+    hits.push(hit)
+    tokensUsed += hit.tokensReturned
+  }
+
+  return hits
+}
+
+function buildSearchHit(ranked: RankedChunkRow, query: string, snippetTokenBudget: number): SearchHit {
+  const row = ranked.row
+  const score = ranked.score * scoreBoostForRow(row, query)
+  const snippet = buildQueryCenteredSnippet(row, query, snippetTokenBudget)
+  const reason = reasonTagForRankedRow(ranked)
 
   const hit: SearchHit = {
     id: row.id,
@@ -834,7 +887,10 @@ function buildSearchHit(row: ChunkRow, baseScore: number, query: string): Search
       endLine: row.end_line
     },
     score,
-    snippet: row.snippet
+    reason,
+    snippet: snippet.text,
+    snippetRange: snippet.range,
+    tokensReturned: estimateSearchHitTokens(row, snippet.text)
   }
 
   if (row.language) {
@@ -850,6 +906,172 @@ function buildSearchHit(row: ChunkRow, baseScore: number, query: string): Search
   }
 
   return hit
+}
+
+function normalizeSearchTokenBudget(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) {
+    return undefined
+  }
+
+  return Math.floor(value)
+}
+
+function estimateSearchHitTokens(row: ChunkRow, snippet: string): number {
+  const header = `${row.file_path}:${row.start_line}-${row.end_line} ${row.symbol ?? ''} ${row.kind ?? ''}`
+  return SEARCH_HIT_TOKEN_OVERHEAD + estimateTokenCount(header) + estimateTokenCount(snippet)
+}
+
+function estimateTokenCount(value: string): number {
+  if (!value.trim()) {
+    return 0
+  }
+
+  return Math.max(1, Math.ceil(value.length / 4))
+}
+
+function buildQueryCenteredSnippet(
+  row: ChunkRow,
+  query: string,
+  tokenBudget: number
+): { text: string; range: { startLine: number; endLine: number } } {
+  if (tokenBudget <= 0) {
+    return { text: '', range: { startLine: row.start_line, endLine: row.start_line } }
+  }
+
+  const lines = splitLines(row.snippet)
+  if (lines.length === 0) {
+    return { text: '', range: { startLine: row.start_line, endLine: row.start_line } }
+  }
+
+  const centerIndex = bestSnippetCenterLine(lines, query)
+  let startIndex = Math.max(0, centerIndex - DEFAULT_SNIPPET_CONTEXT_LINES)
+  let endIndex = Math.min(lines.length - 1, centerIndex + DEFAULT_SNIPPET_CONTEXT_LINES)
+  let selected = trimSnippetLines(lines.slice(startIndex, endIndex + 1))
+
+  while (estimateTokenCount(selected.join('\n')) > tokenBudget && endIndex > startIndex) {
+    const removeBefore = centerIndex - startIndex >= endIndex - centerIndex
+    if (removeBefore && startIndex < centerIndex) {
+      startIndex += 1
+    } else {
+      endIndex -= 1
+    }
+    selected = trimSnippetLines(lines.slice(startIndex, endIndex + 1))
+  }
+
+  let text = selected.join('\n').trim()
+  if (estimateTokenCount(text) > tokenBudget) {
+    text = truncateToTokenBudget(text, tokenBudget)
+  }
+
+  return {
+    text,
+    range: {
+      startLine: row.start_line + startIndex,
+      endLine: row.start_line + endIndex
+    }
+  }
+}
+
+function bestSnippetCenterLine(lines: string[], query: string): number {
+  const queryTerms = new Set([...buildNormalizedTerms(query), ...extractSymbolCandidates(query)])
+  if (queryTerms.size === 0) {
+    return 0
+  }
+
+  let bestIndex = 0
+  let bestScore = Number.NEGATIVE_INFINITY
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? ''
+    const normalizedLine = line.toLowerCase()
+    const lineTerms = new Set(buildNormalizedTerms(line))
+    let score = 0
+
+    for (const term of queryTerms) {
+      if (lineTerms.has(term) || normalizedLine.includes(term.toLowerCase())) {
+        score += term.length > 3 ? 2 : 1
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score
+      bestIndex = index
+    }
+  }
+
+  return bestIndex
+}
+
+function trimSnippetLines(lines: string[]): string[] {
+  return lines
+    .map((line) => {
+      const trimmedRight = line.trimEnd()
+      return trimmedRight.length > DEFAULT_SNIPPET_LINE_CHAR_LIMIT
+        ? `${trimmedRight.slice(0, DEFAULT_SNIPPET_LINE_CHAR_LIMIT - 1)}…`
+        : trimmedRight
+    })
+    .filter((line, index, all) => line.trim() || (index > 0 && index < all.length - 1))
+}
+
+function truncateToTokenBudget(text: string, tokenBudget: number): string {
+  if (tokenBudget <= 0) {
+    return ''
+  }
+
+  const maxChars = Math.max(1, tokenBudget * 4)
+  return text.length <= maxChars ? text : `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`
+}
+
+function reasonTagForRankedRow(row: RankedChunkRow): SearchReasonTag {
+  if (row.reasons.has('=')) {
+    return '='
+  }
+
+  if (row.reasons.has('~')) {
+    return '~'
+  }
+
+  return '+'
+}
+
+function dedupeContainedRows(rows: RankedChunkRow[]): RankedChunkRow[] {
+  const kept: RankedChunkRow[] = []
+
+  for (const candidate of rows) {
+    const isContained = kept.some((existing) => chunksOverlapOrContain(existing.row, candidate.row))
+    if (!isContained) {
+      kept.push(candidate)
+    }
+  }
+
+  return kept
+}
+
+function chunksOverlapOrContain(left: ChunkRow, right: ChunkRow): boolean {
+  if (left.file_path !== right.file_path) {
+    return false
+  }
+
+  const overlapStart = Math.max(left.start_line, right.start_line)
+  const overlapEnd = Math.min(left.end_line, right.end_line)
+  if (overlapEnd < overlapStart) {
+    return false
+  }
+
+  const leftLength = left.end_line - left.start_line + 1
+  const rightLength = right.end_line - right.start_line + 1
+  const overlapLength = overlapEnd - overlapStart + 1
+
+  return overlapLength === Math.min(leftLength, rightLength)
+}
+
+function isSingleBestIdentifierQuery(query: string): boolean {
+  const trimmed = query.trim()
+  if (!trimmed || /\s/.test(trimmed)) {
+    return false
+  }
+
+  return extractSymbolCandidates(trimmed).some((candidate) => candidate === trimmed.toLowerCase())
 }
 
 function buildChunkSearchFilters(options?: SearchOptions): { whereSql: string; params: string[] } {
@@ -1036,9 +1258,9 @@ function selectGrepCandidateFiles(db: Database.Database, options?: GrepOptions):
 function fuseRankedRows(query: string, exactRows: ChunkRow[], vectorRows: ChunkRow[], lexicalRows: ChunkRow[]): RankedChunkRow[] {
   const byId = new Map<string, RankedChunkRow>()
 
-  addReciprocalRanks(byId, exactRows, 4)
-  addReciprocalRanks(byId, vectorRows)
-  addReciprocalRanks(byId, lexicalRows)
+  addReciprocalRanks(byId, exactRows, '=', 4)
+  addReciprocalRanks(byId, vectorRows, '+')
+  addReciprocalRanks(byId, lexicalRows, '~')
 
   return [...byId.values()].sort((left, right) => {
     const leftScore = left.score * scoreBoostForRow(left.row, query)
@@ -1053,19 +1275,21 @@ function fuseRankedRows(query: string, exactRows: ChunkRow[], vectorRows: ChunkR
   })
 }
 
-function addReciprocalRanks(target: Map<string, RankedChunkRow>, rows: ChunkRow[], weight = 1): void {
+function addReciprocalRanks(target: Map<string, RankedChunkRow>, rows: ChunkRow[], reason: SearchReasonTag, weight = 1): void {
   rows.forEach((row, index) => {
     const score = weight / (DEFAULT_RRF_K + index + 1)
     const existing = target.get(row.id)
 
     if (existing) {
       existing.score += score
+      existing.reasons.add(reason)
       return
     }
 
     target.set(row.id, {
       row,
-      score
+      score,
+      reasons: new Set([reason])
     })
   })
 }
@@ -1318,7 +1542,7 @@ function createChunkId(chunk: ChunkRecord): string {
 }
 
 function parseChunkId(id: string): { file: string; startLine: number; endLine: number; contentHash: string } | null {
-  const match = /^(.*):(\d+)-(\d+)@([a-f0-9]{64})$/.exec(id)
+  const match = /^(.*):(\d+)-(\d+)(?:@([a-f0-9]{8,64}))?$/.exec(id)
   if (!match) {
     return null
   }
@@ -1369,10 +1593,6 @@ function buildEmbeddingBatches(
   }
 
   return batches
-}
-
-function estimateTokenCount(value: string): number {
-  return Math.max(1, Math.ceil(value.length / 4))
 }
 
 function registerSqlFunctions(db: Database.Database): void {

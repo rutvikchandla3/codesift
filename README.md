@@ -8,7 +8,7 @@ Local-first lexical code search for repositories, delivered as one TypeScript co
 
 ## Status
 
-M2 implementation has started on top of the M1 walking skeleton.
+M2 implementation is complete on top of the M1 walking skeleton.
 
 Implemented today:
 
@@ -20,13 +20,15 @@ Implemented today:
 - end-to-end `index`, `search`, `sym`, `grep`, `status`, and `clean` CLI flows
 - stable chunk ids plus on-demand chunk/range reads from disk
 - real MCP stdio transport with `search_code`, `find_symbol`, `grep_code`, `read_chunk`, and `index_status`
+- token-budgeted compact search results (`maxTokens` / `max_tokens`), overlap dedupe, single-best identifier answers, query-centered snippets, and reason tags
+- pinned-OSS eval harness with paired tokens-to-resolution plus stdio cold-start latency vs ripgrep and a checked-in loss budget
 
 Still intentionally deferred to later milestones:
 
 - production learned embedding provider
 - watch mode and incremental freshness
 - streamable HTTP MCP transport
-- broader eval harness and ranking work
+- broader M6-quality golden sets and learned-vector ranking work
 
 ## Supported platforms
 
@@ -75,7 +77,9 @@ After indexing a repo, point an MCP client at the stdio command:
 codesift mcp /path/to/repo
 ```
 
-Routing policy for agents: `find_symbol` for identifiers/definitions, `grep_code` for exact strings or regex, and `search_code` for behavior/concept queries. Keep host grep as fallback, not the first tool.
+Routing policy for agents: `find_symbol` for identifiers/definitions, `grep_code` for exact strings or regex, and `search_code` for behavior/concept queries. Keep host grep as fallback, not the first tool. `search_code` is compact by default and accepts `max_tokens` for strict context budgets.
+
+Cold-start note: `codesift mcp` has a measured stdio startup cost, but normal MCP clients keep the server process alive, so this is a one-time repo/session tax; subsequent searches use the warm path. The M4 daemon will further reduce this startup cost.
 
 ## Commands
 
@@ -84,6 +88,7 @@ pnpm build
 pnpm test
 pnpm typecheck
 pnpm run test:offline
+pnpm --filter @codesift/eval run bench
 pnpm run test:smoke-install
 pnpm run ci
 ```
