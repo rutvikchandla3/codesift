@@ -35,6 +35,8 @@ describe('codesift CLI formatters', () => {
         stale: false,
         chunkCount: 0,
         symbolCount: 0,
+        generatedFileCount: 0,
+        generatedChunkCount: 0,
         indexGeneration: 0,
         provider: null,
         compatibility: { ok: true },

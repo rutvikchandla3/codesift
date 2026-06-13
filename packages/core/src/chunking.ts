@@ -233,12 +233,13 @@ function buildPythonChunks(file: ScannedFile): ChunkRecord[] {
 
 function buildGoChunks(file: ScannedFile): ChunkRecord[] {
   const lines = splitLines(file.content)
+  const codeLines = maskCStyleSyntax(lines)
   const chunks: ChunkRecord[] = []
 
   for (let index = 0; index < lines.length; index += 1) {
     const lineNumber = index + 1
-    const trimmed = stripLineComment(lines[index] ?? '').trim()
-    if (!trimmed || isCommentOnly(trimmed)) {
+    const trimmed = codeLines[index]?.trim() ?? ''
+    if (!trimmed) {
       continue
     }
 
@@ -256,23 +257,54 @@ function buildGoChunks(file: ScannedFile): ChunkRecord[] {
       continue
     }
 
-    const typeMatch = trimmed.match(/^type\s+([A-Za-z_][A-Za-z0-9_]*)\s+(struct|interface)\b/)
-    if (typeMatch) {
-      pushLineChunk(chunks, file, lines, lineNumber, findCStyleDeclarationEnd(lines, lineNumber), {
-        symbol: typeMatch[1]!,
-        kind: typeMatch[2] === 'interface' ? 'interface' : 'class',
+    const typeBlockMatch = trimmed.match(/^type\s*\(/)
+    if (typeBlockMatch) {
+      const endLine = findBalancedDelimiterEnd(lines, lineNumber, '(', ')')
+      for (let blockLine = lineNumber + 1; blockLine < endLine; blockLine += 1) {
+        const entry = codeLines[blockLine - 1]?.trim() ?? ''
+        const typeEntry = parseGoTypeDeclaration(entry)
+        if (!typeEntry) {
+          continue
+        }
+
+        pushLineChunk(chunks, file, lines, blockLine, Math.min(findCStyleDeclarationEnd(lines, blockLine), endLine), {
+          symbol: typeEntry.name,
+          kind: typeEntry.kind,
+          signature: entry
+        })
+      }
+      index = Math.max(index, endLine - 1)
+      continue
+    }
+
+    const typeEntry = trimmed.startsWith('type ') ? parseGoTypeDeclaration(trimmed.replace(/^type\s+/, '')) : null
+    if (typeEntry) {
+      pushLineChunk(chunks, file, lines, lineNumber, findGoSimpleBlockEnd(lines, lineNumber), {
+        symbol: typeEntry.name,
+        kind: typeEntry.kind,
         signature: trimmed
       })
       continue
     }
 
-    const aliasMatch = trimmed.match(/^type\s+([A-Za-z_][A-Za-z0-9_]*)\b/)
-    if (aliasMatch) {
-      pushLineChunk(chunks, file, lines, lineNumber, findGoSimpleBlockEnd(lines, lineNumber), {
-        symbol: aliasMatch[1]!,
-        kind: 'type',
-        signature: trimmed
-      })
+    const valueBlockMatch = trimmed.match(/^(const|var)\s*\(/)
+    if (valueBlockMatch) {
+      const declarationKind = valueBlockMatch[1] === 'const' ? 'constant' : 'variable'
+      const endLine = findBalancedDelimiterEnd(lines, lineNumber, '(', ')')
+      for (let blockLine = lineNumber + 1; blockLine < endLine; blockLine += 1) {
+        const entry = codeLines[blockLine - 1]?.trim() ?? ''
+        const name = parseGoValueDeclarationName(entry)
+        if (!name) {
+          continue
+        }
+
+        pushLineChunk(chunks, file, lines, blockLine, Math.min(findGoSimpleBlockEnd(lines, blockLine), endLine), {
+          symbol: name,
+          kind: declarationKind,
+          signature: entry
+        })
+      }
+      index = Math.max(index, endLine - 1)
       continue
     }
 
@@ -283,26 +315,18 @@ function buildGoChunks(file: ScannedFile): ChunkRecord[] {
         kind: valueMatch[1] === 'const' ? 'constant' : 'variable',
         signature: trimmed
       })
-      continue
-    }
-
-    const blockMatch = trimmed.match(/^(const|var)\s*\(/)
-    if (blockMatch) {
-      pushLineChunk(chunks, file, lines, lineNumber, findBalancedDelimiterEnd(lines, lineNumber, '(', ')'), {
-        symbol: blockMatch[1]!,
-        kind: blockMatch[1] === 'const' ? 'constant' : 'variable',
-        signature: trimmed
-      })
     }
   }
 
-  return chunks
+  return dedupeChunkRecords(chunks)
 }
 
 function buildJavaChunks(file: ScannedFile): ChunkRecord[] {
   const lines = splitLines(file.content)
+  const codeLines = maskCStyleSyntax(lines)
   const chunks: ChunkRecord[] = []
   const containers = collectJavaContainers(lines)
+  const methods: LineContainer[] = []
 
   for (const container of containers) {
     pushLineChunk(chunks, file, lines, container.startLine, container.endLine, {
@@ -315,7 +339,7 @@ function buildJavaChunks(file: ScannedFile): ChunkRecord[] {
 
   for (let index = 0; index < lines.length; index += 1) {
     const lineNumber = index + 1
-    const trimmed = lines[index]?.trim() ?? ''
+    const trimmed = codeLines[index]?.trim() ?? ''
     const methodName = parseJavaMethodName(trimmed)
     if (!methodName) {
       continue
@@ -326,7 +350,9 @@ function buildJavaChunks(file: ScannedFile): ChunkRecord[] {
       continue
     }
 
-    pushLineChunk(chunks, file, lines, lineNumber, findCStyleDeclarationEnd(lines, lineNumber), {
+    const endLine = findCStyleDeclarationEnd(lines, lineNumber)
+    methods.push({ name: methodName, kind: 'method', startLine: lineNumber, endLine, parent: parent.name })
+    pushLineChunk(chunks, file, lines, lineNumber, endLine, {
       symbol: methodName,
       kind: 'method',
       parent: parent.name,
@@ -334,13 +360,36 @@ function buildJavaChunks(file: ScannedFile): ChunkRecord[] {
     })
   }
 
-  return chunks
+  for (let index = 0; index < lines.length; index += 1) {
+    const lineNumber = index + 1
+    const trimmed = codeLines[index]?.trim() ?? ''
+    if (!trimmed || trimmed.includes('(')) {
+      continue
+    }
+
+    const parent = innermostContainer(containers, lineNumber)
+    if (!parent || (parent.kind !== 'enum' && !trimmed.includes(';')) || methods.some((method) => method.startLine < lineNumber && lineNumber <= method.endLine)) {
+      continue
+    }
+
+    for (const field of parseJavaFieldDeclarations(trimmed, parent.kind)) {
+      pushLineChunk(chunks, file, lines, lineNumber, lineNumber, {
+        symbol: field.name,
+        kind: field.kind,
+        parent: parent.name,
+        signature: trimmed
+      })
+    }
+  }
+
+  return dedupeChunkRecords(chunks)
 }
 
 function buildRubyChunks(file: ScannedFile): ChunkRecord[] {
   const lines = splitLines(file.content)
   const chunks: ChunkRecord[] = []
   const containers = collectRubyContainers(lines)
+  const methods: LineContainer[] = []
 
   for (const container of containers) {
     pushLineChunk(chunks, file, lines, container.startLine, container.endLine, {
@@ -353,14 +402,16 @@ function buildRubyChunks(file: ScannedFile): ChunkRecord[] {
 
   for (let index = 0; index < lines.length; index += 1) {
     const lineNumber = index + 1
-    const trimmed = lines[index]?.trim() ?? ''
+    const trimmed = stripRubyComment(lines[index] ?? '').trim()
     const defMatch = trimmed.match(/^def\s+(?:(?:self|[A-Za-z_][A-Za-z0-9_]*)\.)?([A-Za-z_][A-Za-z0-9_!?=]*)\b/)
     if (!defMatch) {
       continue
     }
 
     const parent = innermostContainer(containers, lineNumber)
-    pushLineChunk(chunks, file, lines, lineNumber, findRubyBlockEnd(lines, lineNumber), {
+    const endLine = findRubyBlockEnd(lines, lineNumber)
+    methods.push({ name: defMatch[1]!, kind: parent ? 'method' : 'function', startLine: lineNumber, endLine, ...(parent ? { parent: parent.name } : {}) })
+    pushLineChunk(chunks, file, lines, lineNumber, endLine, {
       symbol: defMatch[1]!,
       kind: parent ? 'method' : 'function',
       ...(parent ? { parent: parent.name.split('::').at(-1) ?? parent.name } : {}),
@@ -368,11 +419,42 @@ function buildRubyChunks(file: ScannedFile): ChunkRecord[] {
     })
   }
 
-  return chunks
+  for (let index = 0; index < lines.length; index += 1) {
+    const lineNumber = index + 1
+    const trimmed = stripRubyComment(lines[index] ?? '').trim()
+    if (!trimmed || methods.some((method) => method.startLine < lineNumber && lineNumber <= method.endLine)) {
+      continue
+    }
+
+    const parent = innermostContainer(containers, lineNumber)
+    const constantMatch = trimmed.match(/^([A-Z][A-Za-z0-9_]*)\s*=/)
+    if (constantMatch) {
+      pushLineChunk(chunks, file, lines, lineNumber, findRubyAssignmentEnd(lines, lineNumber), {
+        symbol: constantMatch[1]!,
+        kind: 'constant',
+        ...(parent ? { parent: parent.name.split('::').at(-1) ?? parent.name } : {}),
+        signature: trimmed
+      })
+      continue
+    }
+
+    const variableMatch = trimmed.match(/^(@@?[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z_][A-Za-z0-9_]*|[a-z_][A-Za-z0-9_]*)\s*=/)
+    if (variableMatch) {
+      pushLineChunk(chunks, file, lines, lineNumber, findRubyAssignmentEnd(lines, lineNumber), {
+        symbol: variableMatch[1]!,
+        kind: 'variable',
+        ...(parent ? { parent: parent.name.split('::').at(-1) ?? parent.name } : {}),
+        signature: trimmed
+      })
+    }
+  }
+
+  return dedupeChunkRecords(chunks)
 }
 
 function buildRustChunks(file: ScannedFile): ChunkRecord[] {
   const lines = splitLines(file.content)
+  const codeLines = maskCStyleSyntax(lines)
   const chunks: ChunkRecord[] = []
   const containers = collectRustContainers(lines)
 
@@ -387,34 +469,37 @@ function buildRustChunks(file: ScannedFile): ChunkRecord[] {
 
   for (let index = 0; index < lines.length; index += 1) {
     const lineNumber = index + 1
-    const trimmed = stripLineComment(lines[index] ?? '').trim()
-    if (!trimmed || isCommentOnly(trimmed)) {
+    const trimmed = codeLines[index]?.trim() ?? ''
+    if (!trimmed) {
       continue
     }
 
     const fnMatch = trimmed.match(/^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?(?:extern\s+(?:"[^"]+"\s+)?)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>]+>\s*)?\(/)
     if (fnMatch) {
-      const parent = innermostContainer(containers, lineNumber, ['namespace', 'interface'])
+      const parent = innermostContainer(containers, lineNumber, ['namespace', 'interface', 'module'])
+      const isMethod = parent?.kind === 'namespace' || parent?.kind === 'interface'
       pushLineChunk(chunks, file, lines, lineNumber, findCStyleDeclarationEnd(lines, lineNumber), {
         symbol: fnMatch[1]!,
-        kind: parent ? 'method' : 'function',
+        kind: isMethod ? 'method' : 'function',
         ...(parent ? { parent: parent.name } : {}),
         signature: trimmed
       })
       continue
     }
 
-    const constantMatch = trimmed.match(/^(?:pub(?:\([^)]*\))?\s+)?(const|static)\s+([A-Za-z_][A-Za-z0-9_]*)\b/)
+    const constantMatch = trimmed.match(/^(?:pub(?:\([^)]*\))?\s+)?(const|static)\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\b/)
     if (constantMatch) {
+      const parent = innermostContainer(containers, lineNumber, ['module'])
       pushLineChunk(chunks, file, lines, lineNumber, findCStyleDeclarationEnd(lines, lineNumber), {
         symbol: constantMatch[2]!,
         kind: constantMatch[1] === 'const' ? 'constant' : 'variable',
+        ...(parent ? { parent: parent.name } : {}),
         signature: trimmed
       })
     }
   }
 
-  return chunks
+  return dedupeChunkRecords(chunks)
 }
 
 function buildMarkdownChunks(file: ScannedFile): ChunkRecord[] {
@@ -692,12 +777,138 @@ function rebuildChunkWithContent(chunk: ChunkRecord, content: string, startLine:
   return rebuilt
 }
 
+function dedupeChunkRecords(chunks: ChunkRecord[]): ChunkRecord[] {
+  const seen = new Set<string>()
+  const deduped: ChunkRecord[] = []
+
+  for (const chunk of chunks) {
+    const key = [chunk.file, chunk.startLine, chunk.endLine].join('\0')
+    if (seen.has(key)) {
+      continue
+    }
+
+    seen.add(key)
+    deduped.push(chunk)
+  }
+
+  return deduped
+}
+
+function parseGoTypeDeclaration(entry: string): { name: string; kind: SymbolKind } | null {
+  const structuralMatch = entry.match(/^([A-Za-z_][A-Za-z0-9_]*)\s+(?:=\s*)?(struct|interface)\b/)
+  if (structuralMatch) {
+    return {
+      name: structuralMatch[1]!,
+      kind: structuralMatch[2] === 'interface' ? 'interface' : 'class'
+    }
+  }
+
+  const aliasMatch = entry.match(/^([A-Za-z_][A-Za-z0-9_]*)\s+(?:=\s*)?[A-Za-z_][A-Za-z0-9_./\[\]*]*/)
+  return aliasMatch ? { name: aliasMatch[1]!, kind: 'type' } : null
+}
+
+function parseGoValueDeclarationName(entry: string): string | null {
+  if (!entry || entry.startsWith(')')) {
+    return null
+  }
+
+  return entry.match(/^([A-Za-z_][A-Za-z0-9_]*)\b/)?.[1] ?? null
+}
+
+function parseJavaFieldDeclarations(trimmed: string, parentKind: SymbolKind): Array<{ name: string; kind: SymbolKind }> {
+  if (/^(?:package|import)\b/.test(trimmed) || /\b(?:return|throw|new)\b/.test(trimmed)) {
+    return []
+  }
+
+  if (parentKind === 'enum') {
+    const enumConstants = trimmed
+      .replace(/;.*/, '')
+      .split(',')
+      .map((part) => part.trim().match(/^([A-Z][A-Z0-9_]*)\b/)?.[1])
+      .filter((name): name is string => Boolean(name))
+    if (enumConstants.length > 0) {
+      return enumConstants.map((name) => ({ name, kind: 'constant' as const }))
+    }
+  }
+
+  if (!trimmed.endsWith(';') || /^[{};]/.test(trimmed)) {
+    return []
+  }
+
+  const withoutInitializerNoise = trimmed.replace(/;.*/, '')
+  const declarationParts = splitTopLevelComma(withoutInitializerNoise)
+  if (declarationParts.length === 0) {
+    return []
+  }
+
+  const isConstant = /\bstatic\s+final\b/.test(trimmed) || /\bfinal\s+static\b/.test(trimmed)
+  const fields: Array<{ name: string; kind: SymbolKind }> = []
+
+  for (const [index, part] of declarationParts.entries()) {
+    const beforeInitializer = part.split('=')[0]?.trim() ?? ''
+    const nameMatch = beforeInitializer.match(/([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:\[\s*\])?$/)
+    const name = nameMatch?.[1]
+    if (!name || JAVA_CONTROL_KEYWORDS.has(name)) {
+      continue
+    }
+
+    if (index === 0) {
+      const tokens = beforeInitializer.split(/\s+/).filter(Boolean)
+      if (tokens.length < 2) {
+        continue
+      }
+    }
+
+    fields.push({ name, kind: isConstant ? 'constant' : 'variable' })
+  }
+
+  return fields
+}
+
+function splitTopLevelComma(value: string): string[] {
+  const parts: string[] = []
+  let depth = 0
+  let current = ''
+
+  for (const char of value) {
+    if (char === '<' || char === '[' || char === '(') {
+      depth += 1
+    } else if (char === '>' || char === ']' || char === ')') {
+      depth = Math.max(0, depth - 1)
+    }
+
+    if (char === ',' && depth === 0) {
+      parts.push(current.trim())
+      current = ''
+      continue
+    }
+
+    current += char
+  }
+
+  if (current.trim()) {
+    parts.push(current.trim())
+  }
+
+  return parts
+}
+
+function findRubyAssignmentEnd(lines: string[], startLine: number): number {
+  const trimmed = stripRubyComment(lines[startLine - 1] ?? '').trim()
+  if (/[\[{(]\s*$/.test(trimmed)) {
+    return findRubyBlockEnd(lines, startLine)
+  }
+
+  return startLine
+}
+
 function collectJavaContainers(lines: string[]): LineContainer[] {
   const containers: LineContainer[] = []
+  const codeLines = maskCStyleSyntax(lines)
 
   for (let index = 0; index < lines.length; index += 1) {
     const lineNumber = index + 1
-    const trimmed = lines[index]?.trim() ?? ''
+    const trimmed = codeLines[index]?.trim() ?? ''
     const match = trimmed.match(/^(?:(?:public|protected|private|abstract|final|static|sealed|non-sealed)\s+)*(class|interface|enum|record)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b/)
     if (!match) {
       continue
@@ -750,11 +961,12 @@ function collectRubyContainers(lines: string[]): LineContainer[] {
 
 function collectRustContainers(lines: string[]): LineContainer[] {
   const containers: LineContainer[] = []
+  const codeLines = maskCStyleSyntax(lines)
 
   for (let index = 0; index < lines.length; index += 1) {
     const lineNumber = index + 1
-    const trimmed = stripLineComment(lines[index] ?? '').trim()
-    if (!trimmed || isCommentOnly(trimmed)) {
+    const trimmed = codeLines[index]?.trim() ?? ''
+    if (!trimmed) {
       continue
     }
 
@@ -775,12 +987,17 @@ function collectRustContainers(lines: string[]): LineContainer[] {
     }
 
     const kind = rustContainerKind(typeMatch[1]!)
-    containers.push({
+    const parent = innermostContainer(containers, lineNumber, ['module'])
+    const container: LineContainer = {
       name: typeMatch[2]!,
       kind,
       startLine: lineNumber,
       endLine: findCStyleDeclarationEnd(lines, lineNumber)
-    })
+    }
+    if (parent) {
+      container.parent = parent.name
+    }
+    containers.push(container)
   }
 
   return containers
@@ -854,11 +1071,15 @@ function rustContainerKind(keyword: string): SymbolKind {
 }
 
 function parseGoReceiverParent(receiver: string): string | undefined {
-  const cleaned = receiver
-    .replace(/[()[\]*&]/g, ' ')
-    .replace(/\[[^\]]*\]/g, ' ')
+  const withoutParens = receiver.replace(/[()]/g, ' ').trim()
+  const withoutName = withoutParens.replace(/^[_A-Za-z][_A-Za-z0-9]*\s+/, '').trim()
+  const typePart = withoutName
+    .replace(/^\*+/, '')
+    .replace(/\[[^\]]*\]/g, '')
+    .replace(/^&+/, '')
     .trim()
-  return cleaned.match(/[A-Za-z_][A-Za-z0-9_]*$/)?.[0]
+  const lastSegment = typePart.split('.').at(-1) ?? typePart
+  return lastSegment.match(/[A-Za-z_][A-Za-z0-9_]*/)?.[0]
 }
 
 function parseRustImplParent(trimmed: string): string | undefined {
@@ -881,11 +1102,12 @@ function findGoSimpleBlockEnd(lines: string[], startLine: number): number {
 }
 
 function findCStyleDeclarationEnd(lines: string[], startLine: number): number {
+  const codeLines = maskCStyleSyntax(lines)
   let depth = 0
   let sawBrace = false
 
-  for (let index = startLine - 1; index < lines.length; index += 1) {
-    const line = stripLineComment(lines[index] ?? '')
+  for (let index = startLine - 1; index < codeLines.length; index += 1) {
+    const line = codeLines[index] ?? ''
     for (const char of line) {
       if (char === '{') {
         depth += 1
@@ -908,11 +1130,12 @@ function findCStyleDeclarationEnd(lines: string[], startLine: number): number {
 }
 
 function findBalancedDelimiterEnd(lines: string[], startLine: number, open: string, close: string): number {
+  const codeLines = maskCStyleSyntax(lines)
   let depth = 0
   let sawOpen = false
 
-  for (let index = startLine - 1; index < lines.length; index += 1) {
-    const line = stripLineComment(lines[index] ?? '')
+  for (let index = startLine - 1; index < codeLines.length; index += 1) {
+    const line = codeLines[index] ?? ''
     for (const char of line) {
       if (char === open) {
         depth += 1
@@ -970,6 +1193,82 @@ function countRubyOpeners(line: string): number {
 
 function countRubyClosers(line: string): number {
   return /^end\b/.test(line.trim()) ? 1 : 0
+}
+
+function maskCStyleSyntax(lines: string[]): string[] {
+  const maskedLines: string[] = []
+  let inBlockComment = false
+  let stringQuote: '"' | "'" | '`' | null = null
+  let escaped = false
+
+  for (const line of lines) {
+    let masked = ''
+
+    for (let index = 0; index < line.length; index += 1) {
+      const char = line[index]!
+      const next = line[index + 1]
+
+      if (inBlockComment) {
+        if (char === '*' && next === '/') {
+          masked += '  '
+          index += 1
+          inBlockComment = false
+        } else {
+          masked += ' '
+        }
+        continue
+      }
+
+      if (stringQuote) {
+        if (escaped) {
+          escaped = false
+          masked += ' '
+          continue
+        }
+
+        if (char === '\\' && stringQuote !== '`') {
+          escaped = true
+          masked += ' '
+          continue
+        }
+
+        if (char === stringQuote) {
+          stringQuote = null
+        }
+
+        masked += ' '
+        continue
+      }
+
+      if (char === '/' && next === '/') {
+        masked += ' '.repeat(line.length - index)
+        break
+      }
+
+      if (char === '/' && next === '*') {
+        masked += '  '
+        index += 1
+        inBlockComment = true
+        continue
+      }
+
+      if (char === '"' || char === "'" || char === '`') {
+        stringQuote = char
+        masked += ' '
+        continue
+      }
+
+      masked += char
+    }
+
+    maskedLines.push(masked)
+    if (stringQuote !== '`') {
+      stringQuote = null
+      escaped = false
+    }
+  }
+
+  return maskedLines
 }
 
 function stripLineComment(line: string): string {

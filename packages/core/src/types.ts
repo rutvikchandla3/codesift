@@ -33,7 +33,9 @@ export interface SearchHit {
   tokensReturned: number
   language?: string
   symbol?: string
+  parent?: string
   kind?: SymbolKind
+  generated?: boolean
   stale?: boolean
 }
 
@@ -151,6 +153,8 @@ export interface RepoStatus {
   stale: boolean
   chunkCount: number
   symbolCount: number
+  generatedFileCount: number
+  generatedChunkCount: number
   indexGeneration: number
   provider: RepoStatusProvider | null
   compatibility: IndexCompatibilityStatus

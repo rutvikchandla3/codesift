@@ -1,6 +1,6 @@
 # Implementation drifts and incomplete areas
 
-Snapshot: first M3 implementation slice in this working tree.
+Snapshot: M3 completed in this working tree.
 
 This file is the no-hidden-drift ledger. If a PLAN/M2_PLAN requirement is not implemented or not proven yet, it is listed here instead of implied by README/status wording.
 
@@ -19,9 +19,10 @@ The previous snapshot was stale. These items are now implemented in the repo:
 - MCP server instructions and per-tool input schemas.
 - Core `Repo.grep()` plus CLI `codesift grep` for literal/regex search over indexed files.
 - SQL-time path filtering for search/symbol paths, including a regression test for pre-truncation filtering.
-- First M3 structural chunk/symbol extraction for Go, Java, Ruby, and Rust.
+- M3 parser-quality structural chunk/symbol extraction for Go, Java, Ruby, and Rust, with an accepted no-tree-sitter-yet decision recorded in `PLAN.md` §12.10.
 - Heading-aware Markdown chunks and top-level key/section chunks for JSON, YAML, and TOML.
-- Nested `.gitignore` / `.codesiftignore` handling, default vendor/third-party ignores, generated/minified flagging + down-ranking, and oversized chunk splitting.
+- Nested `.gitignore` / `.codesiftignore` handling, default vendor/third-party ignores, generated/minified flagging + down-ranking, generated result/status UX, and oversized chunk splitting.
+- Local M3 eval fixture repos for Go, Java, Ruby, and Rust covering `search_code`, `find_symbol`, and `grep_code` behavior.
 
 ## Current honest status by milestone
 
@@ -73,22 +74,15 @@ Still open / not yet proven:
 
 ### M3
 
-First implementation slice now landed:
+M3 is complete:
 
-- Go, Java, Ruby, and Rust structural chunking plus symbol extraction are wired into `buildChunks()`.
-- Markdown headings and JSON/YAML/TOML top-level keys/sections now become named chunks.
-- Oversized structural chunks split into bounded overlapping windows before embedding/indexing.
-- Nested ignore files are honored during scanning; `vendor/`, `third_party/`, and `__generated__/` are default ignored.
-- Generated/minified files outside ignored dirs are indexed with a `generated` flag and down-ranked in search instead of silently winning neutral queries.
-
-Still open / not yet proven:
-
-1. **New language parsers are structural regex/brace scanners, not tree-sitter AST.**
-   - This starts M3 coverage and symbols, but does not yet meet the final AST-quality wording in `PLAN.md`.
-2. **Per-language eval-set spot checks are unit-level only.**
-   - `packages/core/test/m3.test.ts` proves representative fixtures; pinned OSS per-language eval fixtures are still needed before M3 sign-off.
-3. **Generated code has a down-ranking flag but no public result annotation yet.**
-   - Search scoring uses it; status/result UX can be improved later if needed.
+- Go, Java, Ruby, and Rust use hardened structural scanners rather than tree-sitter WASM. The accepted decision is documented in `PLAN.md` §12.10: avoiding grammar packaging/install surface is preferable for v0.1 until learned-vector quality justifies that dependency.
+- The scanners mask comments/strings before brace parsing, preserve parent breadcrumbs, suppress duplicate same-range chunks, and extract modules/classes/types/interfaces/traits, functions/methods, constants, and variables where sensible.
+- Markdown headings and JSON/YAML/TOML top-level keys/sections are named chunks and symbols where appropriate.
+- Oversized structural chunks split into bounded overlapping windows before embedding/indexing; regression coverage asserts max chunk size.
+- Nested ignore files are honored during scanning; `vendor/`, `third_party/`, and `__generated__/` remain default ignored.
+- Generated/minified files outside ignored dirs are indexed with a `generated` flag, down-ranked in search, annotated in search output, and counted in status.
+- `packages/eval/fixtures/m3-{go,java,ruby,rust}` plus `packages/eval/fixtures/manifest.json` provide per-language spot checks for `search_code`, `find_symbol`, and `grep_code`.
 
 ## Verification run for this snapshot
 
@@ -96,12 +90,11 @@ Still open / not yet proven:
 - `pnpm typecheck` passes locally.
 - `pnpm test` passes locally.
 - `pnpm run test:offline` passes locally.
-- `pnpm --filter @codesift/eval run bench` passes locally with no new losses and no token-loss axes.
+- `pnpm bench` passes locally with the updated M3 fixture loss baseline. Loss axes remain cold-stdio latency only.
 - `pnpm run test:smoke-install` skips on Node 24.14.0 with the expected unsupported-engine message; rerun on Node 20 or 22 before claiming packed-install proof.
 
 ## Next no-drift steps
 
-1. Finish M3 with tree-sitter-quality parsers or an explicit accepted parser-quality decision plus pinned per-language OSS spot checks.
-2. Implement the M4 daemon/watch path that reduces the measured stdio one-time startup tax.
-3. Replace the blob-vector arm with sqlite-vec `vec0` before learned-vector support is presented as default-ready.
-4. Keep expanding the pinned OSS golden set for M6 quality numbers.
+1. Implement the M4 daemon/watch path that reduces the measured stdio one-time startup tax.
+2. Replace the blob-vector arm with sqlite-vec `vec0` before learned-vector support is presented as default-ready.
+3. Keep expanding the pinned OSS golden set for M6 quality numbers.

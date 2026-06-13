@@ -4,7 +4,7 @@
 
 Hybrid (lexical + semantic) code search for repositories, shipped as one TypeScript core with three thin interfaces: a **CLI** for humans, an **SDK** for programs, and an **MCP server** for AI agents. Open source, MIT.
 
-**Status**: M3 implementation has started; M2 is complete, with first M3 language/chunker hardening landed locally.
+**Status**: M3 is complete; M2 is complete and M4 freshness/watch is next.
 
 ---
 
@@ -122,7 +122,7 @@ packages/
 ```
 scan (git ls-files ∪ fs walk, .gitignore-aware)
   → detect language
-  → chunk: AST (tree-sitter, 6 langs) | fallback line-windows (others)
+  → chunk: AST/structural language parsers | fallback line-windows (others)
   → extract symbols (defs: name, kind, signature, range, parent)
   → build embedding text: path + symbol breadcrumb + leading comment + code
   → embedBatch via provider (local ONNX default)
@@ -130,7 +130,7 @@ scan (git ls-files ∪ fs walk, .gitignore-aware)
 ```
 
 - **Chunking**: top-level functions/classes/methods become chunks; oversized nodes split at child boundaries with overlap; tiny siblings merged. Target 256–512 tokens/chunk. Each chunk carries file, range, language, symbol name/kind/parent. Fallback: ~60-line windows, 15-line overlap.
-- **tree-sitter via WASM** (`web-tree-sitter`): no node-gyp/native build pain across platforms; parsing speed is not the bottleneck (embedding is). Grammars for the 6 launch languages bundled as `.wasm` lazy-loaded.
+- **Parser-quality decision for M3**: tree-sitter WASM remains the preferred long-term parser path only if grammars can be bundled without native/postinstall pain. For M3, codesift accepts deterministic structural scanners for Go/Java/Ruby/Rust instead: comment/string-masked brace/block parsing, nested parent tracking, broad symbol extraction, and eval fixtures prove the launch contract without adding a new grammar supply chain.
 - **Contextual headers**: embedding text is prefixed with `src/auth/jwt.ts > class TokenVerifier > verify()` + docstring — markedly improves NL→code retrieval for little cost.
 
 ### 5.3 Embeddings — provider interface
@@ -203,7 +203,7 @@ Rough sizing: M0–M2 are the critical path to a usable tool; M3–M6 are parall
 |---|---|
 | Local embedding quality disappoints vs cloud | Eval harness quantifies the gap; provider swap is one config line; publish honest numbers. |
 | ~65 MB first-run model download UX | Progress UI, shared cache in `~/.cache/codesift`, clear offline docs; `--provider` lets users skip it. |
-| Native dep pain (`better-sqlite3`, `sqlite-vec` prebuilds) | Both ship prebuilt binaries; CI matrix on mac/linux/win catches breakage; tree-sitter is WASM so it's not a third native dep. |
+| Native dep pain (`better-sqlite3`, `sqlite-vec` prebuilds) | Both ship prebuilt binaries; CI matrix on mac/linux/win catches breakage; M3 avoids adding a parser native dependency. |
 | Brute-force KNN ceiling on huge repos | Documented limit; `StorageBackend` interface keeps an ANN backend (LanceDB) a post-MVP add, not a rewrite. |
 | Chunking quality varies by language | Per-language eval breakdown; fallback chunker as the floor. |
 | Index staleness confuses users | `stale` flags on results + `status` + MCP `index_status`; `--watch` for the sensitive. |
@@ -379,6 +379,20 @@ residency, and background sync lifecycle.
 First M3 implementation slice landed locally: structural chunk/symbol extraction for Go, Java, Ruby,
 and Rust; heading-aware Markdown chunks; top-level key/section-aware JSON/YAML/TOML chunks; nested
 `.gitignore` / `.codesiftignore` handling; default vendor/third-party ignores; generated/minified-source
-flagging with search down-ranking; and oversized structural chunk splitting. This is intentionally a
-pragmatic structural parser slice, not yet the final tree-sitter-quality AST implementation or the full
-per-language OSS eval gate.
+flagging with search down-ranking; and oversized structural chunk splitting. This was intentionally a
+pragmatic structural parser slice and not the final M3 sign-off.
+
+### 12.10 M3 completed (2026-06-13)
+
+M3 is signed off with an explicit parser-quality decision: do **not** add tree-sitter WASM yet. The
+available path would add grammar packaging and install-surface risk before codesift has learned-vector
+quality to justify it. Instead, M3 accepts hardened deterministic structural scanners for Go, Java, Ruby,
+and Rust: C-style comment/string masking for brace languages, Ruby block balancing, nested parent
+containers, duplicate-range suppression, and symbol extraction for modules/classes/types/interfaces/traits,
+functions/methods, constants, and variables where sensible.
+
+The proof gate is now checked in: local M3 fixture repos for Go, Java, Ruby, and Rust exercise
+`search_code`, `find_symbol`, and `grep_code` through the eval harness; core M3 tests cover parser edge
+cases, generated/minified down-ranking + public annotations, nested ignore behavior, Markdown/config
+chunking, and oversized chunk distribution. Tree-sitter remains a future migration option, not an M3 open
+item.

@@ -63,6 +63,70 @@
       "axes": [
         "latency.cold"
       ]
+    },
+    {
+      "repoId": "m3-go",
+      "queryId": "m3-go-error-literal",
+      "queryType": "string-literal",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
+      "repoId": "m3-go",
+      "queryId": "m3-go-method-symbol",
+      "queryType": "symbol-def",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
+      "repoId": "m3-java",
+      "queryId": "m3-java-error-literal",
+      "queryType": "string-literal",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
+      "repoId": "m3-java",
+      "queryId": "m3-java-method-symbol",
+      "queryType": "symbol-def",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
+      "repoId": "m3-ruby",
+      "queryId": "m3-ruby-error-literal",
+      "queryType": "string-literal",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
+      "repoId": "m3-ruby",
+      "queryId": "m3-ruby-method-symbol",
+      "queryType": "symbol-def",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
+      "repoId": "m3-rust",
+      "queryId": "m3-rust-error-literal",
+      "queryType": "string-literal",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
+      "repoId": "m3-rust",
+      "queryId": "m3-rust-method-symbol",
+      "queryType": "symbol-def",
+      "axes": [
+        "latency.cold"
+      ]
     }
   ]
 }

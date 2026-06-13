@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { DEFAULT_MANIFEST_PATH, createEmptyManifest, diffLossBudgets, loadManifest, proveRoutingPolicy, summarizeEmptyRun } from '../src/index.js'
+import { DEFAULT_MANIFEST_PATH, createEmptyManifest, diffLossBudgets, evaluateManifest, loadManifest, proveRoutingPolicy, summarizeEmptyRun } from '../src/index.js'
 
 describe('@codesift/eval', () => {
   it('creates empty manifests for future golden sets', () => {
@@ -28,11 +28,31 @@ describe('@codesift/eval', () => {
   it('loads the default fixture manifest', async () => {
     const manifest = await loadManifest(DEFAULT_MANIFEST_PATH)
 
-    expect(manifest.repos).toHaveLength(3)
-    expect(manifest.queries.length).toBeGreaterThanOrEqual(10)
+    expect(manifest.repos).toHaveLength(7)
+    expect(manifest.queries.length).toBeGreaterThanOrEqual(20)
     expect(manifest.queries.some((query) => query.queryType === 'exact-identifier')).toBe(true)
     expect(manifest.queries.some((query) => query.queryType === 'nl-concept')).toBe(true)
+    expect(manifest.repos.map((repo) => repo.language)).toEqual(
+      expect.arrayContaining(['go', 'java', 'ruby', 'rust'])
+    )
   })
+
+  it('evaluates local M3 language spot-check fixtures with codesift success', async () => {
+    const manifest = await loadManifest(DEFAULT_MANIFEST_PATH)
+    const m3Manifest = {
+      repos: manifest.repos.filter((repo) => repo.id.startsWith('m3-')),
+      queries: manifest.queries.filter((query) => query.repoId.startsWith('m3-'))
+    }
+    const summary = await evaluateManifest(m3Manifest, { resultLimit: 5, inspectionLimit: 5, latencyToleranceMs: Number.POSITIVE_INFINITY })
+    const codesiftRuns = summary.runs.filter((run) => run.tool === 'codesift')
+
+    expect(codesiftRuns).toHaveLength(12)
+    expect(codesiftRuns.every((run) => run.taskSuccess)).toBe(true)
+    expect(summary.exactRecallViolations).toEqual([])
+    expect(summary.routingProof.selections.map((selection) => selection.selectedTool)).toEqual(
+      expect.arrayContaining(['search_code', 'find_symbol', 'grep_code'])
+    )
+  }, 30_000)
 
   it('proves the deterministic agent policy prefers codesift tools over host grep', async () => {
     const manifest = await loadManifest(DEFAULT_MANIFEST_PATH)

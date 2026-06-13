@@ -32,6 +32,13 @@ interface ChunkLocationRow {
   end_line: number
 }
 
+interface RepoCountRow {
+  chunk_count: number
+  symbol_count: number
+  generated_file_count: number
+  generated_chunk_count: number
+}
+
 interface TableInfoRow {
   name: string
 }
@@ -571,6 +578,8 @@ export class SqliteRepo implements Repo {
         stale: false,
         chunkCount: 0,
         symbolCount: 0,
+        generatedFileCount: 0,
+        generatedChunkCount: 0,
         indexGeneration: 0,
         provider: null,
         compatibility: { ok: true },
@@ -581,14 +590,16 @@ export class SqliteRepo implements Repo {
     const db = this.openDatabase()
     const counts =
       db
-        .prepare<[], { chunk_count: number; symbol_count: number }>(
+        .prepare<[], RepoCountRow>(
           `
             select
               (select count(*) from chunks) as chunk_count,
-              (select count(*) from symbols) as symbol_count
+              (select count(*) from symbols) as symbol_count,
+              (select count(*) from files where generated = 1) as generated_file_count,
+              (select count(*) from chunks where generated = 1) as generated_chunk_count
           `
         )
-        .get() ?? { chunk_count: 0, symbol_count: 0 }
+        .get() ?? { chunk_count: 0, symbol_count: 0, generated_file_count: 0, generated_chunk_count: 0 }
 
     const providerId = readMeta(db, 'provider_id')
     const providerDims = readMetaNumber(db, 'provider_dims')
@@ -611,6 +622,8 @@ export class SqliteRepo implements Repo {
       stale: false,
       chunkCount: counts.chunk_count,
       symbolCount: counts.symbol_count,
+      generatedFileCount: counts.generated_file_count,
+      generatedChunkCount: counts.generated_chunk_count,
       indexGeneration,
       provider,
       compatibility: this.getIndexCompatibility(db, indexed),
@@ -914,6 +927,14 @@ function buildSearchHit(ranked: RankedChunkRow, query: string, snippetTokenBudge
 
   if (row.symbol) {
     hit.symbol = row.symbol
+  }
+
+  if (row.parent) {
+    hit.parent = row.parent
+  }
+
+  if (row.generated === 1) {
+    hit.generated = true
   }
 
   if (row.kind) {

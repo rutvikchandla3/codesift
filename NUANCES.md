@@ -322,6 +322,8 @@ worse, and it destroys the trust the "only tool" thesis depends on.
 
 ## 8. Theme F — Scope, scale & safety (what you index decides recall, tokens, latency, trust)
 
+**M3 update (2026-06-13):** The chunker-hardening subset below is now implemented: oversized structural splitting, generated/vendor/minified detection with down-ranking and result/status UX, nested ignore handling, and heading/key-aware Markdown/config chunking. Remaining Theme F items outside M3 (secrets/cloud, streaming batches, `vec0`, broader grep-drop-in surface) stay open in their later milestones.
+
 - **Secrets indexed verbatim and shipped to cloud embedders** *(CRITICAL, M5)*. No secret detection:
   `config.yaml`, `secrets.json`, `*.tf`, hardcoded keys in source are chunked, stored full-text in
   `index.db`, and (opt-in cloud) sent to Voyage/OpenAI verbatim. → a secret-scan pass (entropy +

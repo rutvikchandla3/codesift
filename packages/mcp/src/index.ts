@@ -400,13 +400,22 @@ function formatMcpSearchHits(hits: SearchHit[]): string {
   const tokensReturned = hits.reduce((sum, hit) => sum + hit.tokensReturned, 0)
   const body = hits
     .map((hit) => {
-      const symbol = hit.symbol ? ` ${hit.symbol}` : ''
+      const symbol = formatHitSymbol(hit)
+      const generated = hit.generated ? ' [generated]' : ''
       const snippet = compactSnippet(hit.snippet, 4)
-      return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${snippet ? ` | ${snippet}` : ''}`
+      return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${generated}${snippet ? ` | ${snippet}` : ''}`
     })
     .join('\n')
 
   return `${body}\ntokensReturned=${tokensReturned}`
+}
+
+function formatHitSymbol(hit: SearchHit): string {
+  if (!hit.symbol) {
+    return ''
+  }
+
+  return ` ${[hit.parent, hit.symbol].filter(Boolean).join(' > ')}`
 }
 
 function formatMcpSymbols(definitions: SymbolDefinition[]): string {

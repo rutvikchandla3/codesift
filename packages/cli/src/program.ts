@@ -47,6 +47,8 @@ export function formatStatus(status: RepoStatus): string {
     `stale: ${status.stale ? 'yes' : 'no'}`,
     `chunks: ${status.chunkCount}`,
     `symbols: ${status.symbolCount}`,
+    `generated files: ${status.generatedFileCount}`,
+    `generated chunks: ${status.generatedChunkCount}`,
     `generation: ${status.indexGeneration}`,
     `provider: ${status.provider?.id ?? 'unconfigured'}`,
     `compatibility: ${formatCompatibilityStatus(status)}`,
@@ -62,8 +64,9 @@ export function formatHits(hits: SearchHit[]): string {
   return hits
     .map((hit) => {
       const range = `${hit.range.startLine}-${hit.range.endLine}`
-      const symbol = hit.symbol ? ` · ${hit.symbol}` : ''
-      return `${hit.file}:${range}${symbol} · ${hit.reason} score=${hit.score.toFixed(4)}\n${hit.snippet}`
+      const symbol = formatHitSymbol(hit)
+      const generated = hit.generated ? ' · generated' : ''
+      return `${hit.file}:${range}${symbol}${generated} · ${hit.reason} score=${hit.score.toFixed(4)}\n${hit.snippet}`
     })
     .join('\n\n')
 }
@@ -75,7 +78,8 @@ export function formatCompactHits(hits: SearchHit[]): string {
 
   return hits
     .map((hit) => {
-      const symbol = hit.symbol ? ` · ${hit.symbol}` : ''
+      const symbol = formatHitSymbol(hit)
+      const generated = hit.generated ? ' [generated]' : ''
       const snippet = hit.snippet
         .split('\n')
         .map((line) => line.trim())
@@ -83,13 +87,21 @@ export function formatCompactHits(hits: SearchHit[]): string {
         .slice(0, 3)
         .join(' ↩ ')
 
-      return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${snippet ? ` | ${snippet}` : ''}`
+      return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${generated}${snippet ? ` | ${snippet}` : ''}`
     })
     .join('\n')
 }
 
 export function formatChunkId(id: string): string {
   return id.replace(/@[a-f0-9]{8,64}$/i, '')
+}
+
+function formatHitSymbol(hit: SearchHit): string {
+  if (!hit.symbol) {
+    return ''
+  }
+
+  return ` · ${[hit.parent, hit.symbol].filter(Boolean).join(' > ')}`
 }
 
 export function formatSymbols(definitions: SymbolDefinition[]): string {
