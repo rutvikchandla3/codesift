@@ -99,6 +99,21 @@ export interface SyncOptions {
   rebuild?: boolean
   signal?: AbortSignal
   onProgress?: (event: SyncProgressEvent) => void
+  /**
+   * Permit a cloud (learned) provider's document embed when secret-shaped content is detected.
+   * When false (the default), a detected secret aborts the sync; when true, the content is redacted
+   * before it is sent. Ignored on the local provider path, which never performs network egress.
+   */
+  allowSecrets?: boolean
+}
+
+export interface RepoOptions {
+  /**
+   * Explicit embedding provider id. Highest precedence in resolution:
+   * explicit `providerId` > `CODESIFT_EMBEDDING_PROVIDER` env > `.codesift/config.json` `provider`
+   * > the built-in local default.
+   */
+  providerId?: string
 }
 
 export interface SyncResult {

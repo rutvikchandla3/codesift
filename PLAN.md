@@ -4,7 +4,7 @@
 
 Hybrid (lexical + semantic) code search for repositories, shipped as one TypeScript core with three thin interfaces: a **CLI** for humans, an **SDK** for programs, and an **MCP server** for AI agents. Open source, MIT.
 
-**Status**: M4 freshness/watch is complete; M5 and M6 remain before v0.1 release.
+**Status**: M5 interfaces are complete (HTTP MCP transport, opt-in cloud providers, config/rebuild, SDK freeze + typedoc); M6 (quality & release) remains before v0.1. See `M5_PLAN.md` and §12.11.
 
 ---
 
@@ -397,3 +397,37 @@ The proof gate is now checked in: local M3 fixture repos for Go, Java, Ruby, and
 cases, generated/minified down-ranking + public annotations, nested ignore behavior, Markdown/config
 chunking, and oversized chunk distribution. Tree-sitter remains a future migration option, not an M3 open
 item.
+
+### 12.11 M5 completed (2026-06-13)
+
+M5 (interfaces complete) is signed off. Full detail and the per-stream acceptance criteria live in
+`M5_PLAN.md`. Landed:
+
+- **Streamable HTTP MCP transport** (`packages/mcp/src/http.ts`, wired to CLI `codesift serve`): a real
+  `StreamableHTTPServerTransport` in stateless mode over a `node:http` listener, wrapping the *same*
+  `createSdkServer` tool registry as stdio (no duplication). Binds `127.0.0.1` by default; an optional
+  bearer token is enforced on every request with a constant-time `timingSafeEqual` over fixed-length
+  sha256 digests (no length leak). Proven by `packages/mcp/test/http.test.ts` (real-HTTP
+  initialize→tools/list→tools/call round-trip + 401 on missing/wrong/wrong-scheme tokens) and a CLI
+  `serve` smoke (second process queries over HTTP with bearer auth).
+- **Opt-in cloud embedding providers** `voyage-code-3` (1024d) and `openai-text-embedding-3-small`
+  (1536d), `isLearned: true`, registered in the provider registry but **never the default**. Keys read
+  lazily inside `embedBatch`; **zero network at import** and on the local path (the offline/egress gate
+  still passes).
+- **Secret-scan + redaction** (`packages/core/src/secret-scan.ts`): `prepareForCloud` gates the cloud
+  **document-embed** path only — refuses on a detected secret unless `--allow-secrets`, in which case it
+  redacts before sending. The local provider path is never gated (it has no egress). The query-embed
+  path is intentionally left ungated (queries are user-authored, not repository content).
+- **Config + provider resolution** (`packages/core/src/config.ts`, `.codesift/config.json`): precedence
+  is explicit `RepoOptions.providerId` > `CODESIFT_EMBEDDING_PROVIDER` env > config `provider` > local
+  default, resolved per sync/search so the daemon's cached handles pick up changes. CLI `config get|set`
+  replaces the M5 stub; switching `provider` surfaces the existing `IndexCompatibilityError` guidance to
+  run `codesift index --rebuild`. `openRepo(root, options?)` now accepts the options arg.
+- **SDK freeze + typedoc**: `docs/sdk.md` (a quickstart proven by `packages/core/test/sdk-quickstart.test.ts`),
+  `typedoc.json` + `pnpm run docs` (builds with 0 errors), and the frozen public surface
+  (`RepoOptions`, `SearchReasonTag`, the config API, the provider/secret-scan exports) re-exported from
+  `@codesift/core`.
+
+`pnpm run ci` (build · typecheck · test · test:offline · bench) is green; the eval loss budget did not
+grow (0 new losses). **`vec0` stays deferred to M6** per §12.8 — cloud providers are opt-in, so the
+default-supported-learned-provider trigger for the `vec0`/ANN migration has not fired.

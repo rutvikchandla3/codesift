@@ -9,14 +9,17 @@ import {
   getDefaultEmbeddingProvider,
   isLearnedEmbeddingProvider,
   openRepo,
+  readConfig,
+  setConfigValue,
   type GrepHit,
   type GrepOptions,
   type RepoStatus,
   type SearchHit,
   type SymbolDefinition,
-  type SymbolKind
+  type SymbolKind,
+  type SyncOptions
 } from '@codesift/core'
-import { createHttpServer, createStdioServer, getToolDefinitions } from '@codesift/mcp'
+import { createHttpServerHandle, createStdioServer, getToolDefinitions } from '@codesift/mcp'
 
 export interface CliIo {
   stdout(message: string): void
@@ -178,6 +181,10 @@ function formatVectorStatus(status: RepoStatus): string {
   return status.vectorSearch.state
 }
 
+function formatConfigValue(value: unknown): string {
+  return Array.isArray(value) ? value.join(',') : String(value)
+}
+
 function parseCsvList(value?: string): string[] | undefined {
   if (!value) {
     return undefined
@@ -233,9 +240,17 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
     .argument('[path]', 'repository path', process.cwd())
     .option('--rebuild', 'force a full rebuild')
     .option('--watch', 'watch for filesystem changes')
-    .action(async (path: string, options: { rebuild?: boolean; watch?: boolean }) => {
+    .option('--allow-secrets', 'permit cloud embedding of secret-shaped content (redacts before send)')
+    .action(async (path: string, options: { rebuild?: boolean; watch?: boolean; allowSecrets?: boolean }) => {
       const repo = await openRepo(path)
-      const result = await repo.sync(options.rebuild ? { rebuild: true } : undefined)
+      const syncOptions: SyncOptions = {}
+      if (options.rebuild) {
+        syncOptions.rebuild = true
+      }
+      if (options.allowSecrets) {
+        syncOptions.allowSecrets = true
+      }
+      const result = await repo.sync(syncOptions)
 
       io.stdout(
         `Indexed ${result.indexedFiles} files (${result.skippedFiles} skipped, ${result.skippedSymlinks} symlink skips) in ${result.durationMs}ms at ${repo.root}.`
@@ -435,14 +450,22 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
     .option('--token <token>', 'optional bearer token')
     .action(async (path: string, options: { host: string; port: string; token?: string }) => {
       const repo = await openRepo(path)
-      const server = createHttpServer(repo, {
+      const server = createHttpServerHandle(repo, {
         host: options.host,
         port: Number(options.port),
         ...(options.token ? { token: options.token } : {})
       })
 
       await server.start()
-      io.stdout(`Scaffold HTTP server ready on ${options.host}:${options.port}.`)
+      const address = server.address ?? { host: options.host, port: Number(options.port) }
+      io.stdout(`codesift MCP HTTP listening on http://${address.host}:${address.port}`)
+      io.stdout(
+        server.requiresToken
+          ? 'Authentication: bearer token required (Authorization: Bearer <token>).'
+          : 'Authentication: none (bind is localhost-only).'
+      )
+      io.stdout(`Tools: ${getToolDefinitions().map((tool) => tool.name).join(', ')}. Press Ctrl+C to stop.`)
+      await waitForTermination(() => server.stop())
     })
 
   program
@@ -460,8 +483,41 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
     .argument('[action]', 'get or set')
     .argument('[key]')
     .argument('[value]')
-    .action((_action?: string, _key?: string, _value?: string) => {
-      io.stdout('Configuration management is scaffolded and will land with provider support in M5.')
+    .option('--repo <path>', 'repository path', process.cwd())
+    .action(async (action: string | undefined, key: string | undefined, value: string | undefined, options: { repo: string }) => {
+      const resolvedAction = action ?? 'get'
+
+      if (resolvedAction === 'get') {
+        const config = readConfig(options.repo)
+        if (key) {
+          const current = (config as Record<string, unknown>)[key]
+          io.stdout(current === undefined ? `${key} is unset` : `${key}=${formatConfigValue(current)}`)
+        } else {
+          const entries = Object.entries(config)
+          io.stdout(entries.length === 0 ? 'No configuration set (using local defaults).' : entries.map(([k, v]) => `${k}=${formatConfigValue(v)}`).join('\n'))
+        }
+        return
+      }
+
+      if (resolvedAction === 'set') {
+        if (!key) {
+          throw new Error('config set requires a key, e.g. codesift config set provider voyage-code-3')
+        }
+
+        setConfigValue(options.repo, key, value)
+        io.stdout(value === undefined ? `Unset ${key}.` : `Set ${key}=${value}.`)
+
+        if (key === 'provider') {
+          const repo = await openRepo(options.repo)
+          const status = await repo.status()
+          if (status.indexed && !status.compatibility.ok) {
+            io.stderr(status.compatibility.message ?? 'Provider changed — run "codesift index --rebuild" to rebuild with the new provider.')
+          }
+        }
+        return
+      }
+
+      throw new Error(`Unknown config action: ${resolvedAction}. Use "get" or "set".`)
     })
 
   program

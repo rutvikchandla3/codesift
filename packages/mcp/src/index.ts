@@ -17,6 +17,10 @@ import {
   type SymbolKind
 } from '@codesift/core'
 
+import { createHttpServerHandle } from './http.js'
+
+export { HttpMcpServerHandle, createHttpServerHandle } from './http.js'
+
 export const DEFAULT_SEARCH_K = CORE_DEFAULT_SEARCH_K
 
 const SYMBOL_KINDS = [
@@ -202,27 +206,6 @@ class StdioMcpServerHandle implements McpServerHandle {
   }
 }
 
-class ScaffoldHttpServerHandle implements McpServerHandle {
-  readonly transport = 'http' as const
-
-  constructor(
-    private readonly _repo: Repo,
-    readonly options: HttpServerOptions = {}
-  ) {}
-
-  get tools(): readonly McpToolDefinition[] {
-    return getToolDefinitions()
-  }
-
-  async start(): Promise<void> {
-    return undefined
-  }
-
-  async stop(): Promise<void> {
-    return undefined
-  }
-}
-
 export function getToolDefinitions(): readonly McpToolDefinition[] {
   const provider = getDefaultEmbeddingProvider()
   const searchDescription = isLearnedEmbeddingProvider(provider)
@@ -374,7 +357,7 @@ export function createStdioServer(repo: Repo): McpServerHandle {
 }
 
 export function createHttpServer(repo: Repo, options: HttpServerOptions = {}): McpServerHandle {
-  return new ScaffoldHttpServerHandle(repo, options)
+  return createHttpServerHandle(repo, options)
 }
 
 export async function callMcpTool(repo: Repo, name: McpToolName, args: unknown): Promise<string> {
@@ -448,7 +431,7 @@ export async function handleMcpJsonRpcRequest(repo: Repo, request: McpJsonRpcReq
   return jsonRpcError(id, -32601, `Method not found: ${method}`)
 }
 
-function createSdkServer(repo: Repo): McpServer {
+export function createSdkServer(repo: Repo): McpServer {
   const router = createRouter(repo)
   const server = new McpServer(
     { name: 'codesift', version: '0.0.0' },

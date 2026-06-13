@@ -8,10 +8,12 @@ import { minimatch } from 'minimatch'
 import * as sqliteVec from 'sqlite-vec'
 
 import { buildChunks, type ChunkRecord } from './chunking.js'
-import { getDefaultEmbeddingProvider, isLearnedEmbeddingProvider } from './embedding.js'
+import { readConfig } from './config.js'
+import { DEFAULT_EMBEDDING_PROVIDER_ID, getEmbeddingProvider, isCloudEmbeddingProvider, isLearnedEmbeddingProvider } from './embedding.js'
 import { isCodeLanguage, isDocumentationLanguage } from './languages.js'
 import { scanRepository, scanRepositoryManifest, type ScannedFile } from './scan.js'
-import { DEFAULT_SEARCH_K, type FindSymbolOptions, type GrepHit, type GrepOptions, type IndexCompatibilitySnapshot, type IndexCompatibilityStatus, type ReadChunkOptions, type ReadRangeOptions, type Repo, type RepoStaleReason, type RepoStatus, type RepoSyncStatus, type SearchHit, type SearchOptions, type SearchReasonTag, type StopWatching, type SymbolDefinition, type SymbolKind, type SyncOptions, type SyncResult, type VectorSearchStatus, type WatchOptions } from './types.js'
+import { prepareForCloud } from './secret-scan.js'
+import { DEFAULT_SEARCH_K, type EmbeddingProvider, type FindSymbolOptions, type GrepHit, type GrepOptions, type IndexCompatibilitySnapshot, type IndexCompatibilityStatus, type ReadChunkOptions, type ReadRangeOptions, type Repo, type RepoOptions, type RepoStaleReason, type RepoStatus, type RepoSyncStatus, type SearchHit, type SearchOptions, type SearchReasonTag, type StopWatching, type SymbolDefinition, type SymbolKind, type SyncOptions, type SyncResult, type VectorSearchStatus, type WatchOptions } from './types.js'
 
 interface ChunkRow {
   id: string
@@ -192,11 +194,32 @@ export class SqliteRepo implements Repo {
   private readonly databaseIdleResolvers: Array<() => void> = []
   private databaseGate: Promise<void> = Promise.resolve()
 
-  constructor(root: string) {
+  private readonly explicitProviderId: string | undefined
+
+  constructor(root: string, options: RepoOptions = {}) {
     this.root = resolve(root)
     this.indexDirectoryPath = resolve(this.root, '.codesift')
     this.indexGitignorePath = resolve(this.indexDirectoryPath, '.gitignore')
     this.indexPath = resolve(this.indexDirectoryPath, 'index.db')
+    this.explicitProviderId = options.providerId?.trim() || undefined
+  }
+
+  /**
+   * Resolve the active embedding provider. Precedence: explicit `RepoOptions.providerId` >
+   * `CODESIFT_EMBEDDING_PROVIDER` env > `.codesift/config.json` `provider` > the built-in local
+   * default. Read on every sync/search so a `config set provider` (or rebuild) is picked up without
+   * reopening the repo — important for the long-lived daemon's cached handles.
+   */
+  private resolveProvider(): EmbeddingProvider {
+    const envId = process.env.CODESIFT_EMBEDDING_PROVIDER?.trim()
+    const configuredId = readConfig(this.root).provider?.trim()
+    const providerId = this.explicitProviderId || envId || configuredId || DEFAULT_EMBEDDING_PROVIDER_ID
+    const provider = getEmbeddingProvider(providerId)
+    if (!provider) {
+      throw new Error(`Embedding provider not registered: ${providerId}`)
+    }
+
+    return provider
   }
 
   async initialize(): Promise<void> {
@@ -207,8 +230,10 @@ export class SqliteRepo implements Repo {
   async sync(options?: SyncOptions): Promise<SyncResult> {
     const startedAt = Date.now()
     const syncStartedAt = new Date().toISOString()
-    const provider = getDefaultEmbeddingProvider()
+    const provider = this.resolveProvider()
     const modelVersion = provider.modelVersion ?? provider.model ?? provider.id
+    const sendsToCloud = isCloudEmbeddingProvider(provider)
+    const allowSecrets = options?.allowSecrets ?? readConfig(this.root).allowSecrets ?? false
 
     if (options?.rebuild) {
       await this.runExclusiveDatabaseChange(() => this.resetDatabaseFile())
@@ -275,11 +300,13 @@ export class SqliteRepo implements Repo {
         throwIfAborted(options?.signal)
 
         const batch = batches[index] ?? []
-        const embeddings = await provider.embedBatch(
-          batch.map((chunk) => chunk.embeddingText),
-          { role: 'document' },
-          options?.signal
-        )
+        const batchTexts = batch.map((chunk) => chunk.embeddingText)
+        // Secret-scan only the cloud (learned) document-embed path: this is the egress vector for
+        // repository secrets. The local provider never leaves the machine, so it is never gated.
+        // Throws (aborting the sync, leaving the previous index intact) on a detected secret unless
+        // allowSecrets is set, in which case the content is redacted before it is sent.
+        const texts = sendsToCloud ? prepareForCloud(batchTexts, { allowSecrets }) : batchTexts
+        const embeddings = await provider.embedBatch(texts, { role: 'document' }, options?.signal)
 
         throwIfAborted(options?.signal)
 
@@ -417,7 +444,7 @@ export class SqliteRepo implements Repo {
           .all(ftsQuery, ...params)
       : []
 
-    const provider = getDefaultEmbeddingProvider()
+    const provider = this.resolveProvider()
     const shouldUseVectorSearch = isLearnedEmbeddingProvider(provider) && queryShouldUseVectorSearch(query)
     let vectorRows: ChunkRow[] = []
 
@@ -1122,7 +1149,7 @@ export class SqliteRepo implements Repo {
       return { ok: true }
     }
 
-    const provider = getDefaultEmbeddingProvider()
+    const provider = this.resolveProvider()
     const expected: IndexCompatibilitySnapshot = {
       schemaVersion: SCHEMA_VERSION,
       providerId: provider.id,

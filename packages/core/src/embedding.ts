@@ -1,7 +1,20 @@
+import { OpenAIEmbeddingProvider, OPENAI_EMBEDDING_PROVIDER_ID } from './providers/openai.js'
+import { VoyageEmbeddingProvider, VOYAGE_EMBEDDING_PROVIDER_ID } from './providers/voyage.js'
 import type { EmbeddingProvider, EmbeddingRole } from './types.js'
 
 export const DEFAULT_EMBEDDING_PROVIDER_ID = 'lexical-v1'
 export const LOCAL_HASH_EMBEDDING_PROVIDER_ID = 'local-hash-v1'
+
+/**
+ * Ids of the cloud (learned) embedding providers. These resolve via
+ * {@link getEmbeddingProvider} but are never the default; selecting one is
+ * always explicit (via `CODESIFT_EMBEDDING_PROVIDER` or `.codesift/config.json`).
+ * They perform network I/O only inside `embedBatch`, never at import/registration.
+ */
+export const CLOUD_EMBEDDING_PROVIDER_IDS: readonly string[] = [
+  VOYAGE_EMBEDDING_PROVIDER_ID,
+  OPENAI_EMBEDDING_PROVIDER_ID
+]
 const DEFAULT_LEXICAL_DIMS = 8
 const DEFAULT_HASH_DIMS = 384
 
@@ -182,6 +195,25 @@ function ensureBuiltinEmbeddingProviders(): void {
   if (!embeddingProviders.has(LOCAL_HASH_EMBEDDING_PROVIDER_ID)) {
     embeddingProviders.set(LOCAL_HASH_EMBEDDING_PROVIDER_ID, new LocalHashEmbeddingProvider())
   }
+
+  registerCloudEmbeddingProviders()
+}
+
+/**
+ * Register the cloud (learned) providers so they resolve via
+ * {@link getEmbeddingProvider} / appear in {@link listEmbeddingProviders}.
+ * Constructing the providers performs no network I/O; egress happens only when
+ * `embedBatch` is actually called. Idempotent. The default provider is
+ * unaffected and stays {@link DEFAULT_EMBEDDING_PROVIDER_ID}.
+ */
+export function registerCloudEmbeddingProviders(): void {
+  if (!embeddingProviders.has(VOYAGE_EMBEDDING_PROVIDER_ID)) {
+    embeddingProviders.set(VOYAGE_EMBEDDING_PROVIDER_ID, new VoyageEmbeddingProvider())
+  }
+
+  if (!embeddingProviders.has(OPENAI_EMBEDDING_PROVIDER_ID)) {
+    embeddingProviders.set(OPENAI_EMBEDDING_PROVIDER_ID, new OpenAIEmbeddingProvider())
+  }
 }
 
 ensureBuiltinEmbeddingProviders()
@@ -241,4 +273,8 @@ export function listEmbeddingProviders(): EmbeddingProvider[] {
 
 export function isLearnedEmbeddingProvider(provider: EmbeddingProvider): boolean {
   return provider.isLearned === true
+}
+
+export function isCloudEmbeddingProvider(provider: EmbeddingProvider): boolean {
+  return CLOUD_EMBEDDING_PROVIDER_IDS.includes(provider.id)
 }

@@ -16,6 +16,7 @@
     "test:smoke-install": "node scripts/smoke-pack-install.mjs",
     "typecheck": "pnpm -r --filter './packages/**' typecheck",
     "bench": "pnpm --filter @codesift/eval run bench",
+    "docs": "typedoc",
     "ci": "pnpm build && pnpm typecheck && pnpm test && pnpm run test:offline && pnpm bench"
   },
   "devDependencies": {
@@ -23,6 +24,7 @@
     "@types/node": "^24.0.1",
     "rimraf": "^6.0.1",
     "tsup": "^8.5.0",
+    "typedoc": "^0.28.19",
     "typescript": "^5.8.3",
     "vitest": "^3.2.4"
   }
