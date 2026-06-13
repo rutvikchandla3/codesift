@@ -238,3 +238,116 @@ Decision needed at review; M0 registers it.
 4. Default `k` for MCP `search_code` (proposal: 8, compact format) — agents over-fetch otherwise.
 5. Telemetry: proposal is **none** (OSS trust matters more than usage data) — confirm.
 6. Eval benchmark repos — any preferred OSS repos to use as golden-set targets?
+
+---
+
+## 12. Strategic correction & future nuances (post-audit, 2026-06-13)
+
+> This section is the output of a structured nuance audit (full detail in **`NUANCES.md`**;
+> milestone-scoped implementation deltas in **`M0_ADDENDUM.md`** and **`M1_ADDENDUM.md`**, kept
+> separate so the M0/M1 implementation work doesn't collide here). It **updates** the plan above.
+> Where it conflicts with an earlier section, this section wins; superseded statements are called out.
+
+### 12.1 Positioning correction — *subsume grep, don't complement it* (supersedes §3)
+
+§3 frames codesift as *"a complement [to ripgrep], not a competitor."* That framing caps the product.
+The goal is for codesift to be **undeniably better than grep** — *the only search tool an agent ever
+reaches for.* The moment an agent must **choose** between codesift and its always-present, zero-config
+built-in grep, codesift has already lost. So the thesis is **subsumption**:
+
+> codesift must do **everything grep does, at least as well** — including literal/regex/exact-string
+> match — *plus* semantic, behind one tool surface, so there is never a reason to keep grep wired in.
+
+### 12.2 "Undeniable" as a measurable contract (new — gates v0.1)
+
+Define superiority as a per-axis contract, proven head-to-head vs ripgrep on a pinned benchmark:
+
+| Axis | Contract |
+|---|---|
+| Recall (exact) | If a string/identifier exists, codesift returns it. `recall@k = 1.0` on the exact-identifier + string-literal golden sets. **Any miss is a release blocker.** |
+| Recall (concept) | NL→code recall@5 ≥ a real-embedding baseline. |
+| Tokens | Median *tokens-to-resolution* ≤ ½ of ripgrep-only on the agent-task set. |
+| Latency (common case) | Exact/identifier queries answer in single-digit ms and **never load a model**; cold-first-query competitive with `rg` cold. |
+| Latency (concept) | Warm p50 < 150 ms; cold-first-query a *separately published* number. |
+| Trust | Never confidently wrong: stale/branch-drift flagged; results deterministic; no secret leakage. |
+
+### 12.3 New & amended goals (extends §2)
+
+- **G8 — Grep subsumption.** A first-class literal/regex/exact primitive (`repo.grep`) over raw file
+  bytes, exposed via CLI (`codesift grep`) and MCP (`grep_code`), with grep flag-parity
+  (`-i -w -A/-B/-C -l -c`, include/exclude globs). Reframes the §2 references/call-graph non-goal:
+  no semantic call graph, but **occurrence-level recall parity with grep is required**.
+- **G9 — Token economics as a first-class, measured metric.** Tokens-to-resolution (TTR) vs ripgrep is
+  the headline metric, measured in the eval harness, gating every retrieval change.
+- **G10 — Query-intent routing.** Core classifies each query (literal/regex · identifier-exact · NL)
+  and routes; identifier-exact queries skip embedding entirely.
+- **G11 — Honest capability labelling.** The word "semantic"/"hybrid" is gated behind a real learned
+  embedding provider. The fake `local-hash-v1` is **never** the published default (supersedes the
+  optimism in §5.3 / README about a shipped semantic default).
+
+### 12.4 Architecture additions
+
+**§5.7 Latency contract & the cold-start problem (supersedes §5.5's single "p50 < 300 ms warm" target
+and §5.6's "No separate daemon lifecycle").** Agents spawn `npx codesift mcp` per repo over stdio, so
+there is **no resident model** — the "300 ms warm" number measures a state that never occurs. Replace
+with three published numbers: (a) **cold-first-query** (the real agent path: spawn → first result),
+(b) **warm-query** p50 < 150 ms, (c) **daemon-cold-start** (model+ext load, amortized once per machine).
+Decision: a **persistent per-machine daemon** (one long-lived process, model + DB + prepared statements
+resident, multiple indexes addressed by repo root) that stdio/HTTP MCP shims connect to over a socket;
+the `npx codesift mcp` shim becomes a thin, fast-starting client. The daemon also owns background
+incremental sync (pulls part of §5.6/M4 forward) and a multi-repo/workspace query.
+
+**§5.8 Staged, model-free-first retrieval (amends §5.5).** Retrieval is not "always run both arms then
+RRF." It is: (1) classify the query; (2) for literal/identifier queries, answer from FTS5 + symbols +
+literal scan **without loading the embedding model**; (3) load the model lazily only for conceptual
+queries or when lexical confidence is low; (4) fuse via RRF, with an **exact-match candidate set
+(FTS-exact ∪ symbol-exact) UNION-ed into the pool independent of the vector top-k** so an exact match is
+never truncated away; (5) push `lang`/`path`/`kind` into SQL predicates *before* truncation; (6) dedup
+overlapping chunks; (7) optional reranker over top-N behind a latency budget. Vectors use a real
+sqlite-vec **`vec0` virtual table** (not a blob-column `ORDER BY` scan), with a data-driven chunk-count
+threshold above which ANN becomes mandatory.
+
+**§5.9 Token-efficient result contract (new).** A single terse line format shared by `--compact` and
+MCP (compact is the MCP default; never pretty-printed JSON): `id`, `path:Lstart-end`, symbol breadcrumb,
+a **query-centered, token-bounded** snippet, and a 1-token match-reason tag (`=`/`~`/`+`) instead of a
+raw float score. A working `read_chunk(id)` / `readRange` expand-on-demand loop backed by **stable
+content-addressed ids**. A `maxTokens` budget on search (k becomes a ceiling). A single-best-answer mode
+for identifier-exact queries.
+
+**§5.10 Trust & safety (new).** Real staleness from `(mtime,size)` + git HEAD/branch (structured reason,
+not a bool); schema-version migration gate on open; provider/dims guard → guided `--rebuild`;
+`busy_timeout` + shadow-generation atomic swap for read-during-rebuild; secret-scan + redaction before
+any cloud-embedding send; self-gitignored index; determinism guarantee. Telemetry: **none** (resolves
+OQ#5), enforced by a network-egress CI test.
+
+### 12.5 Revised roadmap notes
+
+- **M2 is the make-or-break milestone** and absorbs the load-bearing subsumption work: real MCP
+  transport + routing `instructions`; literal/regex `grep_code`; exact-identifier recall floor = 1.0;
+  query routing; working `read_chunk` + token budget + dedup + terse format; `vec0` table;
+  content-hash embedding cache; the daemon decision + zero-model fast-path. **The TTR + cold-latency
+  eval is pulled in to M2** (not deferred to M6) so every retrieval change ships measured.
+- **§10 post-MVP roadmap, re-ordered for the thesis:** (1) the **agent-loop integration** lever — tuned,
+  eval-gated MCP `instructions` and a recipe to de-prioritize the built-in grep (this is where adoption
+  is actually won); (2) reranking; (3) ANN scale backend (threshold set by M2 data); (4) team server;
+  (5) more query types; (6) ecosystem. Reranking's latency cost is gated and measured, not assumed.
+- **M6 ships a public head-to-head scorecard**, including a checked-in `losses.json` of queries where
+  grep still wins — honesty is part of "undeniable."
+
+### 12.6 New risks (extends §8)
+
+| Risk | Mitigation |
+|---|---|
+| Per-spawn cold-start makes codesift categorically slower than grep on its best queries | Zero-model lexical/exact fast-path (single-digit ms) + persistent daemon; cold-first-query as a published, gated metric. |
+| Shipping the fake `local-hash-v1` as "semantic" destroys trust and poisons the eval | Hard gate: never the published default; "semantic" wording gated behind a learned provider; honest "lexical search" until then. |
+| Native-dep (`better-sqlite3`/`sqlite-vec`) install failure silently kills the MCP server | Lazy-load `sqlite-vec` so lexical survives; expanded CI matrix (musl/Alpine, Win-ARM) + clean-install smoke test asserting no source compile. |
+| Secrets indexed and shipped to cloud embedders | Secret-scan + redaction pass; cloud path refuses without `--allow-secrets`; expanded default ignores. |
+| Confidently-wrong stale/cross-branch results | Real staleness (mtime + git HEAD), structured reason, per-hit `stale`, agent self-heal via `index_status`. |
+| The benchmark proves the wrong thing (recall-only, no grep baseline) | Head-to-head TTR + cold-latency vs ripgrep; query-type-balanced golden sets incl. exact-identifier; paired-delta CI gates. |
+
+### 12.7 Resolved open questions (from §11)
+
+- **OQ#4** (default `k` for MCP) → **budget-first**: unify default `k=8` in core as a *ceiling*; add a
+  `maxTokens` budget; report `tokensReturned`.
+- **OQ#5** (telemetry) → **none**, enforced by a network-egress CI test.
+- Default local `index` / `search` / `sym` / `status` flows are expected to remain fully offline; any outbound network use on that path is treated as a regression.

@@ -4,7 +4,7 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { formatHits, formatStatus, formatSymbols, runCli, type CliIo } from '../src/program.js'
+import { formatCompactHits, formatHits, formatStatus, formatSymbols, runCli, type CliIo } from '../src/program.js'
 
 const temporaryDirectories: string[] = []
 
@@ -26,13 +26,18 @@ describe('codesift CLI formatters', () => {
         stale: false,
         chunkCount: 0,
         symbolCount: 0,
-        provider: null
+        provider: null,
+        vectorSearch: {
+          available: true,
+          state: 'lazy'
+        }
       })
     ).toContain('provider: unconfigured')
   })
 
   it('renders empty states', () => {
     expect(formatHits([])).toContain('No hits found')
+    expect(formatCompactHits([])).toContain('No hits found')
     expect(formatSymbols([])).toContain('No symbol matches found')
   })
 })
@@ -69,7 +74,21 @@ describe('codesift CLI end-to-end', () => {
 
     await runCli(['node', 'codesift', 'index', repoRoot], io)
     await runCli(
-      ['node', 'codesift', 'search', 'validate jwt token', '--repo', repoRoot, '--lang', 'typescript', '-k', '1'],
+      [
+        'node',
+        'codesift',
+        'search',
+        'validate jwt token',
+        '--repo',
+        repoRoot,
+        '--lang',
+        'typescript',
+        '--kind',
+        'function',
+        '--compact',
+        '-k',
+        '1'
+      ],
       io
     )
     await runCli(
@@ -94,6 +113,7 @@ describe('codesift CLI end-to-end', () => {
 
     expect(messages[0]).toContain('Indexed 2 files')
     expect(messages[1]).toContain('src/auth/jwt.ts')
+    expect(messages[1]).toContain('verifyJwtToken')
     expect(messages[2]).toContain('function verifyJwtToken')
 
     const jsonHits = JSON.parse(messages[3] ?? '[]') as Array<{ file: string }>

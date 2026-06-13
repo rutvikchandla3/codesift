@@ -34,7 +34,8 @@ export function formatStatus(status: RepoStatus): string {
     `stale: ${status.stale ? 'yes' : 'no'}`,
     `chunks: ${status.chunkCount}`,
     `symbols: ${status.symbolCount}`,
-    `provider: ${status.provider?.id ?? 'unconfigured'}`
+    `provider: ${status.provider?.id ?? 'unconfigured'}`,
+    `vector: ${formatVectorStatus(status)}`
   ].join('\n')
 }
 
@@ -47,9 +48,30 @@ export function formatHits(hits: SearchHit[]): string {
     .map((hit) => {
       const range = `${hit.range.startLine}-${hit.range.endLine}`
       const symbol = hit.symbol ? ` · ${hit.symbol}` : ''
-      return `${hit.file}:${range}${symbol}\n${hit.snippet}`
+      return `${hit.file}:${range}${symbol} · score=${hit.score.toFixed(4)}\n${hit.snippet}`
     })
     .join('\n\n')
+}
+
+export function formatCompactHits(hits: SearchHit[]): string {
+  if (hits.length === 0) {
+    return 'No hits found.'
+  }
+
+  return hits
+    .map((hit) => {
+      const range = `${hit.range.startLine}-${hit.range.endLine}`
+      const symbol = hit.symbol ? ` · ${hit.symbol}` : ''
+      const snippet = hit.snippet
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .slice(0, 3)
+        .join(' ↩ ')
+
+      return `${hit.file}:${range}${symbol} · ${hit.score.toFixed(4)}${snippet ? ` | ${snippet}` : ''}`
+    })
+    .join('\n')
 }
 
 export function formatSymbols(definitions: SymbolDefinition[]): string {
@@ -63,6 +85,16 @@ export function formatSymbols(definitions: SymbolDefinition[]): string {
       return `${definition.kind} ${definition.name} — ${definition.file}:${range}`
     })
     .join('\n')
+}
+
+function formatVectorStatus(status: RepoStatus): string {
+  const detail = status.vectorSearch.detail ? ` — ${status.vectorSearch.detail}` : ''
+
+  if (status.vectorSearch.state === 'unavailable') {
+    return `${status.vectorSearch.state} (${status.vectorSearch.message ?? 'unknown error'}${detail})`
+  }
+
+  return status.vectorSearch.state
 }
 
 function parseCsvList(value?: string): string[] | undefined {
@@ -110,30 +142,48 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
     .option('--repo <path>', 'repository path', process.cwd())
     .option('--lang <langs>', 'comma-separated language filter, e.g. ts,typescript,python')
     .option('--path <glob>', 'path glob filter, e.g. src/**')
+    .option('--kind <kind>', 'symbol kind filter for matching chunks')
     .option('--json', 'print JSON results')
-    .action(async (query: string, options: { k: string; repo: string; lang?: string; path?: string; json?: boolean }) => {
-      const repo = await openRepo(options.repo)
-      const languages = parseCsvList(options.lang)
-      const searchOptions: {
-        k: number
-        lang?: string[]
-        pathGlob?: string
-      } = {
-        k: Number(options.k)
+    .option('--compact', 'print token-efficient compact results')
+    .action(
+      async (
+        query: string,
+        options: { k: string; repo: string; lang?: string; path?: string; kind?: string; json?: boolean; compact?: boolean }
+      ) => {
+        const repo = await openRepo(options.repo)
+        const languages = parseCsvList(options.lang)
+        const searchOptions: {
+          k: number
+          lang?: string[]
+          pathGlob?: string
+          kind?: SymbolKind
+        } = {
+          k: Number(options.k)
+        }
+
+        if (languages) {
+          searchOptions.lang = languages
+        }
+
+        if (options.path) {
+          searchOptions.pathGlob = options.path
+        }
+
+        if (options.kind) {
+          searchOptions.kind = options.kind as SymbolKind
+        }
+
+        const hits = await repo.search(query, searchOptions)
+        const output = options.json ? JSON.stringify(hits, null, 2) : options.compact ? formatCompactHits(hits) : formatHits(hits)
+        const status = await repo.status()
+
+        io.stdout(output)
+
+        if (status.vectorSearch.state === 'unavailable' && status.vectorSearch.message) {
+          io.stderr(formatVectorStatus(status))
+        }
       }
-
-      if (languages) {
-        searchOptions.lang = languages
-      }
-
-      if (options.path) {
-        searchOptions.pathGlob = options.path
-      }
-
-      const hits = await repo.search(query, searchOptions)
-
-      io.stdout(options.json ? JSON.stringify(hits, null, 2) : formatHits(hits))
-    })
+    )
 
   program
     .command('sym')

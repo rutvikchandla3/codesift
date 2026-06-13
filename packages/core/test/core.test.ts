@@ -71,6 +71,7 @@ export function applyRetryBackoff(attempt: number): number {
       `# Demo repo
 
 This project validates JWT tokens before protected requests continue.
+TokenVerifier is the main entry point described in docs. TokenVerifier appears here as documentation too.
 `,
       'utf8'
     )
@@ -89,6 +90,8 @@ This project validates JWT tokens before protected requests continue.
       lang: ['markdown'],
       pathGlob: 'README.md'
     })
+    const exactSymbolHits = await repo.search('TokenVerifier', { k: 2 })
+    const functionOnlyHits = await repo.search('validate jwt token', { k: 3, kind: 'function' })
     const symbols = await repo.findSymbol('verifyJwtToken')
 
     expect(result.indexedFiles).toBe(4)
@@ -103,6 +106,8 @@ This project validates JWT tokens before protected requests continue.
     expect(pythonHits[0]?.file).toBe('client.py')
     expect(srcOnlyHits.some((hit) => hit.file === 'client.py')).toBe(false)
     expect(readmeHits[0]?.file).toBe('README.md')
+    expect(exactSymbolHits[0]?.file).toBe('src/auth/jwt.ts')
+    expect(functionOnlyHits.every((hit) => hit.kind === 'function')).toBe(true)
     expect(symbols[0]?.file).toBe('src/auth/jwt.ts')
     expect(symbols[0]?.kind).toBe('function')
   })
