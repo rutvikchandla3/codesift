@@ -3,6 +3,8 @@ export type {
   EmbeddingProvider,
   EmbeddingRole,
   FindSymbolOptions,
+  GrepHit,
+  GrepOptions,
   IndexCompatibilitySnapshot,
   IndexCompatibilityStatus,
   Range,

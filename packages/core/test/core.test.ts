@@ -139,6 +139,8 @@ describe('@codesift/core', () => {
     const exactSymbolHits = await repo.search('TokenVerifier', { k: 2 })
     const functionOnlyHits = await repo.search('validate jwt token', { k: 3, kind: 'function' })
     const symbols = await repo.findSymbol('verifyJwtToken')
+    const literalGrepHits = await repo.grep('TokenVerifier', { pathGlob: 'src/**', contextLines: 1 })
+    const regexGrepHits = await repo.grep('verifyJwtToken\\(token', { regex: true, pathGlob: 'src/auth/**' })
     const chunkSource = await repo.readChunk(jwtHits[0]!.id)
     const rangeSource = await repo.readRange('src/auth/jwt.ts', 2, 4, { contextLines: 1 })
 
@@ -167,6 +169,10 @@ describe('@codesift/core', () => {
     expect(functionOnlyHits.every((hit) => hit.kind === 'function')).toBe(true)
     expect(symbols[0]?.file).toBe('src/auth/jwt.ts')
     expect(symbols[0]?.kind).toBe('function')
+    expect(literalGrepHits.map((hit) => hit.file)).toEqual(['src/auth/jwt.ts'])
+    expect(literalGrepHits[0]?.snippet).toContain('export class TokenVerifier')
+    expect(regexGrepHits[0]?.file).toBe('src/auth/jwt.ts')
+    expect(regexGrepHits[0]?.line).toBe(2)
     expect(jwtHits[0]?.id).toMatch(/^src\/auth\/jwt\.ts:\d+-\d+@[a-f0-9]{64}$/)
     expect(secondSearchIds).toEqual(jwtHits.map((hit) => hit.id))
     expect(secondSyncIds).toEqual(jwtHits.map((hit) => hit.id))
@@ -181,6 +187,34 @@ describe('@codesift/core', () => {
     db.close()
 
     expect(fileRow?.mtime).toBeGreaterThan(0)
+  })
+
+  it('applies path filters before search truncation', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-path-filter-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'aaa'), { recursive: true })
+    await mkdir(join(repoRoot, 'zzz'), { recursive: true })
+
+    for (let index = 0; index < 240; index += 1) {
+      await writeFile(
+        join(repoRoot, 'aaa', `file-${String(index).padStart(3, '0')}.ts`),
+        `export function outside${index}(): string {\n  return 'common token outside'\n}\n`,
+        'utf8'
+      )
+    }
+
+    await writeFile(
+      join(repoRoot, 'zzz', 'target.ts'),
+      `export function targetOnly(): string {\n  return 'common token inside target'\n}\n`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+    const hits = await repo.search('common token', { k: 1, pathGlob: 'zzz/**' })
+
+    expect(hits.map((hit) => hit.file)).toEqual(['zzz/target.ts'])
   })
 
   it('registers embedding providers and routes document/query roles with batched progress', async () => {

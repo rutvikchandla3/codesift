@@ -8,7 +8,7 @@ Local-first lexical code search for repositories, delivered as one TypeScript co
 
 ## Status
 
-M1 walking skeleton is live and in final polish.
+M2 implementation has started on top of the M1 walking skeleton.
 
 Implemented today:
 
@@ -17,14 +17,15 @@ Implemented today:
 - Python structural definition chunking
 - fallback line-window chunking for other supported text files
 - SQLite-backed local index with FTS and lazy `sqlite-vec` loading
-- end-to-end `index`, `search`, `sym`, `status`, and `clean` CLI flows
+- end-to-end `index`, `search`, `sym`, `grep`, `status`, and `clean` CLI flows
 - stable chunk ids plus on-demand chunk/range reads from disk
+- real MCP stdio transport with `search_code`, `find_symbol`, `grep_code`, `read_chunk`, and `index_status`
 
 Still intentionally deferred to later milestones:
 
 - production learned embedding provider
 - watch mode and incremental freshness
-- full MCP transport implementation
+- streamable HTTP MCP transport
 - broader eval harness and ranking work
 
 ## Supported platforms
@@ -62,8 +63,19 @@ pnpm test
 
 node packages/cli/dist/bin.js index .
 node packages/cli/dist/bin.js search "where is the sqlite database opened" -k 5
+node packages/cli/dist/bin.js grep -e "SqliteRepo" --path 'packages/core/**'
 node packages/cli/dist/bin.js sym SqliteRepo
 ```
+
+## MCP recipe
+
+After indexing a repo, point an MCP client at the stdio command:
+
+```bash
+codesift mcp /path/to/repo
+```
+
+Routing policy for agents: `find_symbol` for identifiers/definitions, `grep_code` for exact strings or regex, and `search_code` for behavior/concept queries. Keep host grep as fallback, not the first tool.
 
 ## Commands
 

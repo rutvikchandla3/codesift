@@ -1,284 +1,88 @@
 # Implementation drifts and incomplete areas
 
-Snapshot: current repo state after M0 scaffold + M1 walking skeleton / final polish work.
+Snapshot: M2 first critical-path slice in this working tree.
 
-## Executive summary
+This file is the no-hidden-drift ledger. If a PLAN/M2_PLAN requirement is not implemented or not proven yet, it is listed here instead of implied by README/status wording.
 
-This repo is usable as a prototype, but it does not fully match the plan yet.
+## Completed since the previous drift snapshot
 
-- **M0** is mostly complete in practice, but not complete by the strict PLAN exit criteria.
-- **M1** is implemented in spirit, but several core pieces were simplified or substituted.
+The previous snapshot was stale. These items are now implemented in the repo:
 
-## M0 drifts from PLAN
+- FTS5 `chunks_fts`, BM25 ranking, and RRF-style fusion.
+- Symbol boost and exact-symbol candidate handling in `search()`.
+- Stable content/location chunk ids.
+- Core read primitives: `readChunk()` and `readRange()`.
+- Provider/schema/dims/model compatibility guard with guided rebuild errors.
+- CLI `--kind` and `--compact` for search.
+- Real MCP stdio server for `codesift mcp` using `@modelcontextprotocol/sdk`.
+- MCP tools: `search_code`, `find_symbol`, `grep_code`, `read_chunk`, `index_status`.
+- MCP server instructions and per-tool input schemas.
+- Core `Repo.grep()` plus CLI `codesift grep` for literal/regex search over indexed files.
+- SQL-time path filtering for search/symbol paths, including a regression test for pre-truncation filtering.
 
-### 1. npm name was not actually registered
-PLAN says M0 includes name registration on npm.
-
-Current state:
-- `codesift` was chosen and used in package names
-- npm availability was checked informally
-- the name was **not actually registered/published/reserved**
-
-Impact:
-- M0 is not strictly complete by the PLAN exit criteria.
-
-### 2. GitHub CI was scaffolded but not proven green remotely
-PLAN says M0 exits with CI green.
-
-Current state:
-- `.github/workflows/ci.yml` exists
-- local `pnpm build` / `pnpm test` were run
-- the GitHub Actions matrix was **not verified in GitHub** as part of M0 completion
-
-Impact:
-- CI exists, but M0 did not fully prove the remote matrix.
-
-### 3. Package scaffold was not publish-validated
-Current state:
-- workspace/packages exist
-- build/test/type setup exists
-- package publish/install flows were **not validated**
-
-Impact:
-- acceptable for a scaffold, but below a strict release-ready interpretation.
-
-## M1 drifts from PLAN
-
-### 1. Local embeddings are heuristic, not a real ONNX embedding model
-PLAN intent:
-- local-first semantic retrieval with a real embedding model
-
-Current state:
-- `packages/core/src/embedding.ts` implements `local-hash-v1`
-- this is token hashing + stemming + trigram/synonym heuristics
-- this is **not** a true ML embedding model
-
-Impact:
-- retrieval is semantic-ish, not true semantic embeddings
-- quality will be more brittle than the PLAN target implies
-
-### 2. Python chunking is not AST chunking
-PLAN says M1 should have AST chunking for TS/JS and Python.
-
-Current state:
-- TS/JS uses the TypeScript compiler API
-- Python uses regex + indentation-based structure extraction
-- Python is **not** AST-based today
-
-Impact:
-- Python support is useful but below the planned fidelity.
-
-### 3. TS/JS chunking does not use tree-sitter
-PLAN architecture describes tree-sitter WASM.
-
-Current state:
-- TS/JS chunking uses the TypeScript compiler API
-- this is a deliberate shortcut / substitution
-
-Impact:
-- workable for now, but it drifts from the planned parser architecture.
-
-### 4. Storage schema is simpler than planned
-PLAN storage describes:
-- `files`
-- `chunks`
-- `chunks_fts`
-- `vecs`
-- `symbols`
-- `meta`
-
-Current state:
-- `files`
-- `chunks`
-- `symbols`
-- `meta`
-
-Missing:
-- **FTS5 table**
-- separate **vector table**
-
-Impact:
-- current storage is a prototype layout, not the planned hybrid-search layout.
-
-### 5. Retrieval is vector-only, not hybrid
-PLAN retrieval describes:
-- BM25 over lexical text
-- vector KNN
-- RRF fusion
-- exact symbol boost
-- SQL-native filters
-
-Current state:
-- vector-distance search only
-- some hand-tuned ranking boosts/penalties
-- symbol lookup exists separately via `sym`
-
-Missing:
-- **FTS5 / BM25**
-- **RRF fusion**
-- **exact symbol boost in ranking**
-- **SQL-native path filtering**
-
-Impact:
-- current search works as a prototype but is materially simpler than the PLAN.
-
-### 6. Ranking heuristics compensate for weak embeddings
-Current state:
-- code/symbol chunks are mildly favored
-- docs/project-metadata files can be mildly penalized for code-focused queries
-
-Impact:
-- this improves results, but it is a heuristic patch rather than the planned retrieval architecture.
-
-### 7. `sync()` is a rebuild, not true incremental indexing
-PLAN later expects manifest-diff incremental freshness.
-
-Current state:
-- scanning happens each run
-- chunk/symbol tables are cleared and rebuilt
-- `removedFiles` is not a real deletion diff
-
-Impact:
-- simple and reliable for now, but not aligned with the planned freshness model.
-
-### 8. `watch()` is still not implemented
-PLAN has watch mode later, but current code still leaves it as a no-op.
-
-Current state:
-- `watch()` returns a no-op stop handler
-- CLI still says watch is reserved for M4
-
-Impact:
-- expected for milestone sequencing, but still incomplete vs overall product plan.
-
-### 9. Staleness reporting is not real yet
-PLAN mentions stale flags / freshness checks.
-
-Current state:
-- `status().stale` is always `false`
-- no mtime/hash freshness checks are exposed at query time
-
-Impact:
-- status is not yet trustworthy for freshness.
-
-### 10. MCP package is still mostly scaffolded
-Current state:
-- tool names and router wiring exist
-- search/symbol routing reuses core repo APIs
-- transport/server behavior is still scaffold-level
-- `read_chunk` is still placeholder text
-
-Impact:
-- the package exists, but this is not a complete MCP server implementation yet.
-
-## Places where the repo is ahead in surface area
-
-These are useful, but they do not erase the architectural drifts:
-
-- `sym` command already exists
-- symbol extraction already exists for TS/JS and Python
-- CLI search has repo/lang/path filters
-- end-to-end tests cover indexing/search/symbol flows on synthetic repos
-
-## Honest status against PLAN
+## Current honest status by milestone
 
 ### M0
-- **Practical status:** mostly done
-- **Strict PLAN status:** not fully complete
+
+Practical scaffold is in place. Strict release-readiness is still not fully proven:
+
+1. **npm name/package publication is not proven in this repo.**
+   - Package names are set, but no actual npm publish/reservation proof is checked in.
+2. **Remote GitHub Actions green status is not proven here.**
+   - Local CI passes; remote matrix status must be verified outside this working tree.
+3. **Packed install smoke was not run under a supported Node in this session.**
+   - `pnpm run test:smoke-install` skips on Node 24 because the project supports Node 20/22.
 
 ### M1
-- **Practical status:** useful walking skeleton / prototype
-- **Strict PLAN status:** partially complete and drifted
 
-## Biggest technical shortcuts
+M1 addendum contracts are mostly implemented, but these product/architecture drifts remain:
 
-If only a few items matter most, these are the main ones:
+1. **Default embeddings are lexical/heuristic, not a real learned ONNX model.**
+   - README/CLI/MCP correctly avoid claiming semantic/hybrid behavior unless a learned provider is active.
+2. **Python chunking is structural regex/indentation, not Python AST.**
+3. **TS/JS chunking uses the TypeScript compiler API, not tree-sitter WASM.**
+4. **`sync()` is still full rebuild style, not manifest-diff incremental indexing.**
+5. **`watch()` remains a no-op and CLI watch is explicitly reserved for M4.**
+6. **Freshness/staleness reporting is not real yet.**
+   - `status().stale` is still always false.
 
-1. heuristic local embedder instead of a real local embedding model
-2. Python structural chunking instead of Python AST chunking
-3. no FTS5 / BM25 / hybrid fusion yet
-4. simplified storage schema
-5. rebuild-style sync instead of true incremental indexing
+### M2
 
-## Recommended fix order
+Implemented in the current slice:
 
-1. add real lexical search with FTS5
-2. implement hybrid retrieval (BM25 + vector fusion)
-3. add exact symbol boost in search ranking
-4. replace / upgrade the local embedding provider
-5. replace Python chunking with true AST chunking
-6. move path filtering into SQL / retrieval pipeline
-7. implement manifest-diff incremental sync
-8. implement real MCP transport + `read_chunk`
+- M2-1 real stdio MCP transport with JSON-RPC smoke coverage.
+- M2-2 routing instructions and schemas.
+- M2-3 first implementation of literal/regex grep in core, CLI, and MCP.
+- M2-4 first implementation of exact candidates plus SQL path filtering.
 
-## Additional drifts found in follow-up audit
+Still open / not yet proven:
 
-These were not captured above. Not all of them are M0/M1 blockers, but they are real PLAN drift.
+1. **M2-3 grep parity is not proven against ripgrep.**
+   - Current grep uses JavaScript `RegExp` semantics and scans files from the indexed file set.
+   - The required random-literal superset-or-equal invariant vs `rg` is not yet implemented as a test/eval gate.
+2. **M2-4 exact recall is not golden-set proven.**
+   - Exact symbol + exact FTS candidate union exists, and path filtering is SQL-time.
+   - `recall@k = 1.0` for exact identifiers/string literals, including path-scoped queries, still needs the M2 eval harness.
+3. **M2-5 TTR/cold-latency eval is not implemented.**
+   - `packages/eval` remains a scaffold relative to the M2 proof requirements: pinned repos, deterministic policy runner, paired codesift-vs-ripgrep deltas, CI regression gate, and `losses.json` are all still open.
+4. **M2-6 token levers are only partially started.**
+   - MCP returns compact text by default.
+   - `maxTokens`, `tokensReturned`, overlap dedupe/merge, single-best-answer mode, query-centered snippets, and score-to-reason-tag payload changes are not implemented.
+5. **M2-7 latency decisions are not recorded.**
+   - No measured `vec0`/ANN crossover yet.
+   - No daemon timing decision yet.
+   - PLAN §12 has not been updated with these decisions.
+6. **HTTP MCP remains scaffolded.**
+   - M2 exit criteria are stdio-focused, but `codesift serve` still should not be represented as complete.
 
-### 1. CLI search surface is still behind the PLAN contract
-PLAN CLI/search surface includes:
-- `--kind`
-- `--compact`
-- scored, breadcrumb-rich default output
+## Verification run for this snapshot
 
-Current state:
-- `packages/cli/src/program.ts` search supports `--lang`, `--path`, and `--json`
-- search does **not** support `--kind`
-- search does **not** support `--compact`
-- default hit formatting does **not** include score or parent breadcrumb
+- `pnpm run ci` passes locally.
+- `pnpm run test:smoke-install` skips on Node 24.14.0 with the expected unsupported-engine message; rerun on Node 20 or 22 before claiming packed-install proof.
 
-Impact:
-- the CLI surface is still narrower than the planned user contract.
+## Next no-drift steps
 
-### 2. Core SDK does not yet expose the primitive needed for MCP `read_chunk`
-PLAN MCP design expects a follow-up expansion flow from compact hit ids.
-
-Current state:
-- `@codesift/core` exposes `search`, `findSymbol`, `status`, and `watch`
-- it does **not** expose a chunk lookup / expansion API by chunk id
-- `@codesift/mcp` therefore cannot implement real `read_chunk` yet and falls back to placeholder text
-
-Impact:
-- this is more than an MCP transport gap; the core SDK contract is still missing a required read primitive.
-
-### 3. MCP commands are scaffold-only in a stronger sense than the current note suggests
-Current state:
-- `packages/mcp/src/index.ts` has no real stdio MCP transport
-- `packages/mcp/src/index.ts` has no real HTTP server
-- `codesift mcp` / `codesift serve` print readiness text but do not start a usable long-running server
-- `serve --token` accepts a bearer token option, but the token is not used anywhere
-
-Impact:
-- MCP is not just incomplete; the CLI surface currently suggests runtime behavior that does not exist yet.
-
-### 4. Provider metadata is stored but not enforced
-PLAN says provider/model/dims are recorded in the index and provider switches should force a guided rebuild.
-
-Current state:
-- provider id and dims are written into `meta`
-- sync/search do **not** validate provider compatibility against an existing index
-- switching provider implementations would not trigger a guided rebuild path
-
-Impact:
-- the provider lifecycle contract described in the PLAN is not implemented yet.
-
-### 5. Eval package is still a scaffold, not a runnable harness
-PLAN describes a real evaluation harness with:
-- pinned benchmark repos
-- golden query sets
-- recall@k / MRR computation
-- CI regression outputs
-
-Current state:
-- `packages/eval/src/index.ts` contains only manifest/result types and empty helpers
-- there is no runner, dataset loader, benchmark manifest, or metrics pipeline
-
-Impact:
-- the repo has an eval package name and shell, but not the evaluation system the PLAN describes.
-
-## Suggested interpretation going forward
-
-Treat the current codebase as:
-- a **working prototype** for M1 behavior
-- **not yet** a faithful implementation of the PLAN architecture
-- a reasonable base for completing true M1/M2 work
+1. Add ripgrep parity tests for `Repo.grep()` / `codesift grep`.
+2. Build the M2 eval harness enough to prove exact recall and paired TTR/latency deltas.
+3. Add M2 token-budget result shaping (`maxTokens`, dedupe, single-best exact answer).
+4. Record measured latency decisions in `PLAN.md` once data exists.

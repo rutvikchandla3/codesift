@@ -32,6 +32,16 @@ export interface SearchHit {
   stale?: boolean
 }
 
+export interface GrepHit {
+  file: string
+  range: Range
+  line: number
+  column: number
+  match: string
+  snippet: string
+  language?: string
+}
+
 export interface SymbolDefinition {
   id: string
   name: string
@@ -48,6 +58,19 @@ export interface SearchOptions {
   lang?: string[]
   pathGlob?: string
   kind?: SymbolKind | SymbolKind[]
+}
+
+export interface GrepOptions {
+  regex?: boolean
+  ignoreCase?: boolean
+  wholeWord?: boolean
+  multiline?: boolean
+  lang?: string[]
+  pathGlob?: string
+  contextLines?: number
+  beforeContextLines?: number
+  afterContextLines?: number
+  maxMatches?: number
 }
 
 export interface FindSymbolOptions {
@@ -139,6 +162,7 @@ export interface Repo {
   readonly root: string
   sync(options?: SyncOptions): Promise<SyncResult>
   search(query: string, options?: SearchOptions): Promise<SearchHit[]>
+  grep(pattern: string, options?: GrepOptions): Promise<GrepHit[]>
   findSymbol(name: string, options?: FindSymbolOptions): Promise<SymbolDefinition[]>
   readChunk(id: string, options?: ReadChunkOptions): Promise<string>
   readRange(file: string, startLine: number, endLine: number, options?: ReadRangeOptions): Promise<string>

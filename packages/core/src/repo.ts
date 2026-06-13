@@ -11,7 +11,7 @@ import { buildChunks, type ChunkRecord } from './chunking.js'
 import { getDefaultEmbeddingProvider, isLearnedEmbeddingProvider } from './embedding.js'
 import { isCodeLanguage, isDocumentationLanguage } from './languages.js'
 import { scanRepository } from './scan.js'
-import { DEFAULT_SEARCH_K, type FindSymbolOptions, type IndexCompatibilitySnapshot, type IndexCompatibilityStatus, type ReadChunkOptions, type ReadRangeOptions, type Repo, type RepoStatus, type SearchHit, type SearchOptions, type StopWatching, type SymbolDefinition, type SymbolKind, type SyncOptions, type SyncResult, type VectorSearchStatus, type WatchOptions } from './types.js'
+import { DEFAULT_SEARCH_K, type FindSymbolOptions, type GrepHit, type GrepOptions, type IndexCompatibilitySnapshot, type IndexCompatibilityStatus, type ReadChunkOptions, type ReadRangeOptions, type Repo, type RepoStatus, type SearchHit, type SearchOptions, type StopWatching, type SymbolDefinition, type SymbolKind, type SyncOptions, type SyncResult, type VectorSearchStatus, type WatchOptions } from './types.js'
 
 interface ChunkRow {
   id: string
@@ -306,38 +306,34 @@ export class SqliteRepo implements Repo {
     this.ensureIndexCompatibleForQueries(db)
 
     const requestedK = options?.k ?? DEFAULT_SEARCH_K
-    const limit = options?.pathGlob
-      ? Math.max(requestedK * 25, DEFAULT_PATH_FILTERED_LIMIT)
-      : Math.max(requestedK * 10, DEFAULT_VECTOR_LIMIT)
+    const limit = Math.max(requestedK * 10, DEFAULT_VECTOR_LIMIT)
     const { whereSql, params } = buildChunkSearchFilters(options)
+    const exactRows = selectExactCandidateRows(db, query, options, Math.max(requestedK * 10, DEFAULT_PATH_FILTERED_LIMIT))
 
     const ftsQuery = buildFtsQuery(query)
     const lexicalRows = ftsQuery
-      ? applyPathFilter(
-          db
-            .prepare<unknown[], ChunkRow>(
-              `
-                select
-                  c.id,
-                  c.file_path,
-                  c.start_line,
-                  c.end_line,
-                  c.snippet,
-                  c.language,
-                  c.symbol,
-                  c.kind,
-                  c.parent
-                from chunks_fts
-                join chunks c on c.id = chunks_fts.chunk_id
-                where chunks_fts match ?
-                ${whereSql ? `and ${whereSql.replace(/^where\s+/i, '')}` : ''}
-                order by bm25(chunks_fts, 1.0, 6.0, 2.5, 2.0) asc, c.file_path asc, c.start_line asc, c.id asc
-                limit ${limit}
-              `
-            )
-            .all(ftsQuery, ...params),
-          options?.pathGlob
-        )
+      ? db
+          .prepare<unknown[], ChunkRow>(
+            `
+              select
+                c.id,
+                c.file_path,
+                c.start_line,
+                c.end_line,
+                c.snippet,
+                c.language,
+                c.symbol,
+                c.kind,
+                c.parent
+              from chunks_fts
+              join chunks c on c.id = chunks_fts.chunk_id
+              where chunks_fts match ?
+              ${whereSql ? `and ${whereSql.replace(/^where\s+/i, '')}` : ''}
+              order by bm25(chunks_fts, 1.0, 6.0, 2.5, 2.0) asc, c.file_path asc, c.start_line asc, c.id asc
+              limit ${limit}
+            `
+          )
+          .all(ftsQuery, ...params)
       : []
 
     const provider = getDefaultEmbeddingProvider()
@@ -348,35 +344,106 @@ export class SqliteRepo implements Repo {
       const [embedding] = await provider.embedBatch([query], { role: 'query' })
 
       vectorRows = embedding
-        ? applyPathFilter(
-            db
-              .prepare<unknown[], ChunkRow>(
-                `
-                  select
-                    id,
-                    file_path,
-                    start_line,
-                    end_line,
-                    snippet,
-                    language,
-                    symbol,
-                    kind,
-                    parent
-                  from chunks
-                  ${whereSql}
-                  order by vec_distance_cosine(embedding, ?) asc, file_path asc, start_line asc, id asc
-                  limit ${limit}
-                `
-              )
-              .all(...params, embedding),
-            options?.pathGlob
-          )
+        ? db
+            .prepare<unknown[], ChunkRow>(
+              `
+                select
+                  id,
+                  file_path,
+                  start_line,
+                  end_line,
+                  snippet,
+                  language,
+                  symbol,
+                  kind,
+                  parent
+                from chunks
+                ${whereSql}
+                order by vec_distance_cosine(embedding, ?) asc, file_path asc, start_line asc, id asc
+                limit ${limit}
+              `
+            )
+            .all(...params, embedding)
         : []
     }
 
-    return fuseRankedRows(query, vectorRows, lexicalRows)
+    return fuseRankedRows(query, exactRows, vectorRows, lexicalRows)
       .slice(0, requestedK)
       .map(({ row, score }) => buildSearchHit(row, score, query))
+  }
+
+  async grep(pattern: string, options?: GrepOptions): Promise<GrepHit[]> {
+    if (!pattern || !existsSync(this.indexPath)) {
+      return []
+    }
+
+    const db = this.openDatabase()
+    this.ensureIndexCompatibleForQueries(db)
+
+    const candidateFiles = selectGrepCandidateFiles(db, options)
+    const matcher = buildGrepMatcher(pattern, options)
+    const beforeContextLines = normalizeContextLines(options?.beforeContextLines ?? options?.contextLines)
+    const afterContextLines = normalizeContextLines(options?.afterContextLines ?? options?.contextLines)
+    const maxMatches = normalizeMaxMatches(options?.maxMatches)
+    const hits: GrepHit[] = []
+
+    for (const file of candidateFiles) {
+      if (hits.length >= maxMatches) {
+        break
+      }
+
+      let content: string
+      try {
+        content = await readFile(resolve(this.root, file.path), 'utf8')
+      } catch {
+        continue
+      }
+
+      const lines = splitLines(content)
+      const lineStarts = buildLineStarts(content)
+      matcher.lastIndex = 0
+      const seenRanges = new Set<string>()
+      let match: RegExpExecArray | null
+
+      while ((match = matcher.exec(content)) !== null) {
+        const matchedText = match[0]
+        if (matchedText.length === 0) {
+          matcher.lastIndex += 1
+          continue
+        }
+
+        const startOffset = match.index
+        const endOffset = startOffset + matchedText.length
+        const startLine = lineNumberForOffset(lineStarts, startOffset)
+        const endLine = lineNumberForOffset(lineStarts, Math.max(startOffset, endOffset - 1))
+        const rangeKey = `${startLine}:${endLine}`
+
+        if (!seenRanges.has(rangeKey)) {
+          seenRanges.add(rangeKey)
+          const snippetStartLine = Math.max(1, startLine - beforeContextLines)
+          const snippetEndLine = Math.min(lines.length, endLine + afterContextLines)
+          const hit: GrepHit = {
+            file: file.path,
+            range: { startLine, endLine },
+            line: startLine,
+            column: startOffset - lineStarts[startLine - 1]! + 1,
+            match: matchedText,
+            snippet: lines.slice(snippetStartLine - 1, snippetEndLine).join('\n')
+          }
+
+          if (file.language) {
+            hit.language = file.language
+          }
+
+          hits.push(hit)
+          if (hits.length >= maxMatches) {
+            break
+          }
+        }
+      }
+    }
+
+    return hits
   }
 
   async findSymbol(name: string, options?: FindSymbolOptions): Promise<SymbolDefinition[]> {
@@ -395,6 +462,10 @@ export class SqliteRepo implements Repo {
       exactWhere.push(`kind in (${kinds.map(() => '?').join(', ')})`)
       exactParams.push(...kinds)
     }
+    if (options?.pathGlob) {
+      exactWhere.push('codesift_minimatch(file_path, ?) = 1')
+      exactParams.push(options.pathGlob)
+    }
 
     const exactRows = db
       .prepare<unknown[], SymbolRow>(
@@ -410,25 +481,11 @@ export class SqliteRepo implements Repo {
     const partialRows =
       exactRows.length > 0
         ? []
-        : db
-            .prepare<unknown[], SymbolRow>(
-              `
-                select id, name, file_path, start_line, end_line, kind, signature, parent, language
-                from symbols
-                where lower(name) like lower(?)
-                ${kinds.length > 0 ? `and kind in (${kinds.map(() => '?').join(', ')})` : ''}
-                order by case when lower(name) = lower(?) then 0 else 1 end, file_path asc, start_line asc
-                limit 25
-              `
-            )
-            .all(`%${name}%`, ...kinds, name)
+        : selectPartialSymbolRows(db, name, kinds, options?.pathGlob)
 
     const rows = [...exactRows, ...partialRows]
-    const filteredRows = options?.pathGlob
-      ? rows.filter((row: SymbolRow) => minimatch(row.file_path, options.pathGlob!))
-      : rows
 
-    return filteredRows.map((row) => {
+    return rows.map((row) => {
       const definition: SymbolDefinition = {
         id: String(row.id),
         name: row.name,
@@ -556,6 +613,7 @@ export class SqliteRepo implements Repo {
     const db = new Database(this.indexPath)
     db.pragma('journal_mode = WAL')
     db.pragma('foreign_keys = ON')
+    registerSqlFunctions(db)
     this.vectorExtensionLoaded = false
     this.ensureSchema(db)
     this.db = db
@@ -809,23 +867,176 @@ function buildChunkSearchFilters(options?: SearchOptions): { whereSql: string; p
     params.push(...kinds)
   }
 
+  if (options?.pathGlob) {
+    whereClauses.push('codesift_minimatch(file_path, ?) = 1')
+    params.push(options.pathGlob)
+  }
+
   return {
     whereSql: whereClauses.length > 0 ? `where ${whereClauses.join(' and ')}` : '',
     params
   }
 }
 
-function applyPathFilter<T extends { file_path: string }>(rows: T[], pathGlob?: string): T[] {
-  if (!pathGlob) {
-    return rows
+function selectExactCandidateRows(
+  db: Database.Database,
+  query: string,
+  options: SearchOptions | undefined,
+  limit: number
+): ChunkRow[] {
+  const candidates = extractSymbolCandidates(query)
+  if (candidates.length === 0) {
+    return []
   }
 
-  return rows.filter((row) => minimatch(row.file_path, pathGlob))
+  const { whereSql, params } = buildChunkSearchFilters(options)
+  const placeholders = candidates.map(() => '?').join(', ')
+  const rowsById = new Map<string, ChunkRow>()
+
+  const chunkRows = db
+    .prepare<unknown[], ChunkRow>(
+      `
+        select id, file_path, start_line, end_line, snippet, language, symbol, kind, parent
+        from chunks
+        ${whereSql ? `${whereSql} and` : 'where'} lower(symbol) in (${placeholders})
+        order by file_path asc, start_line asc, end_line asc, id asc
+        limit ${limit}
+      `
+    )
+    .all(...params, ...candidates)
+
+  for (const row of chunkRows) {
+    rowsById.set(row.id, row)
+  }
+
+  const exactTokenRows = selectExactFtsCandidateRows(db, candidates, options, limit)
+  for (const row of exactTokenRows) {
+    rowsById.set(row.id, row)
+  }
+
+  const symbolRows = db
+    .prepare<unknown[], ChunkRow>(
+      `
+        select distinct c.id, c.file_path, c.start_line, c.end_line, c.snippet, c.language, c.symbol, c.kind, c.parent
+        from symbols s
+        join chunks c on c.file_path = s.file_path and s.start_line between c.start_line and c.end_line
+        ${whereSql ? `${whereSql.replace(/\bfile_path\b/g, 'c.file_path').replace(/\blanguage\b/g, 'c.language').replace(/\bkind\b/g, 'c.kind')} and` : 'where'} lower(s.name) in (${placeholders})
+        order by c.file_path asc, c.start_line asc, c.end_line asc, c.id asc
+        limit ${limit}
+      `
+    )
+    .all(...params, ...candidates)
+
+  for (const row of symbolRows) {
+    rowsById.set(row.id, row)
+  }
+
+  return [...rowsById.values()]
 }
 
-function fuseRankedRows(query: string, vectorRows: ChunkRow[], lexicalRows: ChunkRow[]): RankedChunkRow[] {
+function selectExactFtsCandidateRows(
+  db: Database.Database,
+  candidates: string[],
+  options: SearchOptions | undefined,
+  limit: number
+): ChunkRow[] {
+  const { whereSql, params } = buildChunkSearchFilters(options)
+  const rowsById = new Map<string, ChunkRow>()
+
+  for (const candidate of candidates) {
+    const ftsQuery = buildFtsQuery(candidate)
+    if (!ftsQuery) {
+      continue
+    }
+
+    const rows = db
+      .prepare<unknown[], ChunkRow>(
+        `
+          select
+            c.id,
+            c.file_path,
+            c.start_line,
+            c.end_line,
+            c.snippet,
+            c.language,
+            c.symbol,
+            c.kind,
+            c.parent
+          from chunks_fts
+          join chunks c on c.id = chunks_fts.chunk_id
+          where chunks_fts match ?
+          ${whereSql ? `and ${whereSql.replace(/^where\s+/i, '')}` : ''}
+          order by c.file_path asc, c.start_line asc, c.end_line asc, c.id asc
+          limit ${limit}
+        `
+      )
+      .all(ftsQuery, ...params)
+
+    for (const row of rows) {
+      rowsById.set(row.id, row)
+    }
+  }
+
+  return [...rowsById.values()]
+}
+
+function selectPartialSymbolRows(db: Database.Database, name: string, kinds: SymbolKind[], pathGlob?: string): SymbolRow[] {
+  const whereClauses = ['lower(name) like lower(?)']
+  const params: string[] = [`%${name}%`]
+
+  if (kinds.length > 0) {
+    whereClauses.push(`kind in (${kinds.map(() => '?').join(', ')})`)
+    params.push(...kinds)
+  }
+
+  if (pathGlob) {
+    whereClauses.push('codesift_minimatch(file_path, ?) = 1')
+    params.push(pathGlob)
+  }
+
+  return db
+    .prepare<unknown[], SymbolRow>(
+      `
+        select id, name, file_path, start_line, end_line, kind, signature, parent, language
+        from symbols
+        where ${whereClauses.join(' and ')}
+        order by case when lower(name) = lower(?) then 0 else 1 end, file_path asc, start_line asc
+        limit 25
+      `
+    )
+    .all(...params, name)
+}
+
+function selectGrepCandidateFiles(db: Database.Database, options?: GrepOptions): Array<{ path: string; language: string }> {
+  const whereClauses: string[] = []
+  const params: string[] = []
+
+  if (options?.lang && options.lang.length > 0) {
+    whereClauses.push(`language in (${options.lang.map(() => '?').join(', ')})`)
+    params.push(...options.lang)
+  }
+
+  if (options?.pathGlob) {
+    whereClauses.push('codesift_minimatch(path, ?) = 1')
+    params.push(options.pathGlob)
+  }
+
+  return db
+    .prepare<unknown[], { path: string; language: string }>(
+      `
+        select path, language
+        from files
+        ${whereClauses.length > 0 ? `where ${whereClauses.join(' and ')}` : ''}
+        order by path asc
+      `
+    )
+    .all(...params)
+}
+
+function fuseRankedRows(query: string, exactRows: ChunkRow[], vectorRows: ChunkRow[], lexicalRows: ChunkRow[]): RankedChunkRow[] {
   const byId = new Map<string, RankedChunkRow>()
 
+  addReciprocalRanks(byId, exactRows, 4)
   addReciprocalRanks(byId, vectorRows)
   addReciprocalRanks(byId, lexicalRows)
 
@@ -842,9 +1053,9 @@ function fuseRankedRows(query: string, vectorRows: ChunkRow[], lexicalRows: Chun
   })
 }
 
-function addReciprocalRanks(target: Map<string, RankedChunkRow>, rows: ChunkRow[]): void {
+function addReciprocalRanks(target: Map<string, RankedChunkRow>, rows: ChunkRow[], weight = 1): void {
   rows.forEach((row, index) => {
-    const score = 1 / (DEFAULT_RRF_K + index + 1)
+    const score = weight / (DEFAULT_RRF_K + index + 1)
     const existing = target.get(row.id)
 
     if (existing) {
@@ -954,6 +1165,67 @@ function buildFtsQuery(query: string): string | null {
 
 function quoteFtsTerm(term: string): string {
   return `"${term.replace(/"/g, '""')}"`
+}
+
+function buildGrepMatcher(pattern: string, options?: GrepOptions): RegExp {
+  const source = options?.regex ? pattern : escapeRegExp(pattern)
+  const boundedSource = options?.wholeWord ? `(?<![A-Za-z0-9_])${source}(?![A-Za-z0-9_])` : source
+  const flags = `g${options?.ignoreCase ? 'i' : ''}m${options?.multiline ? 's' : ''}`
+
+  return new RegExp(boundedSource, flags)
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function buildLineStarts(content: string): number[] {
+  const starts = [0]
+
+  for (let index = 0; index < content.length; index += 1) {
+    if (content[index] === '\n') {
+      starts.push(index + 1)
+    }
+  }
+
+  return starts
+}
+
+function lineNumberForOffset(lineStarts: number[], offset: number): number {
+  let low = 0
+  let high = lineStarts.length - 1
+
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2)
+    const lineStart = lineStarts[middle]!
+    const nextLineStart = lineStarts[middle + 1] ?? Number.POSITIVE_INFINITY
+
+    if (offset < lineStart) {
+      high = middle - 1
+      continue
+    }
+
+    if (offset >= nextLineStart) {
+      low = middle + 1
+      continue
+    }
+
+    return middle + 1
+  }
+
+  return lineStarts.length
+}
+
+function normalizeMaxMatches(value: number | undefined): number {
+  if (value === undefined) {
+    return 1000
+  }
+
+  if (!Number.isFinite(value) || value <= 0) {
+    return 1000
+  }
+
+  return Math.floor(value)
 }
 
 function buildLexicalSearchText(row: {
@@ -1101,6 +1373,16 @@ function buildEmbeddingBatches(
 
 function estimateTokenCount(value: string): number {
   return Math.max(1, Math.ceil(value.length / 4))
+}
+
+function registerSqlFunctions(db: Database.Database): void {
+  db.function('codesift_minimatch', { deterministic: true }, (value: unknown, pattern: unknown) => {
+    if (typeof value !== 'string' || typeof pattern !== 'string') {
+      return 0
+    }
+
+    return minimatch(value, pattern) ? 1 : 0
+  })
 }
 
 function buildCompatibilityMismatch(

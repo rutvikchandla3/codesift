@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { getDefaultEmbeddingProvider, registerEmbeddingProvider } from '@codesift/core'
 
-import { formatCompactHits, formatHits, formatStatus, formatSymbols, getCliDescription, runCli, type CliIo } from '../src/program.js'
+import { formatCompactGrepHits, formatCompactHits, formatGrepHits, formatHits, formatStatus, formatSymbols, getCliDescription, runCli, type CliIo } from '../src/program.js'
 
 const temporaryDirectories: string[] = []
 const originalEmbeddingProvider = process.env.CODESIFT_EMBEDDING_PROVIDER
@@ -50,6 +50,8 @@ describe('codesift CLI formatters', () => {
     expect(formatHits([])).toContain('No hits found')
     expect(formatCompactHits([])).toContain('No hits found')
     expect(formatSymbols([])).toContain('No symbol matches found')
+    expect(formatGrepHits([])).toContain('No matches found')
+    expect(formatCompactGrepHits([])).toContain('No matches found')
   })
 })
 
@@ -154,6 +156,7 @@ export function verifyJwtToken(token: string): boolean {
       ],
       io
     )
+    await runCli(['node', 'codesift', 'grep', '-e', 'token.startsWith', '--repo', repoRoot, '--path', 'src/**', '--compact'], io)
     await runCli(['node', 'codesift', 'search', 'verify jwt token', '--repo', repoRoot, '--json', '-k', '1'], io)
 
     expect(messages[0]).toContain('Indexed 2 files')
@@ -161,8 +164,10 @@ export function verifyJwtToken(token: string): boolean {
     expect(messages[1]).toContain('src/auth/jwt.ts')
     expect(messages[1]).toContain('verifyJwtToken')
     expect(messages[2]).toContain('function verifyJwtToken')
+    expect(messages[3]).toContain('src/auth/jwt.ts:3')
+    expect(messages[3]).toContain('token.startsWith')
 
-    const jsonHits = JSON.parse(messages[3] ?? '[]') as Array<{ file: string }>
+    const jsonHits = JSON.parse(messages[4] ?? '[]') as Array<{ file: string }>
     expect(jsonHits[0]?.file).toBe('src/auth/jwt.ts')
   })
 })

@@ -9,6 +9,8 @@ import {
   getDefaultEmbeddingProvider,
   isLearnedEmbeddingProvider,
   openRepo,
+  type GrepHit,
+  type GrepOptions,
   type RepoStatus,
   type SearchHit,
   type SymbolDefinition,
@@ -96,6 +98,38 @@ export function formatSymbols(definitions: SymbolDefinition[]): string {
     .map((definition) => {
       const range = `${definition.range.startLine}-${definition.range.endLine}`
       return `${definition.kind} ${definition.name} — ${definition.file}:${range}`
+    })
+    .join('\n')
+}
+
+export function formatGrepHits(hits: GrepHit[]): string {
+  if (hits.length === 0) {
+    return 'No matches found.'
+  }
+
+  return hits
+    .map((hit) => {
+      const range = hit.range.startLine === hit.range.endLine ? String(hit.range.startLine) : `${hit.range.startLine}-${hit.range.endLine}`
+      return `${hit.file}:${range}:${hit.column}\n${hit.snippet}`
+    })
+    .join('\n\n')
+}
+
+export function formatCompactGrepHits(hits: GrepHit[]): string {
+  if (hits.length === 0) {
+    return 'No matches found.'
+  }
+
+  return hits
+    .map((hit) => {
+      const range = hit.range.startLine === hit.range.endLine ? String(hit.range.startLine) : `${hit.range.startLine}-${hit.range.endLine}`
+      const snippet = hit.snippet
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .slice(0, 4)
+        .join(' ↩ ')
+      return `${hit.file}:${range}:${hit.column}${snippet ? ` | ${snippet}` : ''}`
     })
     .join('\n')
 }
@@ -246,13 +280,98 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
     })
 
   program
+    .command('grep')
+    .argument('[pattern]', 'literal pattern to search for')
+    .option('-e, --regexp <pattern>', 'pattern to search for (ripgrep-compatible spelling)')
+    .option('--regex', 'treat the pattern as a regular expression')
+    .option('-i, --ignore-case', 'case-insensitive matching')
+    .option('-w, --word-regexp', 'match whole words only')
+    .option('--multiline', 'allow regex dot to span newlines')
+    .option('-A, --after-context <lines>', 'lines after each match')
+    .option('-B, --before-context <lines>', 'lines before each match')
+    .option('-C, --context <lines>', 'lines before and after each match')
+    .option('--repo <path>', 'repository path', process.cwd())
+    .option('--lang <langs>', 'comma-separated language filter, e.g. ts,typescript,python')
+    .option('--path <glob>', 'path glob filter, e.g. src/**')
+    .option('--max-matches <count>', 'maximum matches to print')
+    .option('--json', 'print JSON results')
+    .option('--compact', 'print token-efficient compact results')
+    .action(
+      async (
+        patternArgument: string | undefined,
+        options: {
+          regexp?: string
+          regex?: boolean
+          ignoreCase?: boolean
+          wordRegexp?: boolean
+          multiline?: boolean
+          afterContext?: string
+          beforeContext?: string
+          context?: string
+          repo: string
+          lang?: string
+          path?: string
+          maxMatches?: string
+          json?: boolean
+          compact?: boolean
+        }
+      ) => {
+        await withCompatibilityHandling(io, async () => {
+          const pattern = options.regexp ?? patternArgument
+          if (!pattern) {
+            throw new Error('grep requires a pattern argument or -e <pattern>')
+          }
+
+          const repo = await openRepo(options.repo)
+          const languages = parseCsvList(options.lang)
+          const grepOptions: GrepOptions = {}
+
+          if (options.regex) {
+            grepOptions.regex = true
+          }
+          if (options.ignoreCase) {
+            grepOptions.ignoreCase = true
+          }
+          if (options.wordRegexp) {
+            grepOptions.wholeWord = true
+          }
+          if (options.multiline) {
+            grepOptions.multiline = true
+          }
+          if (languages) {
+            grepOptions.lang = languages
+          }
+          if (options.path) {
+            grepOptions.pathGlob = options.path
+          }
+          if (options.context !== undefined) {
+            grepOptions.contextLines = Number(options.context)
+          }
+          if (options.beforeContext !== undefined) {
+            grepOptions.beforeContextLines = Number(options.beforeContext)
+          }
+          if (options.afterContext !== undefined) {
+            grepOptions.afterContextLines = Number(options.afterContext)
+          }
+          if (options.maxMatches !== undefined) {
+            grepOptions.maxMatches = Number(options.maxMatches)
+          }
+
+          const hits = await repo.grep(pattern, grepOptions)
+          const output = options.json ? JSON.stringify(hits, null, 2) : options.compact ? formatCompactGrepHits(hits) : formatGrepHits(hits)
+          io.stdout(output)
+        })
+      }
+    )
+
+  program
     .command('mcp')
     .argument('[path]', 'repository path', process.cwd())
     .action(async (path: string) => {
       const repo = await openRepo(path)
       const server = createStdioServer(repo)
       await server.start()
-      io.stdout(`Scaffold MCP ready with tools: ${getToolDefinitions().map((tool) => tool.name).join(', ')}`)
+      io.stderr(`MCP ready with tools: ${getToolDefinitions().map((tool) => tool.name).join(', ')}`)
     })
 
   program
