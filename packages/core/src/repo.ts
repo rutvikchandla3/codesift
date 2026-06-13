@@ -1,32 +1,20 @@
+import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 
 import Database from 'better-sqlite3'
 import { minimatch } from 'minimatch'
 import * as sqliteVec from 'sqlite-vec'
 
-import { buildChunks } from './chunking.js'
-import { getDefaultEmbeddingProvider } from './embedding.js'
+import { buildChunks, type ChunkRecord } from './chunking.js'
+import { getDefaultEmbeddingProvider, isLearnedEmbeddingProvider } from './embedding.js'
 import { isCodeLanguage, isDocumentationLanguage } from './languages.js'
 import { scanRepository } from './scan.js'
-import type {
-  FindSymbolOptions,
-  Repo,
-  RepoStatus,
-  SearchHit,
-  SearchOptions,
-  StopWatching,
-  SymbolDefinition,
-  SymbolKind,
-  SyncOptions,
-  SyncResult,
-  VectorSearchStatus,
-  WatchOptions
-} from './types.js'
+import { DEFAULT_SEARCH_K, type FindSymbolOptions, type IndexCompatibilitySnapshot, type IndexCompatibilityStatus, type ReadChunkOptions, type ReadRangeOptions, type Repo, type RepoStatus, type SearchHit, type SearchOptions, type StopWatching, type SymbolDefinition, type SymbolKind, type SyncOptions, type SyncResult, type VectorSearchStatus, type WatchOptions } from './types.js'
 
 interface ChunkRow {
-  id: number
+  id: string
   file_path: string
   start_line: number
   end_line: number
@@ -35,6 +23,16 @@ interface ChunkRow {
   symbol: string | null
   kind: SymbolKind | null
   parent: string | null
+}
+
+interface ChunkLocationRow {
+  file_path: string
+  start_line: number
+  end_line: number
+}
+
+interface IndexedChunkRecord extends ChunkRecord {
+  id: string
 }
 
 interface SymbolRow {
@@ -54,7 +52,7 @@ interface RankedChunkRow {
   score: number
 }
 
-const SCHEMA_VERSION = '3'
+const SCHEMA_VERSION = '4'
 const DEFAULT_RRF_K = 60
 const DEFAULT_VECTOR_LIMIT = 50
 const DEFAULT_PATH_FILTERED_LIMIT = 200
@@ -62,9 +60,19 @@ const VECTOR_SEARCH_UNAVAILABLE_MESSAGE = 'vector search unavailable (native dep
 
 let vectorExtensionLoader: (db: Database.Database) => void = (db) => sqliteVec.load(db)
 
+export class IndexCompatibilityError extends Error {
+  readonly code = 'INDEX_REBUILD_REQUIRED'
+
+  constructor(readonly compatibility: IndexCompatibilityStatus) {
+    super(compatibility.message ?? 'Index rebuild required')
+    this.name = 'IndexCompatibilityError'
+  }
+}
+
 export function setVectorExtensionLoaderForTests(loader?: (db: Database.Database) => void): void {
   vectorExtensionLoader = loader ?? ((db) => sqliteVec.load(db))
 }
+
 const DEFAULT_STOP_WORDS = new Set([
   'a',
   'an',
@@ -125,52 +133,42 @@ export class SqliteRepo implements Repo {
 
     await this.initialize()
 
-    const { files, skippedFiles } = await scanRepository(this.root)
-    const fileRows = files.map((file) => ({
-      path: file.relativePath,
-      language: file.language,
-      hash: file.hash,
-      size: file.size
-    }))
-
-    const chunkRows = files.flatMap((file) =>
-      buildChunks(file).map((chunk) => ({
-        ...chunk,
-        embedding: null as Float32Array | null
-      }))
-    )
-
-    const embeddings = await provider.embedBatch(
-      chunkRows.map((chunk) => chunk.embeddingText),
-      options?.signal
-    )
-
-    for (let index = 0; index < chunkRows.length; index += 1) {
-      const row = chunkRows[index]
-      if (row) {
-        row.embedding = embeddings[index] ?? null
-      }
-    }
-
-    const symbolRows = chunkRows.filter((chunk) => chunk.symbol && chunk.kind && chunk.kind !== 'file')
-
     let db = this.openDatabase()
-    if (this.hasLegacyVectorCheck(db)) {
+    const compatibility = this.getIndexCompatibility(db)
+    if (!compatibility.ok && compatibility.code === 'schema_version_mismatch') {
       await this.resetDatabaseFile()
       await this.initialize()
       db = this.openDatabase()
     }
-    this.clearIndex(db)
 
+    const previousGeneration = readMetaNumber(db, 'index_generation') ?? 0
+    const { files, skippedFiles, skippedSymlinks } = await scanRepository(this.root)
+    const fileRows = files.map((file) => ({
+      path: file.relativePath,
+      language: file.language,
+      hash: file.hash,
+      size: file.size,
+      mtime: file.mtime
+    }))
+
+    const chunkRows: IndexedChunkRecord[] = files.flatMap((file) =>
+      buildChunks(file).map((chunk) => ({
+        ...chunk,
+        id: createChunkId(chunk)
+      }))
+    )
+
+    const batches = buildEmbeddingBatches(chunkRows, provider.maxBatch, provider.maxBatchTokens)
     const insertFile = db.prepare(
       `
-        insert into files(path, language, hash, size)
-        values (@path, @language, @hash, @size)
+        insert into files(path, language, hash, size, mtime)
+        values (@path, @language, @hash, @size, @mtime)
       `
     )
     const insertChunk = db.prepare(
       `
         insert into chunks(
+          id,
           file_path,
           language,
           start_line,
@@ -180,14 +178,13 @@ export class SqliteRepo implements Repo {
           parent,
           signature,
           snippet,
-          content,
           embedding
         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
     )
     const insertChunkFts = db.prepare(
       `
-        insert into chunks_fts(rowid, search_text, symbol, parent, signature)
+        insert into chunks_fts(chunk_id, search_text, symbol, parent, signature)
         values (?, ?, ?, ?, ?)
       `
     )
@@ -203,59 +200,98 @@ export class SqliteRepo implements Repo {
       on conflict(key) do update set value = excluded.value
     `)
 
-    const insertAll = db.transaction(() => {
-      for (const row of fileRows) {
-        insertFile.run(row)
-      }
+    try {
+      this.clearIndex(db)
 
-      for (const row of chunkRows) {
-        const result = insertChunk.run(
-          row.file,
-          row.language,
-          row.startLine,
-          row.endLine,
-          row.symbol ?? null,
-          row.kind ?? null,
-          row.parent ?? null,
-          row.signature ?? null,
-          row.snippet,
-          row.content,
-          row.embedding
+      db.transaction(() => {
+        for (const row of fileRows) {
+          insertFile.run(row)
+        }
+      })()
+
+      let completedChunks = 0
+
+      for (let index = 0; index < batches.length; index += 1) {
+        throwIfAborted(options?.signal)
+
+        const batch = batches[index] ?? []
+        const embeddings = await provider.embedBatch(
+          batch.map((chunk) => chunk.embeddingText),
+          { role: 'document' },
+          options?.signal
         )
 
-        insertChunkFts.run(
-          Number(result.lastInsertRowid),
-          buildLexicalSearchText(row),
-          row.symbol ?? '',
-          row.parent ?? '',
-          row.signature ?? ''
-        )
+        throwIfAborted(options?.signal)
+
+        db.transaction(() => {
+          for (let batchIndex = 0; batchIndex < batch.length; batchIndex += 1) {
+            const row = batch[batchIndex]!
+            const embedding = embeddings[batchIndex] ?? new Float32Array(provider.dims)
+
+            insertChunk.run(
+              row.id,
+              row.file,
+              row.language,
+              row.startLine,
+              row.endLine,
+              row.symbol ?? null,
+              row.kind ?? null,
+              row.parent ?? null,
+              row.signature ?? null,
+              row.snippet,
+              embedding
+            )
+
+            insertChunkFts.run(
+              row.id,
+              buildLexicalSearchText(row),
+              row.symbol ?? '',
+              row.parent ?? '',
+              row.signature ?? ''
+            )
+
+            if (row.symbol && row.kind && row.kind !== 'file') {
+              insertSymbol.run(
+                row.symbol,
+                row.kind,
+                row.file,
+                row.startLine,
+                row.endLine,
+                row.parent ?? null,
+                row.signature ?? null,
+                row.language
+              )
+            }
+          }
+        })()
+
+        completedChunks += batch.length
+        options?.onProgress?.({
+          phase: 'batch',
+          batch: index + 1,
+          totalBatches: batches.length,
+          completedChunks,
+          totalChunks: chunkRows.length
+        })
       }
 
-      for (const row of symbolRows) {
-        insertSymbol.run(
-          row.symbol,
-          row.kind,
-          row.file,
-          row.startLine,
-          row.endLine,
-          row.parent ?? null,
-          row.signature ?? null,
-          row.language
-        )
-      }
-
-      setMeta.run('schema_version', SCHEMA_VERSION)
-      setMeta.run('provider_id', provider.id)
-      setMeta.run('provider_dims', String(provider.dims))
-      setMeta.run('indexed_at', new Date().toISOString())
-    })
-
-    insertAll()
+      db.transaction(() => {
+        setMeta.run('schema_version', SCHEMA_VERSION)
+        setMeta.run('provider_id', provider.id)
+        setMeta.run('provider_dims', String(provider.dims))
+        setMeta.run('model_version', provider.modelVersion ?? provider.model ?? provider.id)
+        setMeta.run('indexed_at', new Date().toISOString())
+        setMeta.run('index_generation', String(previousGeneration + 1))
+      })()
+    } catch (error) {
+      this.clearIndex(db)
+      throw error
+    }
 
     return {
       indexedFiles: files.length,
       skippedFiles,
+      skippedSymlinks,
       removedFiles: 0,
       durationMs: Date.now() - startedAt
     }
@@ -267,8 +303,12 @@ export class SqliteRepo implements Repo {
     }
 
     const db = this.openDatabase()
-    const requestedK = options?.k ?? 10
-    const limit = options?.pathGlob ? Math.max(requestedK * 25, DEFAULT_PATH_FILTERED_LIMIT) : Math.max(requestedK * 10, DEFAULT_VECTOR_LIMIT)
+    this.ensureIndexCompatibleForQueries(db)
+
+    const requestedK = options?.k ?? DEFAULT_SEARCH_K
+    const limit = options?.pathGlob
+      ? Math.max(requestedK * 25, DEFAULT_PATH_FILTERED_LIMIT)
+      : Math.max(requestedK * 10, DEFAULT_VECTOR_LIMIT)
     const { whereSql, params } = buildChunkSearchFilters(options)
 
     const ftsQuery = buildFtsQuery(query)
@@ -288,10 +328,10 @@ export class SqliteRepo implements Repo {
                   c.kind,
                   c.parent
                 from chunks_fts
-                join chunks c on c.id = chunks_fts.rowid
+                join chunks c on c.id = chunks_fts.chunk_id
                 where chunks_fts match ?
                 ${whereSql ? `and ${whereSql.replace(/^where\s+/i, '')}` : ''}
-                order by bm25(chunks_fts, 1.0, 6.0, 2.5, 2.0) asc
+                order by bm25(chunks_fts, 1.0, 6.0, 2.5, 2.0) asc, c.file_path asc, c.start_line asc, c.id asc
                 limit ${limit}
               `
             )
@@ -300,12 +340,12 @@ export class SqliteRepo implements Repo {
         )
       : []
 
-    const shouldUseVectorSearch = queryShouldUseVectorSearch(query)
+    const provider = getDefaultEmbeddingProvider()
+    const shouldUseVectorSearch = isLearnedEmbeddingProvider(provider) && queryShouldUseVectorSearch(query)
     let vectorRows: ChunkRow[] = []
 
     if (shouldUseVectorSearch && this.ensureVectorExtension(db)) {
-      const provider = getDefaultEmbeddingProvider()
-      const [embedding] = await provider.embedBatch([query])
+      const [embedding] = await provider.embedBatch([query], { role: 'query' })
 
       vectorRows = embedding
         ? applyPathFilter(
@@ -324,7 +364,7 @@ export class SqliteRepo implements Repo {
                     parent
                   from chunks
                   ${whereSql}
-                  order by vec_distance_cosine(embedding, ?) asc
+                  order by vec_distance_cosine(embedding, ?) asc, file_path asc, start_line asc, id asc
                   limit ${limit}
                 `
               )
@@ -345,6 +385,8 @@ export class SqliteRepo implements Repo {
     }
 
     const db = this.openDatabase()
+    this.ensureIndexCompatibleForQueries(db)
+
     const kinds = normalizeKinds(options?.kind)
 
     const exactWhere = ['lower(name) = lower(?)']
@@ -414,6 +456,38 @@ export class SqliteRepo implements Repo {
     })
   }
 
+  async readChunk(id: string, options?: ReadChunkOptions): Promise<string> {
+    const parsedChunkId = parseChunkId(id) ?? this.lookupChunkLocation(id)
+    if (!parsedChunkId) {
+      throw new Error(`Unknown chunk id: ${id}`)
+    }
+
+    return this.readRange(parsedChunkId.file, parsedChunkId.startLine, parsedChunkId.endLine, options)
+  }
+
+  async readRange(file: string, startLine: number, endLine: number, options?: ReadRangeOptions): Promise<string> {
+    if (!file.trim()) {
+      throw new Error('readRange requires a file path')
+    }
+
+    if (startLine <= 0 || endLine <= 0 || endLine < startLine) {
+      throw new Error(`Invalid line range: ${startLine}-${endLine}`)
+    }
+
+    const absolutePath = resolve(this.root, file)
+    if (!isPathInsideRoot(this.root, absolutePath)) {
+      throw new Error(`File is outside repo root: ${file}`)
+    }
+
+    const fileContent = await readFile(absolutePath, 'utf8')
+    const lines = splitLines(fileContent)
+    const contextLines = normalizeContextLines(options?.contextLines)
+    const slicedStartLine = Math.max(1, startLine - contextLines)
+    const slicedEndLine = Math.min(lines.length, endLine + contextLines)
+
+    return lines.slice(slicedStartLine - 1, slicedEndLine).join('\n')
+  }
+
   async status(): Promise<RepoStatus> {
     if (!existsSync(this.indexPath)) {
       return {
@@ -423,7 +497,9 @@ export class SqliteRepo implements Repo {
         stale: false,
         chunkCount: 0,
         symbolCount: 0,
+        indexGeneration: 0,
         provider: null,
+        compatibility: { ok: true },
         vectorSearch: this.getVectorSearchStatus()
       }
     }
@@ -440,24 +516,30 @@ export class SqliteRepo implements Repo {
         )
         .get() ?? { chunk_count: 0, symbol_count: 0 }
 
-    const providerId = db.prepare<[string], { value: string }>('select value from meta where key = ?').get('provider_id')
-    const providerDims = db.prepare<[string], { value: string }>('select value from meta where key = ?').get('provider_dims')
+    const providerId = readMeta(db, 'provider_id')
+    const providerDims = readMetaNumber(db, 'provider_dims')
+    const modelVersion = readMeta(db, 'model_version')
+    const indexGeneration = readMetaNumber(db, 'index_generation') ?? 0
+    const indexed = counts.chunk_count > 0
 
-    const provider = providerId
+    const provider = indexed && providerId
       ? {
-          id: providerId.value,
-          ...(providerDims ? { dims: Number(providerDims.value) } : {})
+          id: providerId,
+          ...(modelVersion ? { modelVersion } : {}),
+          ...(providerDims !== undefined ? { dims: providerDims } : {})
         }
       : null
 
     return {
       root: this.root,
       indexPath: this.indexPath,
-      indexed: counts.chunk_count > 0,
+      indexed,
       stale: false,
       chunkCount: counts.chunk_count,
       symbolCount: counts.symbol_count,
+      indexGeneration,
       provider,
+      compatibility: this.getIndexCompatibility(db, indexed),
       vectorSearch: this.getVectorSearchStatus()
     }
   }
@@ -527,11 +609,12 @@ export class SqliteRepo implements Repo {
         path text primary key,
         language text not null,
         hash text not null,
-        size integer not null
+        size integer not null,
+        mtime real not null
       );
 
       create table if not exists chunks(
-        id integer primary key autoincrement,
+        id text primary key,
         file_path text not null references files(path) on delete cascade,
         language text not null,
         start_line integer not null,
@@ -541,15 +624,16 @@ export class SqliteRepo implements Repo {
         parent text,
         signature text,
         snippet text not null,
-        content text not null,
         embedding blob not null
       );
 
       create index if not exists idx_chunks_language on chunks(language);
       create index if not exists idx_chunks_symbol on chunks(symbol);
       create index if not exists idx_chunks_kind on chunks(kind);
+      create index if not exists idx_chunks_file_range on chunks(file_path, start_line, end_line);
 
       create virtual table if not exists chunks_fts using fts5(
+        chunk_id UNINDEXED,
         search_text,
         symbol,
         parent,
@@ -580,15 +664,81 @@ export class SqliteRepo implements Repo {
       delete from chunks_fts;
       delete from chunks;
       delete from files;
+      delete from meta;
     `)
   }
 
-  private hasLegacyVectorCheck(db: Database.Database): boolean {
-    const tableDefinition = db
-      .prepare<[], { sql: string | null }>("select sql from sqlite_master where type = 'table' and name = 'chunks'")
-      .get()
+  private lookupChunkLocation(id: string): { file: string; startLine: number; endLine: number } | null {
+    if (!existsSync(this.indexPath)) {
+      return null
+    }
 
-    return tableDefinition?.sql?.includes('vec_length(') ?? false
+    const db = this.openDatabase()
+    const row = db
+      .prepare<[string], ChunkLocationRow>(
+        'select file_path, start_line, end_line from chunks where id = ? limit 1'
+      )
+      .get(id)
+
+    if (!row) {
+      return null
+    }
+
+    return {
+      file: row.file_path,
+      startLine: row.start_line,
+      endLine: row.end_line
+    }
+  }
+
+  private ensureIndexCompatibleForQueries(db: Database.Database): void {
+    const compatibility = this.getIndexCompatibility(db)
+    if (!compatibility.ok) {
+      throw new IndexCompatibilityError(compatibility)
+    }
+  }
+
+  private getIndexCompatibility(db: Database.Database, indexedOverride?: boolean): IndexCompatibilityStatus {
+    const indexed = indexedOverride ?? readChunkCount(db) > 0
+    if (!indexed) {
+      return { ok: true }
+    }
+
+    const provider = getDefaultEmbeddingProvider()
+    const expected: IndexCompatibilitySnapshot = {
+      schemaVersion: SCHEMA_VERSION,
+      providerId: provider.id,
+      providerDims: provider.dims,
+      modelVersion: provider.modelVersion ?? provider.model ?? provider.id
+    }
+    const actualSchemaVersion = readMeta(db, 'schema_version')
+    const actualProviderId = readMeta(db, 'provider_id')
+    const actualProviderDims = readMetaNumber(db, 'provider_dims')
+    const actualModelVersion = readMeta(db, 'model_version')
+    const actual: IndexCompatibilitySnapshot = {
+      ...(actualSchemaVersion ? { schemaVersion: actualSchemaVersion } : {}),
+      ...(actualProviderId ? { providerId: actualProviderId } : {}),
+      ...(actualProviderDims !== undefined ? { providerDims: actualProviderDims } : {}),
+      ...(actualModelVersion ? { modelVersion: actualModelVersion } : {})
+    }
+
+    if (actual.schemaVersion !== expected.schemaVersion) {
+      return buildCompatibilityMismatch('schema_version_mismatch', actual, expected)
+    }
+
+    if (actual.providerId !== expected.providerId) {
+      return buildCompatibilityMismatch('provider_mismatch', actual, expected)
+    }
+
+    if (actual.providerDims !== expected.providerDims) {
+      return buildCompatibilityMismatch('provider_dims_mismatch', actual, expected)
+    }
+
+    if ((actual.modelVersion ?? undefined) !== (expected.modelVersion ?? undefined)) {
+      return buildCompatibilityMismatch('model_version_mismatch', actual, expected)
+    }
+
+    return { ok: true }
   }
 
   private async resetDatabaseFile(): Promise<void> {
@@ -598,6 +748,7 @@ export class SqliteRepo implements Repo {
     }
 
     this.vectorExtensionLoaded = false
+    this.vectorSearchFailure = null
     await Promise.all([
       rm(this.indexPath, { force: true }),
       rm(`${this.indexPath}-shm`, { force: true }),
@@ -618,7 +769,7 @@ function buildSearchHit(row: ChunkRow, baseScore: number, query: string): Search
   const score = baseScore * scoreBoostForRow(row, query)
 
   const hit: SearchHit = {
-    id: String(row.id),
+    id: row.id,
     file: row.file_path,
     range: {
       startLine: row.start_line,
@@ -673,7 +824,7 @@ function applyPathFilter<T extends { file_path: string }>(rows: T[], pathGlob?: 
 }
 
 function fuseRankedRows(query: string, vectorRows: ChunkRow[], lexicalRows: ChunkRow[]): RankedChunkRow[] {
-  const byId = new Map<number, RankedChunkRow>()
+  const byId = new Map<string, RankedChunkRow>()
 
   addReciprocalRanks(byId, vectorRows)
   addReciprocalRanks(byId, lexicalRows)
@@ -681,16 +832,17 @@ function fuseRankedRows(query: string, vectorRows: ChunkRow[], lexicalRows: Chun
   return [...byId.values()].sort((left, right) => {
     const leftScore = left.score * scoreBoostForRow(left.row, query)
     const rightScore = right.score * scoreBoostForRow(right.row, query)
+    const scoreDelta = rightScore - leftScore
 
-    if (rightScore !== leftScore) {
-      return rightScore - leftScore
+    if (Math.abs(scoreDelta) > 1e-12) {
+      return scoreDelta
     }
 
-    return left.row.file_path.localeCompare(right.row.file_path)
+    return stableChunkSortKey(left.row).localeCompare(stableChunkSortKey(right.row))
   })
 }
 
-function addReciprocalRanks(target: Map<number, RankedChunkRow>, rows: ChunkRow[]): void {
+function addReciprocalRanks(target: Map<string, RankedChunkRow>, rows: ChunkRow[]): void {
   rows.forEach((row, index) => {
     const score = 1 / (DEFAULT_RRF_K + index + 1)
     const existing = target.get(row.id)
@@ -887,4 +1039,139 @@ function queryLooksDocumentationOrConfigFocused(query: string): boolean {
   return /\b(readme|plan|doc|docs|documentation|guide|workflow|config|package\.json|pnpm|json|yaml)\b/i.test(
     query
   )
+}
+
+function createChunkId(chunk: ChunkRecord): string {
+  return `${chunk.file}:${chunk.startLine}-${chunk.endLine}@${hashText(chunk.content)}`
+}
+
+function parseChunkId(id: string): { file: string; startLine: number; endLine: number; contentHash: string } | null {
+  const match = /^(.*):(\d+)-(\d+)@([a-f0-9]{64})$/.exec(id)
+  if (!match) {
+    return null
+  }
+
+  const [, file = '', startLine = '0', endLine = '0', contentHash = ''] = match
+  return {
+    file,
+    startLine: Number(startLine),
+    endLine: Number(endLine),
+    contentHash
+  }
+}
+
+function hashText(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex')
+}
+
+function buildEmbeddingBatches(
+  chunks: IndexedChunkRecord[],
+  maxBatch = Number.POSITIVE_INFINITY,
+  maxBatchTokens = Number.POSITIVE_INFINITY
+): IndexedChunkRecord[][] {
+  if (chunks.length === 0) {
+    return []
+  }
+
+  const batches: IndexedChunkRecord[][] = []
+  let currentBatch: IndexedChunkRecord[] = []
+  let currentBatchTokens = 0
+
+  for (const chunk of chunks) {
+    const estimatedTokens = Math.max(1, estimateTokenCount(chunk.embeddingText))
+    const wouldOverflowBatch = currentBatch.length >= maxBatch
+    const wouldOverflowTokens = currentBatch.length > 0 && currentBatchTokens + estimatedTokens > maxBatchTokens
+
+    if (wouldOverflowBatch || wouldOverflowTokens) {
+      batches.push(currentBatch)
+      currentBatch = []
+      currentBatchTokens = 0
+    }
+
+    currentBatch.push(chunk)
+    currentBatchTokens += estimatedTokens
+  }
+
+  if (currentBatch.length > 0) {
+    batches.push(currentBatch)
+  }
+
+  return batches
+}
+
+function estimateTokenCount(value: string): number {
+  return Math.max(1, Math.ceil(value.length / 4))
+}
+
+function buildCompatibilityMismatch(
+  code: NonNullable<IndexCompatibilityStatus['code']>,
+  actual: IndexCompatibilitySnapshot,
+  expected: IndexCompatibilitySnapshot
+): IndexCompatibilityStatus {
+  return {
+    ok: false,
+    code,
+    message:
+      `index built with ${actual.providerId ?? 'unknown'} (${actual.providerDims ?? '?'} dims) / schema v${actual.schemaVersion ?? 'unknown'}, ` +
+      `now ${expected.providerId ?? 'unknown'} (${expected.providerDims ?? '?'} dims) / schema v${expected.schemaVersion ?? 'unknown'} — ` +
+      'run `codesift index --rebuild`',
+    actual,
+    expected
+  }
+}
+
+function readMeta(db: Database.Database, key: string): string | null {
+  return db.prepare<[string], { value: string }>('select value from meta where key = ?').get(key)?.value ?? null
+}
+
+function readMetaNumber(db: Database.Database, key: string): number | undefined {
+  const value = readMeta(db, key)
+  if (!value) {
+    return undefined
+  }
+
+  const numberValue = Number(value)
+  return Number.isFinite(numberValue) ? numberValue : undefined
+}
+
+function readChunkCount(db: Database.Database): number {
+  return db.prepare<[], { value: number }>('select count(*) as value from chunks').get()?.value ?? 0
+}
+
+function stableChunkSortKey(row: ChunkRow): string {
+  return `${row.file_path}:${String(row.start_line).padStart(9, '0')}:${String(row.end_line).padStart(9, '0')}:${row.id}`
+}
+
+function normalizeContextLines(value: number | undefined): number {
+  if (value === undefined) {
+    return 0
+  }
+
+  if (!Number.isFinite(value) || value < 0) {
+    return 0
+  }
+
+  return Math.floor(value)
+}
+
+function splitLines(content: string): string[] {
+  return content.split(/\r?\n/)
+}
+
+function isPathInsideRoot(root: string, target: string): boolean {
+  const normalizedRoot = normalizePath(root)
+  const normalizedTarget = normalizePath(target)
+  return normalizedTarget === normalizedRoot || normalizedTarget.startsWith(`${normalizedRoot}/`)
+}
+
+function normalizePath(value: string): string {
+  return resolve(value).replace(/\\/g, '/').replace(/\/$/, '')
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    const abortError = new Error('The operation was aborted')
+    abortError.name = 'AbortError'
+    throw abortError
+  }
 }

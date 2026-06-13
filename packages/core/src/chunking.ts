@@ -314,7 +314,7 @@ function splitLines(content: string): string[] {
 }
 
 function sliceLines(lines: string[], startLine: number, endLine: number): string {
-  return lines.slice(startLine - 1, endLine).join('\n').trim()
+  return lines.slice(startLine - 1, endLine).join('\n')
 }
 
 function buildSnippet(content: string): string {

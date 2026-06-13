@@ -1,7 +1,9 @@
-import type { EmbeddingProvider } from './types.js'
+import type { EmbeddingProvider, EmbeddingRole } from './types.js'
 
-export const DEFAULT_EMBEDDING_PROVIDER_ID = 'local-hash-v1'
-const DEFAULT_EMBEDDING_DIMS = 384
+export const DEFAULT_EMBEDDING_PROVIDER_ID = 'lexical-v1'
+export const LOCAL_HASH_EMBEDDING_PROVIDER_ID = 'local-hash-v1'
+const DEFAULT_LEXICAL_DIMS = 8
+const DEFAULT_HASH_DIMS = 384
 
 const SYNONYM_GROUPS = [
   ['auth', 'authenticate', 'authentication', 'authorize', 'authorization', 'login', 'signin'],
@@ -28,12 +30,30 @@ for (const group of SYNONYM_GROUPS) {
 
 const embeddingProviders = new Map<string, EmbeddingProvider>()
 
-class LocalHashEmbeddingProvider implements EmbeddingProvider {
+class LexicalEmbeddingProvider implements EmbeddingProvider {
   readonly id = DEFAULT_EMBEDDING_PROVIDER_ID
-  readonly dims = DEFAULT_EMBEDDING_DIMS
+  readonly dims = DEFAULT_LEXICAL_DIMS
   readonly maxTokens = 8192
+  readonly maxBatch = 256
+  readonly maxBatchTokens = 32_768
+  readonly modelVersion = 'builtin-lexical-v1'
+  readonly isLearned = false
 
-  async embedBatch(texts: string[]): Promise<Float32Array[]> {
+  async embedBatch(texts: string[], _options: { role: EmbeddingRole }): Promise<Float32Array[]> {
+    return texts.map(() => new Float32Array(this.dims))
+  }
+}
+
+class LocalHashEmbeddingProvider implements EmbeddingProvider {
+  readonly id = LOCAL_HASH_EMBEDDING_PROVIDER_ID
+  readonly dims = DEFAULT_HASH_DIMS
+  readonly maxTokens = 8192
+  readonly maxBatch = 128
+  readonly maxBatchTokens = 16_384
+  readonly modelVersion = 'local-hash-v1-fixture'
+  readonly isLearned = false
+
+  async embedBatch(texts: string[], _options: { role: EmbeddingRole }): Promise<Float32Array[]> {
     return texts.map((text) => embedText(text, this.dims))
   }
 }
@@ -154,17 +174,33 @@ function stableHash(text: string): number {
   return hash >>> 0
 }
 
-function ensureDefaultEmbeddingProvider(): void {
+function ensureBuiltinEmbeddingProviders(): void {
   if (!embeddingProviders.has(DEFAULT_EMBEDDING_PROVIDER_ID)) {
-    embeddingProviders.set(DEFAULT_EMBEDDING_PROVIDER_ID, new LocalHashEmbeddingProvider())
+    embeddingProviders.set(DEFAULT_EMBEDDING_PROVIDER_ID, new LexicalEmbeddingProvider())
+  }
+
+  if (!embeddingProviders.has(LOCAL_HASH_EMBEDDING_PROVIDER_ID)) {
+    embeddingProviders.set(LOCAL_HASH_EMBEDDING_PROVIDER_ID, new LocalHashEmbeddingProvider())
   }
 }
 
-ensureDefaultEmbeddingProvider()
+ensureBuiltinEmbeddingProviders()
+
+export function getDefaultEmbeddingProviderId(): string {
+  const configuredId = process.env.CODESIFT_EMBEDDING_PROVIDER?.trim()
+  return configuredId || DEFAULT_EMBEDDING_PROVIDER_ID
+}
 
 export function getDefaultEmbeddingProvider(): EmbeddingProvider {
-  ensureDefaultEmbeddingProvider()
-  return embeddingProviders.get(DEFAULT_EMBEDDING_PROVIDER_ID)!
+  ensureBuiltinEmbeddingProviders()
+
+  const providerId = getDefaultEmbeddingProviderId()
+  const provider = embeddingProviders.get(providerId)
+  if (!provider) {
+    throw new Error(`Embedding provider not registered: ${providerId}`)
+  }
+
+  return provider
 }
 
 export function registerEmbeddingProvider(provider: EmbeddingProvider): void {
@@ -180,6 +216,14 @@ export function registerEmbeddingProvider(provider: EmbeddingProvider): void {
     throw new Error('Embedding provider maxTokens must be greater than zero')
   }
 
+  if (provider.maxBatch !== undefined && provider.maxBatch <= 0) {
+    throw new Error('Embedding provider maxBatch must be greater than zero')
+  }
+
+  if (provider.maxBatchTokens !== undefined && provider.maxBatchTokens <= 0) {
+    throw new Error('Embedding provider maxBatchTokens must be greater than zero')
+  }
+
   if (embeddingProviders.has(provider.id)) {
     throw new Error(`Embedding provider already registered: ${provider.id}`)
   }
@@ -193,4 +237,8 @@ export function getEmbeddingProvider(id: string): EmbeddingProvider | undefined 
 
 export function listEmbeddingProviders(): EmbeddingProvider[] {
   return [...embeddingProviders.values()]
+}
+
+export function isLearnedEmbeddingProvider(provider: EmbeddingProvider): boolean {
+  return provider.isLearned === true
 }

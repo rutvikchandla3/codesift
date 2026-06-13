@@ -4,6 +4,10 @@ import { resolve } from 'node:path'
 import { Command } from 'commander'
 
 import {
+  DEFAULT_SEARCH_K,
+  IndexCompatibilityError,
+  getDefaultEmbeddingProvider,
+  isLearnedEmbeddingProvider,
   openRepo,
   type RepoStatus,
   type SearchHit,
@@ -26,6 +30,13 @@ const defaultIo: CliIo = {
   }
 }
 
+export function getCliDescription(): string {
+  const provider = getDefaultEmbeddingProvider()
+  return isLearnedEmbeddingProvider(provider)
+    ? 'Local-first hybrid lexical + semantic code search for CLI, SDK, and MCP.'
+    : 'Local-first lexical code search for CLI, SDK, and MCP.'
+}
+
 export function formatStatus(status: RepoStatus): string {
   return [
     `root: ${status.root}`,
@@ -34,7 +45,9 @@ export function formatStatus(status: RepoStatus): string {
     `stale: ${status.stale ? 'yes' : 'no'}`,
     `chunks: ${status.chunkCount}`,
     `symbols: ${status.symbolCount}`,
+    `generation: ${status.indexGeneration}`,
     `provider: ${status.provider?.id ?? 'unconfigured'}`,
+    `compatibility: ${formatCompatibilityStatus(status)}`,
     `vector: ${formatVectorStatus(status)}`
   ].join('\n')
 }
@@ -87,6 +100,14 @@ export function formatSymbols(definitions: SymbolDefinition[]): string {
     .join('\n')
 }
 
+function formatCompatibilityStatus(status: RepoStatus): string {
+  if (status.compatibility.ok) {
+    return 'ok'
+  }
+
+  return status.compatibility.message ?? 'rebuild required'
+}
+
 function formatVectorStatus(status: RepoStatus): string {
   const detail = status.vectorSearch.detail ? ` — ${status.vectorSearch.detail}` : ''
 
@@ -110,13 +131,23 @@ function parseCsvList(value?: string): string[] | undefined {
   return values.length > 0 ? values : undefined
 }
 
+async function withCompatibilityHandling(io: CliIo, action: () => Promise<void>): Promise<void> {
+  try {
+    await action()
+  } catch (error) {
+    if (error instanceof IndexCompatibilityError) {
+      io.stderr(error.message)
+      return
+    }
+
+    throw error
+  }
+}
+
 export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promise<void> {
   const program = new Command()
 
-  program
-    .name('codesift')
-    .description('Local-first hybrid code search for CLI, SDK, and MCP.')
-    .version('0.0.0')
+  program.name('codesift').description(getCliDescription()).version('0.0.0')
 
   program
     .command('index')
@@ -128,7 +159,7 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
       const result = await repo.sync(options.rebuild ? { rebuild: true } : undefined)
 
       io.stdout(
-        `Indexed ${result.indexedFiles} files (${result.skippedFiles} skipped) in ${result.durationMs}ms at ${repo.root}.`
+        `Indexed ${result.indexedFiles} files (${result.skippedFiles} skipped, ${result.skippedSymlinks} symlink skips) in ${result.durationMs}ms at ${repo.root}.`
       )
       if (options.watch) {
         io.stdout('Watch mode is reserved for M4.')
@@ -138,7 +169,7 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
   program
     .command('search')
     .argument('<query>', 'natural language or symbol-aware query')
-    .option('-k, --k <count>', 'number of hits', '10')
+    .option('-k, --k <count>', 'number of hits', String(DEFAULT_SEARCH_K))
     .option('--repo <path>', 'repository path', process.cwd())
     .option('--lang <langs>', 'comma-separated language filter, e.g. ts,typescript,python')
     .option('--path <glob>', 'path glob filter, e.g. src/**')
@@ -150,38 +181,40 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
         query: string,
         options: { k: string; repo: string; lang?: string; path?: string; kind?: string; json?: boolean; compact?: boolean }
       ) => {
-        const repo = await openRepo(options.repo)
-        const languages = parseCsvList(options.lang)
-        const searchOptions: {
-          k: number
-          lang?: string[]
-          pathGlob?: string
-          kind?: SymbolKind
-        } = {
-          k: Number(options.k)
-        }
+        await withCompatibilityHandling(io, async () => {
+          const repo = await openRepo(options.repo)
+          const languages = parseCsvList(options.lang)
+          const searchOptions: {
+            k: number
+            lang?: string[]
+            pathGlob?: string
+            kind?: SymbolKind
+          } = {
+            k: Number(options.k)
+          }
 
-        if (languages) {
-          searchOptions.lang = languages
-        }
+          if (languages) {
+            searchOptions.lang = languages
+          }
 
-        if (options.path) {
-          searchOptions.pathGlob = options.path
-        }
+          if (options.path) {
+            searchOptions.pathGlob = options.path
+          }
 
-        if (options.kind) {
-          searchOptions.kind = options.kind as SymbolKind
-        }
+          if (options.kind) {
+            searchOptions.kind = options.kind as SymbolKind
+          }
 
-        const hits = await repo.search(query, searchOptions)
-        const output = options.json ? JSON.stringify(hits, null, 2) : options.compact ? formatCompactHits(hits) : formatHits(hits)
-        const status = await repo.status()
+          const hits = await repo.search(query, searchOptions)
+          const output = options.json ? JSON.stringify(hits, null, 2) : options.compact ? formatCompactHits(hits) : formatHits(hits)
+          const status = await repo.status()
 
-        io.stdout(output)
+          io.stdout(output)
 
-        if (status.vectorSearch.state === 'unavailable' && status.vectorSearch.message) {
-          io.stderr(formatVectorStatus(status))
-        }
+          if (status.vectorSearch.state === 'unavailable' && status.vectorSearch.message) {
+            io.stderr(formatVectorStatus(status))
+          }
+        })
       }
     )
 
@@ -192,22 +225,24 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
     .option('--path <glob>', 'path glob filter, e.g. src/**')
     .option('--kind <kind>', 'symbol kind filter')
     .action(async (name: string, options: { repo: string; path?: string; kind?: string }) => {
-      const repo = await openRepo(options.repo)
-      const findOptions: {
-        pathGlob?: string
-        kind?: SymbolKind
-      } = {}
+      await withCompatibilityHandling(io, async () => {
+        const repo = await openRepo(options.repo)
+        const findOptions: {
+          pathGlob?: string
+          kind?: SymbolKind
+        } = {}
 
-      if (options.path) {
-        findOptions.pathGlob = options.path
-      }
+        if (options.path) {
+          findOptions.pathGlob = options.path
+        }
 
-      if (options.kind) {
-        findOptions.kind = options.kind as SymbolKind
-      }
+        if (options.kind) {
+          findOptions.kind = options.kind as SymbolKind
+        }
 
-      const definitions = await repo.findSymbol(name, findOptions)
-      io.stdout(formatSymbols(definitions))
+        const definitions = await repo.findSymbol(name, findOptions)
+        io.stdout(formatSymbols(definitions))
+      })
     })
 
   program

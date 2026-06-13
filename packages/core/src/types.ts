@@ -1,3 +1,5 @@
+export const DEFAULT_SEARCH_K = 8
+
 export type SymbolKind =
   | 'class'
   | 'constant'
@@ -10,6 +12,8 @@ export type SymbolKind =
   | 'namespace'
   | 'type'
   | 'variable'
+
+export type EmbeddingRole = 'query' | 'document'
 
 export interface Range {
   startLine: number
@@ -51,14 +55,24 @@ export interface FindSymbolOptions {
   pathGlob?: string
 }
 
+export interface SyncProgressEvent {
+  phase: 'batch'
+  batch: number
+  totalBatches: number
+  completedChunks: number
+  totalChunks: number
+}
+
 export interface SyncOptions {
   rebuild?: boolean
   signal?: AbortSignal
+  onProgress?: (event: SyncProgressEvent) => void
 }
 
 export interface SyncResult {
   indexedFiles: number
   skippedFiles: number
+  skippedSymlinks: number
   removedFiles: number
   durationMs: number
 }
@@ -78,6 +92,28 @@ export interface VectorSearchStatus {
   detail?: string
 }
 
+export interface RepoStatusProvider {
+  id: string
+  model?: string
+  modelVersion?: string
+  dims?: number
+}
+
+export interface IndexCompatibilitySnapshot {
+  schemaVersion?: string
+  providerId?: string
+  providerDims?: number
+  modelVersion?: string
+}
+
+export interface IndexCompatibilityStatus {
+  ok: boolean
+  code?: 'schema_version_mismatch' | 'provider_mismatch' | 'provider_dims_mismatch' | 'model_version_mismatch'
+  message?: string
+  expected?: IndexCompatibilitySnapshot
+  actual?: IndexCompatibilitySnapshot
+}
+
 export interface RepoStatus {
   root: string
   indexPath: string
@@ -85,12 +121,18 @@ export interface RepoStatus {
   stale: boolean
   chunkCount: number
   symbolCount: number
-  provider: {
-    id: string
-    model?: string
-    dims?: number
-  } | null
+  indexGeneration: number
+  provider: RepoStatusProvider | null
+  compatibility: IndexCompatibilityStatus
   vectorSearch: VectorSearchStatus
+}
+
+export interface ReadChunkOptions {
+  contextLines?: number
+}
+
+export interface ReadRangeOptions {
+  contextLines?: number
 }
 
 export interface Repo {
@@ -98,13 +140,24 @@ export interface Repo {
   sync(options?: SyncOptions): Promise<SyncResult>
   search(query: string, options?: SearchOptions): Promise<SearchHit[]>
   findSymbol(name: string, options?: FindSymbolOptions): Promise<SymbolDefinition[]>
+  readChunk(id: string, options?: ReadChunkOptions): Promise<string>
+  readRange(file: string, startLine: number, endLine: number, options?: ReadRangeOptions): Promise<string>
   status(): Promise<RepoStatus>
   watch(options?: WatchOptions): Promise<StopWatching>
+}
+
+export interface EmbeddingBatchOptions {
+  role: EmbeddingRole
 }
 
 export interface EmbeddingProvider {
   id: string
   dims: number
   maxTokens: number
-  embedBatch(texts: string[], signal?: AbortSignal): Promise<Float32Array[]>
+  maxBatch?: number
+  maxBatchTokens?: number
+  model?: string
+  modelVersion?: string
+  isLearned?: boolean
+  embedBatch(texts: string[], options: EmbeddingBatchOptions, signal?: AbortSignal): Promise<Float32Array[]>
 }

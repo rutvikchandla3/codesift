@@ -2,7 +2,7 @@
   "name": "codesift-workspace",
   "private": true,
   "version": "0.0.0",
-  "description": "Local-first hybrid code search engine for CLI, SDK, and MCP.",
+  "description": "Local-first lexical code search engine for CLI, SDK, and MCP.",
   "license": "MIT",
   "packageManager": "pnpm@10.33.2",
   "engines": {

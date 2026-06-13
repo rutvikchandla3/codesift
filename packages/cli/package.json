@@ -1,7 +1,7 @@
 {
   "name": "codesift",
   "version": "0.0.0",
-  "description": "CLI for codesift local-first hybrid code search.",
+  "description": "CLI for codesift local-first lexical code search.",
   "type": "module",
   "license": "MIT",
   "engines": {

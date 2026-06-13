@@ -6,14 +6,27 @@ import { promisify } from 'node:util'
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { openRepo, setVectorExtensionLoaderForTests } from '../src/index.js'
+import {
+  IndexCompatibilityError,
+  openRepo,
+  registerEmbeddingProvider,
+  setVectorExtensionLoaderForTests,
+  type EmbeddingProvider
+} from '../src/index.js'
 
 const execFileAsync = promisify(execFile)
 const temporaryDirectories: string[] = []
+const originalEmbeddingProvider = process.env.CODESIFT_EMBEDDING_PROVIDER
 
 afterEach(async () => {
   vi.restoreAllMocks()
   setVectorExtensionLoaderForTests()
+
+  if (originalEmbeddingProvider === undefined) {
+    delete process.env.CODESIFT_EMBEDDING_PROVIDER
+  } else {
+    process.env.CODESIFT_EMBEDDING_PROVIDER = originalEmbeddingProvider
+  }
 
   await Promise.all(
     temporaryDirectories.splice(0).map(async (directory) => {
@@ -56,6 +69,28 @@ This project validates JWT tokens before protected requests continue.
   return repoRoot
 }
 
+function activateLearnedProvider(providerId: string): void {
+  const provider: EmbeddingProvider = {
+    id: providerId,
+    dims: 8,
+    maxTokens: 8192,
+    maxBatch: 8,
+    maxBatchTokens: 4096,
+    modelVersion: `${providerId}-model`,
+    isLearned: true,
+    async embedBatch(texts) {
+      return texts.map((text) => {
+        const vector = new Float32Array(8)
+        vector[0] = text.length || 1
+        return vector
+      })
+    }
+  }
+
+  registerEmbeddingProvider(provider)
+  process.env.CODESIFT_EMBEDDING_PROVIDER = providerId
+}
+
 describe('repo resilience seams', () => {
   it('self-gitigores .codesift on first open/sync', async () => {
     const repoRoot = await createDemoRepository('codesift-gitignore-')
@@ -73,6 +108,8 @@ describe('repo resilience seams', () => {
 
   it('keeps lexical and symbol search working when sqlite-vec is unavailable', async () => {
     const repoRoot = await createDemoRepository('codesift-vector-degraded-')
+    activateLearnedProvider(`learned-provider-${Date.now()}`)
+
     const loadSpy = vi.fn(() => {
       throw new Error('missing sqlite-vec prebuild')
     })
@@ -88,14 +125,29 @@ describe('repo resilience seams', () => {
     expect(symbolHits[0]?.file).toBe('src/auth/jwt.ts')
     expect(loadSpy).not.toHaveBeenCalled()
 
-    const semanticHits = await repo.search('validate JWT tokens before requests continue', { k: 3 })
+    const learnedHits = await repo.search('validate JWT tokens before requests continue', { k: 3 })
     const status = await repo.status()
 
-    expect(semanticHits[0]?.file).toBe('src/auth/jwt.ts')
+    expect(learnedHits[0]?.file).toBe('src/auth/jwt.ts')
     expect(loadSpy).toHaveBeenCalledTimes(1)
     expect(status.vectorSearch.state).toBe('unavailable')
     expect(status.vectorSearch.reason).toBe('native-dependency-unavailable')
     expect(status.vectorSearch.message).toBe('vector search unavailable (native dep), lexical/symbol still works')
     expect(status.vectorSearch.detail).toContain('missing sqlite-vec prebuild')
+  })
+
+  it('refuses queries with a guided rebuild message on provider mismatch', async () => {
+    const repoRoot = await createDemoRepository('codesift-provider-mismatch-')
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    activateLearnedProvider(`mismatch-provider-${Date.now()}`)
+
+    const incompatibleStatus = await repo.status()
+    expect(incompatibleStatus.compatibility.ok).toBe(false)
+    expect(incompatibleStatus.compatibility.code).toBe('provider_mismatch')
+    expect(incompatibleStatus.compatibility.message).toContain('codesift index --rebuild')
+
+    await expect(repo.search('validate JWT tokens', { k: 1 })).rejects.toBeInstanceOf(IndexCompatibilityError)
   })
 })

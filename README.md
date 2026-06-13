@@ -1,6 +1,6 @@
 # codesift
 
-Local-first hybrid code search for repositories, delivered as one TypeScript core with three thin interfaces:
+Local-first lexical code search for repositories, delivered as one TypeScript core with three thin interfaces:
 
 - `codesift` CLI
 - `@codesift/core` SDK
@@ -16,17 +16,16 @@ Implemented today:
 - TS/JS structural chunking via the TypeScript compiler API
 - Python structural definition chunking
 - fallback line-window chunking for other supported text files
-- local semantic embeddings via a built-in provider
-- SQLite-backed local index with `sqlite-vec`
+- SQLite-backed local index with FTS and lazy `sqlite-vec` loading
 - end-to-end `index`, `search`, `sym`, `status`, and `clean` CLI flows
+- stable chunk ids plus on-demand chunk/range reads from disk
 
 Still intentionally deferred to later milestones:
 
-- hybrid BM25 + vector fusion
-- exact-symbol boost
-- incremental freshness / watch mode
+- production learned embedding provider
+- watch mode and incremental freshness
 - full MCP transport implementation
-- production local ONNX embedding model
+- broader eval harness and ranking work
 
 ## Supported platforms
 

@@ -1,13 +1,16 @@
-import type {
-  FindSymbolOptions,
-  Repo,
-  RepoStatus,
-  SearchHit,
-  SearchOptions,
-  SymbolDefinition
+import {
+  DEFAULT_SEARCH_K as CORE_DEFAULT_SEARCH_K,
+  getDefaultEmbeddingProvider,
+  isLearnedEmbeddingProvider,
+  type FindSymbolOptions,
+  type Repo,
+  type RepoStatus,
+  type SearchHit,
+  type SearchOptions,
+  type SymbolDefinition
 } from '@codesift/core'
 
-export const DEFAULT_SEARCH_K = 8
+export const DEFAULT_SEARCH_K = CORE_DEFAULT_SEARCH_K
 
 export const MCP_TOOL_NAMES = [
   'search_code',
@@ -61,33 +64,16 @@ export interface McpRouter {
   indexStatus(): Promise<RepoStatus>
 }
 
-const TOOL_DEFINITIONS: readonly McpToolDefinition[] = [
-  {
-    name: 'search_code',
-    description: 'Hybrid lexical + semantic code search over the current repo index.'
-  },
-  {
-    name: 'find_symbol',
-    description: 'Definition lookup from the symbols table.'
-  },
-  {
-    name: 'read_chunk',
-    description: 'Expand a prior hit into a larger chunk with surrounding context.'
-  },
-  {
-    name: 'index_status',
-    description: 'Inspect freshness, counts, and model metadata for the current index.'
-  }
-]
-
 class ScaffoldServerHandle implements McpServerHandle {
-  readonly tools = TOOL_DEFINITIONS
-
   constructor(
     readonly transport: 'stdio' | 'http',
     private readonly _repo: Repo,
     readonly options?: HttpServerOptions
   ) {}
+
+  get tools(): readonly McpToolDefinition[] {
+    return getToolDefinitions()
+  }
 
   async start(): Promise<void> {
     return undefined
@@ -99,7 +85,29 @@ class ScaffoldServerHandle implements McpServerHandle {
 }
 
 export function getToolDefinitions(): readonly McpToolDefinition[] {
-  return TOOL_DEFINITIONS
+  const provider = getDefaultEmbeddingProvider()
+  const searchDescription = isLearnedEmbeddingProvider(provider)
+    ? 'Hybrid lexical + semantic code search over the current repo index.'
+    : 'Lexical code search over the current repo index.'
+
+  return [
+    {
+      name: 'search_code',
+      description: searchDescription
+    },
+    {
+      name: 'find_symbol',
+      description: 'Definition lookup from the symbols table.'
+    },
+    {
+      name: 'read_chunk',
+      description: 'Expand a prior hit into a larger chunk with surrounding context.'
+    },
+    {
+      name: 'index_status',
+      description: 'Inspect freshness, counts, and model metadata for the current index.'
+    }
+  ]
 }
 
 export function createRouter(repo: Repo): McpRouter {
@@ -133,7 +141,7 @@ export function createRouter(repo: Repo): McpRouter {
       return repo.findSymbol(args.name, options)
     },
     async readChunk(args) {
-      return `Scaffold only: chunk ${args.id} cannot be expanded until M2.`
+      return repo.readChunk(args.id, args.context_lines === undefined ? undefined : { contextLines: args.context_lines })
     },
     async indexStatus() {
       return repo.status()
