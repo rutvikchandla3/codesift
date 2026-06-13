@@ -64,14 +64,17 @@ interface IgnoreMatcher {
   matcher: ReturnType<typeof ignore>
 }
 
-export interface ScannedFile {
+export interface ScannedFileMetadata {
   absolutePath: string
   relativePath: string
   language: string
-  content: string
-  hash: string
   size: number
   mtime: number
+}
+
+export interface ScannedFile extends ScannedFileMetadata {
+  content: string
+  hash: string
   generated: boolean
 }
 
@@ -81,8 +84,32 @@ export interface ScanResult {
   skippedSymlinks: number
 }
 
+export interface ScanManifestResult {
+  files: ScannedFileMetadata[]
+  skippedFiles: number
+  skippedSymlinks: number
+}
+
 export async function scanRepository(root: string): Promise<ScanResult> {
-  const files: ScannedFile[] = []
+  const result = await scanRepositoryInternal(root, true)
+  return {
+    files: result.files as ScannedFile[],
+    skippedFiles: result.skippedFiles,
+    skippedSymlinks: result.skippedSymlinks
+  }
+}
+
+export async function scanRepositoryManifest(root: string): Promise<ScanManifestResult> {
+  const result = await scanRepositoryInternal(root, false)
+  return {
+    files: result.files as ScannedFileMetadata[],
+    skippedFiles: result.skippedFiles,
+    skippedSymlinks: result.skippedSymlinks
+  }
+}
+
+async function scanRepositoryInternal(root: string, includeContent: boolean): Promise<{ files: Array<ScannedFile | ScannedFileMetadata>; skippedFiles: number; skippedSymlinks: number }> {
+  const files: Array<ScannedFile | ScannedFileMetadata> = []
   let skippedFiles = 0
   let skippedSymlinks = 0
   const repoRoot = resolve(root)
@@ -106,14 +133,25 @@ export async function scanRepository(root: string): Promise<ScanResult> {
       return
     }
 
-    const buffer = await readFile(absolutePath)
-    if (buffer.includes(0)) {
+    const language = detectLanguage(relativePath)
+    if (!language) {
       skippedFiles += 1
       return
     }
 
-    const language = detectLanguage(relativePath)
-    if (!language) {
+    if (!includeContent) {
+      files.push({
+        absolutePath,
+        relativePath,
+        language,
+        size: fileStat.size,
+        mtime: fileStat.mtimeMs
+      })
+      return
+    }
+
+    const buffer = await readFile(absolutePath)
+    if (buffer.includes(0)) {
       skippedFiles += 1
       return
     }

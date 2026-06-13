@@ -4,7 +4,7 @@
 
 Hybrid (lexical + semantic) code search for repositories, shipped as one TypeScript core with three thin interfaces: a **CLI** for humans, an **SDK** for programs, and an **MCP server** for AI agents. Open source, MIT.
 
-**Status**: M3 is complete; M2 is complete and M4 freshness/watch is next.
+**Status**: M4 freshness/watch is complete; M5 and M6 remain before v0.1 release.
 
 ---
 
@@ -171,7 +171,8 @@ query → [BM25 over code+symbol text]  →  top-100 ─┐
 ### 5.6 Freshness
 
 - `files` manifest: content hash (xxhash) + mtime + size. `index` diffs the manifest, re-processes only changed/added files, deletes chunks of removed files. Renames = delete + add (cheap; embeddings re-used not attempted in v0.1).
-- `--watch`: chokidar with 500 ms debounce, batched through the same incremental path. No separate daemon lifecycle — it's the foreground process.
+- `--watch`: native `fs.watch` directory subscriptions with 500 ms debounce and bounded safety polling, batched through the same incremental path.
+- `codesift mcp`: a thin stdio shim starts or reuses a long-lived local daemon over a local socket, so MCP routing and repo handles are amortized across agent sessions.
 - Query-time: cheap mtime scan; results carry a `stale: true` flag (and the MCP `index_status` tool exposes it) rather than blocking the search.
 
 ## 6. Eval harness (`packages/eval`)
@@ -370,9 +371,9 @@ search enabled while vector search is reported as degraded in `index_status`.
 stdio path (`codesift mcp` spawn → JSON-RPC initialize → first tool result) and records the cold latency
 startup tax in `packages/eval/losses.json`; this is accepted for M2 because MCP clients are expected to
 keep the stdio server alive, so the cost is paid once per repo/client session rather than once per
-search. Warm in-process queries are already faster than `rg` on the M2 set. The daemon is pulled into the
-M4 freshness/watch work so it can share the same long-lived process, prepared statements, model
-residency, and background sync lifecycle.
+search. Warm in-process queries are already faster than `rg` on the M2 set. The daemon landed with the
+M4 freshness/watch work as a local-socket stdio shim that shares a long-lived process and repo handles;
+future M5/M6 work can extend that process with HTTP and learned-model residency.
 
 ### 12.9 M3 start recorded (2026-06-13)
 

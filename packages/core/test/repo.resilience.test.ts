@@ -136,6 +136,28 @@ describe('repo resilience seams', () => {
     expect(status.vectorSearch.detail).toContain('missing sqlite-vec prebuild')
   })
 
+  it('surfaces git branch and HEAD drift as stale reasons', async () => {
+    const repoRoot = await createDemoRepository('codesift-git-drift-')
+    await execFileAsync('git', ['init', '-q'], { cwd: repoRoot })
+    await execFileAsync('git', ['config', 'user.email', 'codesift@example.test'], { cwd: repoRoot })
+    await execFileAsync('git', ['config', 'user.name', 'codesift test'], { cwd: repoRoot })
+    await execFileAsync('git', ['add', '.'], { cwd: repoRoot })
+    await execFileAsync('git', ['commit', '-qm', 'initial'], { cwd: repoRoot })
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    await execFileAsync('git', ['checkout', '-qb', 'feature/drift'], { cwd: repoRoot })
+    const branchStatus = await repo.status()
+
+    expect(branchStatus.staleReasons?.some((reason) => reason.code === 'git_branch_changed')).toBe(true)
+
+    await execFileAsync('git', ['commit', '--allow-empty', '-qm', 'advance head'], { cwd: repoRoot })
+    const headStatus = await repo.status()
+
+    expect(headStatus.staleReasons?.some((reason) => reason.code === 'git_head_changed')).toBe(true)
+  })
+
   it('refuses queries with a guided rebuild message on provider mismatch', async () => {
     const repoRoot = await createDemoRepository('codesift-provider-mismatch-')
     const repo = await openRepo(repoRoot)

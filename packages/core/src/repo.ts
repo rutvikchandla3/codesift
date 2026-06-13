@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
-import { existsSync } from 'node:fs'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { existsSync, watch as watchFs, type FSWatcher } from 'node:fs'
+import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 import Database from 'better-sqlite3'
 import { minimatch } from 'minimatch'
@@ -10,8 +10,8 @@ import * as sqliteVec from 'sqlite-vec'
 import { buildChunks, type ChunkRecord } from './chunking.js'
 import { getDefaultEmbeddingProvider, isLearnedEmbeddingProvider } from './embedding.js'
 import { isCodeLanguage, isDocumentationLanguage } from './languages.js'
-import { scanRepository } from './scan.js'
-import { DEFAULT_SEARCH_K, type FindSymbolOptions, type GrepHit, type GrepOptions, type IndexCompatibilitySnapshot, type IndexCompatibilityStatus, type ReadChunkOptions, type ReadRangeOptions, type Repo, type RepoStatus, type SearchHit, type SearchOptions, type SearchReasonTag, type StopWatching, type SymbolDefinition, type SymbolKind, type SyncOptions, type SyncResult, type VectorSearchStatus, type WatchOptions } from './types.js'
+import { scanRepository, scanRepositoryManifest, type ScannedFile } from './scan.js'
+import { DEFAULT_SEARCH_K, type FindSymbolOptions, type GrepHit, type GrepOptions, type IndexCompatibilitySnapshot, type IndexCompatibilityStatus, type ReadChunkOptions, type ReadRangeOptions, type Repo, type RepoStaleReason, type RepoStatus, type RepoSyncStatus, type SearchHit, type SearchOptions, type SearchReasonTag, type StopWatching, type SymbolDefinition, type SymbolKind, type SyncOptions, type SyncResult, type VectorSearchStatus, type WatchOptions } from './types.js'
 
 interface ChunkRow {
   id: string
@@ -65,7 +65,65 @@ interface RankedChunkRow {
   reasons: Set<SearchReasonTag>
 }
 
-const SCHEMA_VERSION = '6'
+interface IndexedFileRow {
+  path: string
+  language: string
+  hash: string
+  size: number
+  mtime: number
+  generated: number
+}
+
+type StoredEmbedding = Float32Array | Buffer
+
+interface EmbeddedChunkRecord {
+  row: IndexedChunkRecord
+  embedding: StoredEmbedding
+}
+
+interface EmbeddingCacheKey {
+  providerId: string
+  providerDims: number
+  modelVersion: string
+  contentHash: string
+}
+
+interface EmbeddingCacheRow {
+  content_hash: string
+  embedding: Buffer
+}
+
+interface GitSnapshot {
+  branch: string
+  head: string
+}
+
+interface IndexFreshnessStatus {
+  stale: boolean
+  reasons: RepoStaleReason[]
+}
+
+interface SyncDiff {
+  changedFiles: ScannedFile[]
+  touchedFiles: ScannedFile[]
+  removedPaths: string[]
+}
+
+interface SyncApplyContext {
+  diff: SyncDiff
+  embeddedChunks: EmbeddedChunkRecord[]
+  provider: {
+    id: string
+    dims: number
+    modelVersion: string
+  }
+  previousGeneration: number
+  gitSnapshot: GitSnapshot | null
+  syncStartedAt: string
+  completedAt: string
+}
+
+const SCHEMA_VERSION = '7'
 const DEFAULT_RRF_K = 60
 const DEFAULT_VECTOR_LIMIT = 50
 const DEFAULT_PATH_FILTERED_LIMIT = 200
@@ -74,6 +132,9 @@ const DEFAULT_SNIPPET_CONTEXT_LINES = 0
 const DEFAULT_SNIPPET_LINE_CHAR_LIMIT = 40
 const SEARCH_HIT_TOKEN_OVERHEAD = 12
 const VECTOR_SEARCH_UNAVAILABLE_MESSAGE = 'vector search unavailable (native dep), lexical/symbol still works'
+const MTIME_TOLERANCE_MS = 2
+const DEFAULT_WATCH_DEBOUNCE_MS = 500
+const WATCH_SAFETY_POLL_INTERVAL_MS = 1000
 
 let vectorExtensionLoader: (db: Database.Database) => void = (db) => sqliteVec.load(db)
 
@@ -127,6 +188,9 @@ export class SqliteRepo implements Repo {
   private db: Database.Database | undefined
   private vectorExtensionLoaded = false
   private vectorSearchFailure: VectorSearchStatus | null = null
+  private activeDatabaseUsers = 0
+  private readonly databaseIdleResolvers: Array<() => void> = []
+  private databaseGate: Promise<void> = Promise.resolve()
 
   constructor(root: string) {
     this.root = resolve(root)
@@ -142,93 +206,70 @@ export class SqliteRepo implements Repo {
 
   async sync(options?: SyncOptions): Promise<SyncResult> {
     const startedAt = Date.now()
+    const syncStartedAt = new Date().toISOString()
     const provider = getDefaultEmbeddingProvider()
+    const modelVersion = provider.modelVersion ?? provider.model ?? provider.id
 
     if (options?.rebuild) {
-      await this.resetDatabaseFile()
+      await this.runExclusiveDatabaseChange(() => this.resetDatabaseFile())
     }
 
     await this.initialize()
 
     let db = this.openDatabase()
     const compatibility = this.getIndexCompatibility(db)
-    if (!compatibility.ok && compatibility.code === 'schema_version_mismatch') {
+    if (!compatibility.ok) {
       await this.resetDatabaseFile()
       await this.initialize()
       db = this.openDatabase()
     }
 
-    const previousGeneration = readMetaNumber(db, 'index_generation') ?? 0
-    const { files, skippedFiles, skippedSymlinks } = await scanRepository(this.root)
-    const fileRows = files.map((file) => ({
-      path: file.relativePath,
-      language: file.language,
-      hash: file.hash,
-      size: file.size,
-      mtime: file.mtime,
-      generated: file.generated ? 1 : 0
-    }))
-
-    const chunkRows: IndexedChunkRecord[] = files.flatMap((file) =>
-      buildChunks(file).map((chunk) => ({
-        ...chunk,
-        id: createChunkId(chunk)
-      }))
-    )
-
-    const batches = buildEmbeddingBatches(chunkRows, provider.maxBatch, provider.maxBatchTokens)
-    const insertFile = db.prepare(
-      `
-        insert into files(path, language, hash, size, mtime, generated)
-        values (@path, @language, @hash, @size, @mtime, @generated)
-      `
-    )
-    const insertChunk = db.prepare(
-      `
-        insert into chunks(
-          id,
-          file_path,
-          language,
-          start_line,
-          end_line,
-          symbol,
-          kind,
-          parent,
-          signature,
-          snippet,
-          generated,
-          embedding
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `
-    )
-    const insertChunkFts = db.prepare(
-      `
-        insert into chunks_fts(chunk_id, search_text, symbol, parent, signature)
-        values (?, ?, ?, ?, ?)
-      `
-    )
-    const insertSymbol = db.prepare(
-      `
-        insert into symbols(name, kind, file_path, start_line, end_line, parent, signature, language)
-        values (?, ?, ?, ?, ?, ?, ?, ?)
-      `
-    )
-    const setMeta = db.prepare(`
-      insert into meta(key, value)
-      values (?, ?)
-      on conflict(key) do update set value = excluded.value
-    `)
+    writeSyncStatus(db, { state: 'running', startedAt: syncStartedAt })
 
     try {
-      this.clearIndex(db)
+      const previousGeneration = readMetaNumber(db, 'index_generation') ?? 0
+      const previousGitSnapshot = readIndexedGitSnapshot(db)
+      const { files, skippedFiles, skippedSymlinks } = await scanRepository(this.root)
+      const diff = diffScannedFiles(files, selectIndexedFileRows(db))
 
-      db.transaction(() => {
-        for (const row of fileRows) {
-          insertFile.run(row)
-        }
-      })()
+      const chunkRows: IndexedChunkRecord[] = diff.changedFiles.flatMap((file) =>
+        buildChunks(file).map((chunk) => ({
+          ...chunk,
+          id: createChunkId(chunk)
+        }))
+      )
 
+      const cacheKey: Omit<EmbeddingCacheKey, 'contentHash'> = {
+        providerId: provider.id,
+        providerDims: provider.dims,
+        modelVersion
+      }
+      const cachedEmbeddings = selectCachedEmbeddings(db, cacheKey, chunkRows)
+      const pendingByContentHash = new Map<string, IndexedChunkRecord[]>()
+      const chunksToEmbed: IndexedChunkRecord[] = []
+      const embeddedChunks: EmbeddedChunkRecord[] = []
       let completedChunks = 0
+
+      for (const chunk of chunkRows) {
+        const contentHash = contentHashForChunk(chunk)
+        const cached = cachedEmbeddings.get(contentHash)
+        if (cached) {
+          embeddedChunks.push({ row: chunk, embedding: cached })
+          completedChunks += 1
+          continue
+        }
+
+        const pending = pendingByContentHash.get(contentHash)
+        if (pending) {
+          pending.push(chunk)
+          continue
+        }
+
+        pendingByContentHash.set(contentHash, [chunk])
+        chunksToEmbed.push(chunk)
+      }
+
+      const batches = buildEmbeddingBatches(chunksToEmbed, provider.maxBatch, provider.maxBatchTokens)
 
       for (let index = 0; index < batches.length; index += 1) {
         throwIfAborted(options?.signal)
@@ -242,50 +283,19 @@ export class SqliteRepo implements Repo {
 
         throwIfAborted(options?.signal)
 
-        db.transaction(() => {
-          for (let batchIndex = 0; batchIndex < batch.length; batchIndex += 1) {
-            const row = batch[batchIndex]!
-            const embedding = embeddings[batchIndex] ?? new Float32Array(provider.dims)
+        for (let batchIndex = 0; batchIndex < batch.length; batchIndex += 1) {
+          const representative = batch[batchIndex]!
+          const contentHash = contentHashForChunk(representative)
+          const embedding = embeddings[batchIndex] ?? new Float32Array(provider.dims)
+          const pendingChunks = pendingByContentHash.get(contentHash) ?? [representative]
 
-            insertChunk.run(
-              row.id,
-              row.file,
-              row.language,
-              row.startLine,
-              row.endLine,
-              row.symbol ?? null,
-              row.kind ?? null,
-              row.parent ?? null,
-              row.signature ?? null,
-              row.content,
-              row.generated ? 1 : 0,
-              embedding
-            )
-
-            insertChunkFts.run(
-              row.id,
-              buildLexicalSearchText(row),
-              row.symbol ?? '',
-              row.parent ?? '',
-              row.signature ?? ''
-            )
-
-            if (row.symbol && row.kind && row.kind !== 'file') {
-              insertSymbol.run(
-                row.symbol,
-                row.kind,
-                row.file,
-                row.startLine,
-                row.endLine,
-                row.parent ?? null,
-                row.signature ?? null,
-                row.language
-              )
-            }
+          for (const chunk of pendingChunks) {
+            embeddedChunks.push({ row: chunk, embedding })
           }
-        })()
 
-        completedChunks += batch.length
+          completedChunks += pendingChunks.length
+        }
+
         options?.onProgress?.({
           phase: 'batch',
           batch: index + 1,
@@ -295,25 +305,72 @@ export class SqliteRepo implements Repo {
         })
       }
 
-      db.transaction(() => {
-        setMeta.run('schema_version', SCHEMA_VERSION)
-        setMeta.run('provider_id', provider.id)
-        setMeta.run('provider_dims', String(provider.dims))
-        setMeta.run('model_version', provider.modelVersion ?? provider.model ?? provider.id)
-        setMeta.run('indexed_at', new Date().toISOString())
-        setMeta.run('index_generation', String(previousGeneration + 1))
-      })()
-    } catch (error) {
-      this.clearIndex(db)
-      throw error
-    }
+      const gitSnapshot = await readGitSnapshot(this.root)
+      const gitSnapshotChanged = !gitSnapshotsEqual(previousGitSnapshot, gitSnapshot)
+      const metadataMissing = readMeta(db, 'schema_version') !== SCHEMA_VERSION
+      const hasDatabaseChanges =
+        diff.changedFiles.length > 0 ||
+        diff.touchedFiles.length > 0 ||
+        diff.removedPaths.length > 0 ||
+        gitSnapshotChanged ||
+        metadataMissing
 
-    return {
-      indexedFiles: files.length,
-      skippedFiles,
-      skippedSymlinks,
-      removedFiles: 0,
-      durationMs: Date.now() - startedAt
+      if (hasDatabaseChanges) {
+        const shadow = await this.createShadowDatabase(db)
+        let shadowClosed = false
+        try {
+          applySyncChanges(shadow.db, {
+            diff,
+            embeddedChunks,
+            provider: {
+              id: provider.id,
+              dims: provider.dims,
+              modelVersion
+            },
+            previousGeneration,
+            gitSnapshot,
+            syncStartedAt,
+            completedAt: new Date().toISOString()
+          })
+          shadow.db.close()
+          shadowClosed = true
+          await this.runExclusiveDatabaseChange(() => this.swapDatabase(shadow.path))
+        } finally {
+          if (!shadowClosed) {
+            shadow.db.close()
+          }
+          await removeDatabaseSidecars(shadow.path)
+          await rm(shadow.path, { force: true })
+        }
+      } else {
+        writeSyncStatus(db, {
+          state: 'completed',
+          startedAt: syncStartedAt,
+          completedAt: new Date().toISOString()
+        })
+      }
+
+      return {
+        indexedFiles: diff.changedFiles.length,
+        skippedFiles,
+        skippedSymlinks,
+        removedFiles: diff.removedPaths.length,
+        durationMs: Date.now() - startedAt
+      }
+    } catch (error) {
+      const state = isAbortError(error) ? 'aborted' : 'failed'
+      try {
+        writeSyncStatus(this.openDatabase(), {
+          state,
+          startedAt: syncStartedAt,
+          completedAt: new Date().toISOString(),
+          error: extractErrorMessage(error)
+        })
+      } catch {
+        // Best-effort crash/partial-state metadata only; preserve the original sync error.
+      }
+
+      throw error
     }
   }
 
@@ -322,8 +379,11 @@ export class SqliteRepo implements Repo {
       return []
     }
 
-    const db = this.openDatabase()
-    this.ensureIndexCompatibleForQueries(db)
+    const releaseDatabase = await this.enterDatabaseUser()
+    try {
+      const db = this.openDatabase()
+      this.ensureIndexCompatibleForQueries(db)
+      const freshness = await this.getFreshness(db)
 
     const requestedK = options?.k ?? DEFAULT_SEARCH_K
     const limit = Math.max(requestedK * 10, DEFAULT_VECTOR_LIMIT)
@@ -393,7 +453,10 @@ export class SqliteRepo implements Repo {
     const distinctRows = dedupeContainedRows(fusedRows)
     const effectiveK = (options?.singleBest ?? (exactRows.length > 0 && isSingleBestIdentifierQuery(query))) ? 1 : requestedK
 
-    return buildBudgetedSearchHits(query, distinctRows, effectiveK, options?.maxTokens)
+      return markStaleHits(buildBudgetedSearchHits(query, distinctRows, effectiveK, options?.maxTokens), freshness)
+    } finally {
+      releaseDatabase()
+    }
   }
 
   async grep(pattern: string, options?: GrepOptions): Promise<GrepHit[]> {
@@ -401,10 +464,16 @@ export class SqliteRepo implements Repo {
       return []
     }
 
-    const db = this.openDatabase()
-    this.ensureIndexCompatibleForQueries(db)
+    const releaseDatabase = await this.enterDatabaseUser()
+    let candidateFiles: Array<{ path: string; language: string }>
+    try {
+      const db = this.openDatabase()
+      this.ensureIndexCompatibleForQueries(db)
+      candidateFiles = selectGrepCandidateFiles(db, options)
+    } finally {
+      releaseDatabase()
+    }
 
-    const candidateFiles = selectGrepCandidateFiles(db, options)
     const matcher = buildGrepMatcher(pattern, options)
     const beforeContextLines = normalizeContextLines(options?.beforeContextLines ?? options?.contextLines)
     const afterContextLines = normalizeContextLines(options?.afterContextLines ?? options?.contextLines)
@@ -475,10 +544,12 @@ export class SqliteRepo implements Repo {
       return []
     }
 
-    const db = this.openDatabase()
-    this.ensureIndexCompatibleForQueries(db)
+    const releaseDatabase = await this.enterDatabaseUser()
+    try {
+      const db = this.openDatabase()
+      this.ensureIndexCompatibleForQueries(db)
 
-    const kinds = normalizeKinds(options?.kind)
+      const kinds = normalizeKinds(options?.kind)
 
     const exactWhere = ['lower(name) = lower(?)']
     const exactParams: string[] = [name]
@@ -509,36 +580,46 @@ export class SqliteRepo implements Repo {
 
     const rows = [...exactRows, ...partialRows]
 
-    return rows.map((row) => {
-      const definition: SymbolDefinition = {
-        id: String(row.id),
-        name: row.name,
-        file: row.file_path,
-        range: {
-          startLine: row.start_line,
-          endLine: row.end_line
-        },
-        kind: row.kind
-      }
+      return rows.map((row) => {
+        const definition: SymbolDefinition = {
+          id: String(row.id),
+          name: row.name,
+          file: row.file_path,
+          range: {
+            startLine: row.start_line,
+            endLine: row.end_line
+          },
+          kind: row.kind
+        }
 
-      if (row.signature) {
-        definition.signature = row.signature
-      }
+        if (row.signature) {
+          definition.signature = row.signature
+        }
 
-      if (row.parent) {
-        definition.parent = row.parent
-      }
+        if (row.parent) {
+          definition.parent = row.parent
+        }
 
-      if (row.language) {
-        definition.language = row.language
-      }
+        if (row.language) {
+          definition.language = row.language
+        }
 
-      return definition
-    })
+        return definition
+      })
+    } finally {
+      releaseDatabase()
+    }
   }
 
   async readChunk(id: string, options?: ReadChunkOptions): Promise<string> {
-    const parsedChunkId = parseChunkId(id) ?? this.lookupChunkLocation(id)
+    const releaseDatabase = await this.enterDatabaseUser()
+    let parsedChunkId: { file: string; startLine: number; endLine: number } | null
+    try {
+      parsedChunkId = parseChunkId(id) ?? this.lookupChunkLocation(id)
+    } finally {
+      releaseDatabase()
+    }
+
     if (!parsedChunkId) {
       throw new Error(`Unknown chunk id: ${id}`)
     }
@@ -576,6 +657,7 @@ export class SqliteRepo implements Repo {
         indexPath: this.indexPath,
         indexed: false,
         stale: false,
+        sync: { state: 'idle' },
         chunkCount: 0,
         symbolCount: 0,
         generatedFileCount: 0,
@@ -587,9 +669,11 @@ export class SqliteRepo implements Repo {
       }
     }
 
-    const db = this.openDatabase()
-    const counts =
-      db
+    const releaseDatabase = await this.enterDatabaseUser()
+    try {
+      const db = this.openDatabase()
+      const counts =
+        db
         .prepare<[], RepoCountRow>(
           `
             select
@@ -614,25 +698,213 @@ export class SqliteRepo implements Repo {
           ...(providerDims !== undefined ? { dims: providerDims } : {})
         }
       : null
+    const freshness = indexed ? await this.getFreshness(db) : createFreshIndexStatus()
+    const sync = readSyncStatus(db)
 
-    return {
-      root: this.root,
-      indexPath: this.indexPath,
-      indexed,
-      stale: false,
-      chunkCount: counts.chunk_count,
-      symbolCount: counts.symbol_count,
-      generatedFileCount: counts.generated_file_count,
-      generatedChunkCount: counts.generated_chunk_count,
-      indexGeneration,
-      provider,
-      compatibility: this.getIndexCompatibility(db, indexed),
-      vectorSearch: this.getVectorSearchStatus()
+      return {
+        root: this.root,
+        indexPath: this.indexPath,
+        indexed,
+        stale: freshness.stale,
+        ...(freshness.reasons.length > 0 ? { staleReasons: freshness.reasons } : {}),
+        sync,
+        chunkCount: counts.chunk_count,
+        symbolCount: counts.symbol_count,
+        generatedFileCount: counts.generated_file_count,
+        generatedChunkCount: counts.generated_chunk_count,
+        indexGeneration,
+        provider,
+        compatibility: this.getIndexCompatibility(db, indexed),
+        vectorSearch: this.getVectorSearchStatus()
+      }
+    } finally {
+      releaseDatabase()
     }
   }
 
-  async watch(_options?: WatchOptions): Promise<StopWatching> {
-    return async () => undefined
+  async watch(options?: WatchOptions): Promise<StopWatching> {
+    const debounceMs = normalizeWatchDebounceMs(options?.debounceMs)
+    const syncController = new AbortController()
+    const watchers = new Map<string, FSWatcher>()
+    let disposed = false
+    let syncing = false
+    let pending = false
+    let debounceTimer: NodeJS.Timeout | undefined
+    let safetyInterval: NodeJS.Timeout | undefined
+
+    const closeWatchers = () => {
+      for (const watcher of watchers.values()) {
+        watcher.close()
+      }
+      watchers.clear()
+    }
+
+    const stop = async () => {
+      if (disposed) {
+        return
+      }
+
+      disposed = true
+      syncController.abort()
+      if (debounceTimer) {
+        clearTimeout(debounceTimer)
+      }
+      if (safetyInterval) {
+        clearInterval(safetyInterval)
+      }
+      closeWatchers()
+    }
+
+    const refreshWatchers = async () => {
+      if (disposed) {
+        return
+      }
+
+      const directories = await getWatchDirectories(this.root)
+      for (const [directory, watcher] of watchers) {
+        if (!directories.has(directory)) {
+          watcher.close()
+          watchers.delete(directory)
+        }
+      }
+
+      for (const directory of directories) {
+        if (watchers.has(directory)) {
+          continue
+        }
+
+        try {
+          const watcher = watchFs(directory, { persistent: true }, (_eventType, fileName) => {
+            if (fileName && isIgnoredWatchEvent(String(fileName))) {
+              return
+            }
+            scheduleSync()
+          })
+          watcher.on('error', () => {
+            watcher.close()
+            watchers.delete(directory)
+          })
+          watchers.set(directory, watcher)
+        } catch {
+          // Some directories can disappear or be unwatchable during write bursts; the next refresh retries.
+        }
+      }
+    }
+
+    const runSync = async (onlyIfStale: boolean) => {
+      if (disposed) {
+        return
+      }
+
+      if (syncing) {
+        pending = true
+        return
+      }
+
+      syncing = true
+      try {
+        if (onlyIfStale) {
+          const status = await this.status()
+          if (!status.stale) {
+            return
+          }
+        }
+
+        await this.sync({ signal: syncController.signal })
+        await refreshWatchers()
+      } catch {
+        // Keep the foreground watcher alive; the next event or safety poll will retry after transient write bursts.
+      } finally {
+        syncing = false
+        if (pending && !disposed) {
+          pending = false
+          scheduleSync()
+        }
+      }
+    }
+
+    const scheduleSync = () => {
+      if (disposed) {
+        return
+      }
+
+      if (debounceTimer) {
+        clearTimeout(debounceTimer)
+      }
+
+      debounceTimer = setTimeout(() => {
+        debounceTimer = undefined
+        void runSync(false)
+      }, debounceMs)
+    }
+
+    await refreshWatchers()
+
+    safetyInterval = setInterval(() => {
+      void runSync(true)
+    }, WATCH_SAFETY_POLL_INTERVAL_MS)
+
+    if (options?.signal) {
+      if (options.signal.aborted) {
+        await stop()
+      } else {
+        options.signal.addEventListener('abort', () => void stop(), { once: true })
+      }
+    }
+
+    return stop
+  }
+
+  private async getFreshness(db: Database.Database): Promise<IndexFreshnessStatus> {
+    return getIndexFreshness(this.root, db)
+  }
+
+  private async enterDatabaseUser(): Promise<() => void> {
+    await this.databaseGate
+    this.activeDatabaseUsers += 1
+    let released = false
+
+    return () => {
+      if (released) {
+        return
+      }
+
+      released = true
+      this.activeDatabaseUsers = Math.max(0, this.activeDatabaseUsers - 1)
+      if (this.activeDatabaseUsers === 0) {
+        for (const resolveIdle of this.databaseIdleResolvers.splice(0)) {
+          resolveIdle()
+        }
+      }
+    }
+  }
+
+  private async runExclusiveDatabaseChange<T>(action: () => Promise<T>): Promise<T> {
+    let releaseGate!: () => void
+    const previousGate = this.databaseGate
+    const gate = new Promise<void>((resolveGate) => {
+      releaseGate = resolveGate
+    })
+
+    this.databaseGate = previousGate.then(() => gate)
+    await previousGate
+    await this.waitForDatabaseIdle()
+
+    try {
+      return await action()
+    } finally {
+      releaseGate()
+    }
+  }
+
+  private async waitForDatabaseIdle(): Promise<void> {
+    if (this.activeDatabaseUsers === 0) {
+      return
+    }
+
+    await new Promise<void>((resolveIdle) => {
+      this.databaseIdleResolvers.push(resolveIdle)
+    })
   }
 
   private openDatabase(): Database.Database {
@@ -641,13 +913,55 @@ export class SqliteRepo implements Repo {
     }
 
     const db = new Database(this.indexPath)
-    db.pragma('journal_mode = WAL')
-    db.pragma('foreign_keys = ON')
-    registerSqlFunctions(db)
+    this.configureDatabase(db, 'WAL')
     this.vectorExtensionLoaded = false
-    this.ensureSchema(db)
     this.db = db
     return db
+  }
+
+  private configureDatabase(db: Database.Database, journalMode: 'WAL' | 'DELETE'): void {
+    db.pragma(`journal_mode = ${journalMode}`)
+    db.pragma('foreign_keys = ON')
+    db.pragma('busy_timeout = 5000')
+    registerSqlFunctions(db)
+    this.ensureSchema(db)
+  }
+
+  private async createShadowDatabase(sourceDb: Database.Database): Promise<{ path: string; db: Database.Database }> {
+    const shadowPath = join(this.indexDirectoryPath, `index.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.shadow.db`)
+
+    sourceDb.pragma('wal_checkpoint(TRUNCATE)')
+    await copyFile(this.indexPath, shadowPath).catch((error: unknown) => {
+      if (!isNodeErrorCode(error, 'ENOENT')) {
+        throw error
+      }
+    })
+
+    const shadowDb = new Database(shadowPath)
+    this.configureDatabase(shadowDb, 'DELETE')
+    return { path: shadowPath, db: shadowDb }
+  }
+
+  private async swapDatabase(shadowPath: string): Promise<void> {
+    if (this.db) {
+      this.db.close()
+      this.db = undefined
+    }
+
+    this.vectorExtensionLoaded = false
+    this.vectorSearchFailure = null
+    await removeDatabaseSidecars(this.indexPath)
+
+    try {
+      await rename(shadowPath, this.indexPath)
+    } catch (error) {
+      if (!isNodeErrorCode(error, 'EEXIST') && !isNodeErrorCode(error, 'EPERM')) {
+        throw error
+      }
+
+      await rm(this.indexPath, { force: true })
+      await rename(shadowPath, this.indexPath)
+    }
   }
 
   private ensureVectorExtension(db: Database.Database): boolean {
@@ -745,6 +1059,16 @@ export class SqliteRepo implements Repo {
 
       create index if not exists idx_symbols_name on symbols(name);
       create index if not exists idx_symbols_kind on symbols(kind);
+
+      create table if not exists embedding_cache(
+        provider_id text not null,
+        provider_dims integer not null,
+        model_version text not null,
+        content_hash text not null,
+        embedding blob not null,
+        updated_at text not null,
+        primary key(provider_id, provider_dims, model_version, content_hash)
+      );
     `)
 
     ensureColumn(db, 'files', 'generated', 'integer not null default 0')
@@ -757,6 +1081,7 @@ export class SqliteRepo implements Repo {
       delete from chunks_fts;
       delete from chunks;
       delete from files;
+      delete from embedding_cache;
       delete from meta;
     `)
   }
@@ -844,10 +1169,549 @@ export class SqliteRepo implements Repo {
     this.vectorSearchFailure = null
     await Promise.all([
       rm(this.indexPath, { force: true }),
-      rm(`${this.indexPath}-shm`, { force: true }),
-      rm(`${this.indexPath}-wal`, { force: true })
+      removeDatabaseSidecars(this.indexPath)
     ])
   }
+}
+
+function applySyncChanges(db: Database.Database, context: SyncApplyContext): void {
+  const insertFile = db.prepare(
+    `
+      insert into files(path, language, hash, size, mtime, generated)
+      values (@path, @language, @hash, @size, @mtime, @generated)
+    `
+  )
+  const updateFileManifest = db.prepare(
+    `
+      update files
+      set language = @language,
+          hash = @hash,
+          size = @size,
+          mtime = @mtime,
+          generated = @generated
+      where path = @path
+    `
+  )
+  const insertChunk = db.prepare(
+    `
+      insert into chunks(
+        id,
+        file_path,
+        language,
+        start_line,
+        end_line,
+        symbol,
+        kind,
+        parent,
+        signature,
+        snippet,
+        generated,
+        embedding
+      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `
+  )
+  const insertChunkFts = db.prepare(
+    `
+      insert into chunks_fts(chunk_id, search_text, symbol, parent, signature)
+      values (?, ?, ?, ?, ?)
+    `
+  )
+  const insertSymbol = db.prepare(
+    `
+      insert into symbols(name, kind, file_path, start_line, end_line, parent, signature, language)
+      values (?, ?, ?, ?, ?, ?, ?, ?)
+    `
+  )
+  const upsertEmbeddingCache = db.prepare(
+    `
+      insert into embedding_cache(provider_id, provider_dims, model_version, content_hash, embedding, updated_at)
+      values (?, ?, ?, ?, ?, ?)
+      on conflict(provider_id, provider_dims, model_version, content_hash)
+      do update set embedding = excluded.embedding, updated_at = excluded.updated_at
+    `
+  )
+  const setMeta = db.prepare(`
+    insert into meta(key, value)
+    values (?, ?)
+    on conflict(key) do update set value = excluded.value
+  `)
+  const deleteMeta = db.prepare('delete from meta where key = ?')
+  const selectChunkIdsByFile = db.prepare<[string], { id: string }>('select id from chunks where file_path = ?')
+  const deleteChunkFts = db.prepare<[string]>('delete from chunks_fts where chunk_id = ?')
+  const deleteSymbolsByFile = db.prepare<[string]>('delete from symbols where file_path = ?')
+  const deleteChunksByFile = db.prepare<[string]>('delete from chunks where file_path = ?')
+  const deleteFile = db.prepare<[string]>('delete from files where path = ?')
+  const replacementPaths = [...context.diff.removedPaths, ...context.diff.changedFiles.map((file) => file.relativePath)]
+
+  db.transaction(() => {
+    for (const filePath of replacementPaths) {
+      for (const { id } of selectChunkIdsByFile.all(filePath)) {
+        deleteChunkFts.run(id)
+      }
+
+      deleteSymbolsByFile.run(filePath)
+      deleteChunksByFile.run(filePath)
+      deleteFile.run(filePath)
+    }
+
+    for (const file of context.diff.touchedFiles) {
+      updateFileManifest.run(fileToManifestRow(file))
+    }
+
+    for (const file of context.diff.changedFiles) {
+      insertFile.run(fileToManifestRow(file))
+    }
+
+    for (const { row, embedding } of context.embeddedChunks) {
+      insertChunk.run(
+        row.id,
+        row.file,
+        row.language,
+        row.startLine,
+        row.endLine,
+        row.symbol ?? null,
+        row.kind ?? null,
+        row.parent ?? null,
+        row.signature ?? null,
+        row.content,
+        row.generated ? 1 : 0,
+        embedding
+      )
+
+      insertChunkFts.run(
+        row.id,
+        buildLexicalSearchText(row),
+        row.symbol ?? '',
+        row.parent ?? '',
+        row.signature ?? ''
+      )
+
+      upsertEmbeddingCache.run(
+        context.provider.id,
+        context.provider.dims,
+        context.provider.modelVersion,
+        contentHashForChunk(row),
+        embedding,
+        context.completedAt
+      )
+
+      if (row.symbol && row.kind && row.kind !== 'file') {
+        insertSymbol.run(
+          row.symbol,
+          row.kind,
+          row.file,
+          row.startLine,
+          row.endLine,
+          row.parent ?? null,
+          row.signature ?? null,
+          row.language
+        )
+      }
+    }
+
+    setMeta.run('schema_version', SCHEMA_VERSION)
+    setMeta.run('provider_id', context.provider.id)
+    setMeta.run('provider_dims', String(context.provider.dims))
+    setMeta.run('model_version', context.provider.modelVersion)
+    setMeta.run('indexed_at', context.completedAt)
+    setMeta.run('index_generation', String(context.previousGeneration + 1))
+    writeGitSnapshotMeta(setMeta, deleteMeta, context.gitSnapshot)
+    writeSyncStatusWithStatements(setMeta, deleteMeta, {
+      state: 'completed',
+      startedAt: context.syncStartedAt,
+      completedAt: context.completedAt
+    })
+  })()
+}
+
+function fileToManifestRow(file: ScannedFile): IndexedFileRow {
+  return {
+    path: file.relativePath,
+    language: file.language,
+    hash: file.hash,
+    size: file.size,
+    mtime: file.mtime,
+    generated: file.generated ? 1 : 0
+  }
+}
+
+function selectIndexedFileRows(db: Database.Database): IndexedFileRow[] {
+  return db
+    .prepare<[], IndexedFileRow>(
+      `
+        select path, language, hash, size, mtime, generated
+        from files
+        order by path asc
+      `
+    )
+    .all()
+}
+
+function selectCachedEmbeddings(
+  db: Database.Database,
+  key: Omit<EmbeddingCacheKey, 'contentHash'>,
+  chunks: IndexedChunkRecord[]
+): Map<string, Buffer> {
+  const contentHashes = [...new Set(chunks.map(contentHashForChunk))]
+  const result = new Map<string, Buffer>()
+  const batchSize = 900
+
+  for (let index = 0; index < contentHashes.length; index += batchSize) {
+    const batch = contentHashes.slice(index, index + batchSize)
+    if (batch.length === 0) {
+      continue
+    }
+
+    const selectCached = db.prepare<unknown[], EmbeddingCacheRow>(
+      `
+        select content_hash, embedding
+        from embedding_cache
+        where provider_id = ?
+          and provider_dims = ?
+          and model_version = ?
+          and content_hash in (${batch.map(() => '?').join(', ')})
+      `
+    )
+
+    for (const row of selectCached.all(key.providerId, key.providerDims, key.modelVersion, ...batch)) {
+      result.set(row.content_hash, row.embedding)
+    }
+  }
+
+  return result
+}
+
+function contentHashForChunk(chunk: Pick<ChunkRecord, 'content'>): string {
+  return hashText(chunk.content)
+}
+
+function diffScannedFiles(files: ScannedFile[], indexedFiles: IndexedFileRow[]): SyncDiff {
+  const indexedByPath = new Map(indexedFiles.map((file) => [file.path, file]))
+  const scannedPaths = new Set<string>()
+  const changedFiles: ScannedFile[] = []
+  const touchedFiles: ScannedFile[] = []
+
+  for (const file of files) {
+    scannedPaths.add(file.relativePath)
+    const indexed = indexedByPath.get(file.relativePath)
+    const generated = file.generated ? 1 : 0
+
+    if (!indexed) {
+      changedFiles.push(file)
+      continue
+    }
+
+    if (indexed.hash !== file.hash || indexed.language !== file.language || indexed.generated !== generated) {
+      changedFiles.push(file)
+      continue
+    }
+
+    if (indexed.size !== file.size || !mtimeEqual(indexed.mtime, file.mtime)) {
+      touchedFiles.push(file)
+    }
+  }
+
+  const removedPaths = indexedFiles
+    .map((file) => file.path)
+    .filter((filePath) => !scannedPaths.has(filePath))
+
+  return { changedFiles, touchedFiles, removedPaths }
+}
+
+function createFreshIndexStatus(): IndexFreshnessStatus {
+  return {
+    stale: false,
+    reasons: []
+  }
+}
+
+function readSyncStatus(db: Database.Database): RepoSyncStatus {
+  const state = readMeta(db, 'last_sync_status') as RepoSyncStatus['state'] | null
+  if (!state) {
+    return { state: 'idle' }
+  }
+
+  const startedAt = readMeta(db, 'last_sync_started_at')
+  const completedAt = readMeta(db, 'last_sync_completed_at')
+  const error = readMeta(db, 'last_sync_error')
+
+  return {
+    state,
+    ...(startedAt ? { startedAt } : {}),
+    ...(completedAt ? { completedAt } : {}),
+    ...(error ? { error } : {})
+  }
+}
+
+function writeSyncStatus(db: Database.Database, status: RepoSyncStatus): void {
+  const setMeta = db.prepare(`
+    insert into meta(key, value)
+    values (?, ?)
+    on conflict(key) do update set value = excluded.value
+  `)
+  const deleteMeta = db.prepare('delete from meta where key = ?')
+
+  db.transaction(() => {
+    writeSyncStatusWithStatements(setMeta, deleteMeta, status)
+  })()
+}
+
+function writeSyncStatusWithStatements(
+  setMeta: { run(key: string, value: string): unknown },
+  deleteMeta: { run(key: string): unknown },
+  status: RepoSyncStatus
+): void {
+  setMeta.run('last_sync_status', status.state)
+
+  if (status.startedAt) {
+    setMeta.run('last_sync_started_at', status.startedAt)
+  } else {
+    deleteMeta.run('last_sync_started_at')
+  }
+
+  if (status.completedAt) {
+    setMeta.run('last_sync_completed_at', status.completedAt)
+  } else {
+    deleteMeta.run('last_sync_completed_at')
+  }
+
+  if (status.error) {
+    setMeta.run('last_sync_error', status.error)
+  } else {
+    deleteMeta.run('last_sync_error')
+  }
+}
+
+async function getIndexFreshness(root: string, db: Database.Database): Promise<IndexFreshnessStatus> {
+  const indexedFiles = selectIndexedFileRows(db)
+  if (indexedFiles.length === 0) {
+    return createFreshIndexStatus()
+  }
+
+  const currentManifest = await scanRepositoryManifest(root)
+  const indexedByPath = new Map(indexedFiles.map((file) => [file.path, file]))
+  const currentByPath = new Map(currentManifest.files.map((file) => [file.relativePath, file]))
+  const addedPaths: string[] = []
+  const modifiedPaths: string[] = []
+  const removedPaths: string[] = []
+
+  for (const file of currentManifest.files) {
+    const indexed = indexedByPath.get(file.relativePath)
+    if (!indexed) {
+      addedPaths.push(file.relativePath)
+      continue
+    }
+
+    if (indexed.size !== file.size || !mtimeEqual(indexed.mtime, file.mtime)) {
+      modifiedPaths.push(file.relativePath)
+    }
+  }
+
+  for (const file of indexedFiles) {
+    if (!currentByPath.has(file.path)) {
+      removedPaths.push(file.path)
+    }
+  }
+
+  const reasons: RepoStaleReason[] = []
+  if (addedPaths.length > 0) {
+    reasons.push(buildFileStaleReason('file_added', addedPaths, 'new indexable files are not indexed'))
+  }
+
+  if (modifiedPaths.length > 0) {
+    reasons.push(buildFileStaleReason('file_modified', modifiedPaths, 'indexed files changed on disk'))
+  }
+
+  if (removedPaths.length > 0) {
+    reasons.push(buildFileStaleReason('file_removed', removedPaths, 'indexed files were removed'))
+  }
+
+  const indexedGit = readIndexedGitSnapshot(db)
+  const currentGit = await readGitSnapshot(root)
+  if (!gitSnapshotsEqual(indexedGit, currentGit)) {
+    if (indexedGit?.branch !== currentGit?.branch) {
+      reasons.push(buildGitStaleReason('git_branch_changed', 'git branch changed since indexing', indexedGit?.branch, currentGit?.branch))
+    }
+
+    if (indexedGit?.head !== currentGit?.head) {
+      reasons.push(buildGitStaleReason('git_head_changed', 'git HEAD changed since indexing', indexedGit?.head, currentGit?.head))
+    }
+  }
+
+  return {
+    stale: reasons.length > 0,
+    reasons
+  }
+}
+
+function buildFileStaleReason(code: RepoStaleReason['code'], files: string[], label: string): RepoStaleReason {
+  return {
+    code,
+    message: `${files.length} ${label}`,
+    count: files.length,
+    files: files.slice(0, 8)
+  }
+}
+
+function buildGitStaleReason(code: RepoStaleReason['code'], message: string, indexed: string | undefined, current: string | undefined): RepoStaleReason {
+  return {
+    code,
+    message,
+    ...(indexed ? { indexed } : {}),
+    ...(current ? { current } : {})
+  }
+}
+
+function readIndexedGitSnapshot(db: Database.Database): GitSnapshot | null {
+  const branch = readMeta(db, 'git_branch')
+  const head = readMeta(db, 'git_head')
+  return branch && head ? { branch, head } : null
+}
+
+async function readGitSnapshot(root: string): Promise<GitSnapshot | null> {
+  const gitDirectory = await findGitDirectory(root)
+  if (!gitDirectory) {
+    return null
+  }
+
+  const headContent = await readOptionalText(join(gitDirectory, 'HEAD'))
+  const headValue = headContent?.trim()
+  if (!headValue) {
+    return null
+  }
+
+  if (!headValue.startsWith('ref:')) {
+    return /^[a-f0-9]{40,64}$/i.test(headValue) ? { branch: 'HEAD', head: headValue } : null
+  }
+
+  const ref = headValue.slice(4).trim()
+  const branch = ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref
+  const looseRef = await readOptionalText(join(gitDirectory, ref))
+  const head = looseRef?.trim() ?? (await readPackedRef(gitDirectory, ref))
+
+  return head ? { branch, head } : null
+}
+
+async function findGitDirectory(root: string): Promise<string | null> {
+  let current = resolve(root)
+
+  while (true) {
+    const dotGit = join(current, '.git')
+    if (existsSync(dotGit)) {
+      const gitFile = await readOptionalText(dotGit)
+      if (gitFile?.startsWith('gitdir:')) {
+        const gitDir = gitFile.slice('gitdir:'.length).trim()
+        return isAbsolute(gitDir) ? gitDir : resolve(current, gitDir)
+      }
+
+      return dotGit
+    }
+
+    const parent = dirname(current)
+    if (parent === current) {
+      return null
+    }
+
+    current = parent
+  }
+}
+
+async function readPackedRef(gitDirectory: string, ref: string): Promise<string | null> {
+  const packedRefs = await readOptionalText(join(gitDirectory, 'packed-refs'))
+  if (!packedRefs) {
+    return null
+  }
+
+  for (const line of packedRefs.split(/\r?\n/)) {
+    if (!line || line.startsWith('#') || line.startsWith('^')) {
+      continue
+    }
+
+    const [sha, packedRef] = line.trim().split(/\s+/, 2)
+    if (packedRef === ref && sha && /^[a-f0-9]{40,64}$/i.test(sha)) {
+      return sha
+    }
+  }
+
+  return null
+}
+
+async function readOptionalText(path: string): Promise<string | null> {
+  try {
+    return await readFile(path, 'utf8')
+  } catch {
+    return null
+  }
+}
+
+function gitSnapshotsEqual(left: GitSnapshot | null, right: GitSnapshot | null): boolean {
+  if (!left && !right) {
+    return true
+  }
+
+  return left?.branch === right?.branch && left?.head === right?.head
+}
+
+function writeGitSnapshotMeta(
+  setMeta: { run(key: string, value: string): unknown },
+  deleteMeta: { run(key: string): unknown },
+  snapshot: GitSnapshot | null
+): void {
+  if (!snapshot) {
+    deleteMeta.run('git_branch')
+    deleteMeta.run('git_head')
+    return
+  }
+
+  setMeta.run('git_branch', snapshot.branch)
+  setMeta.run('git_head', snapshot.head)
+}
+
+function markStaleHits(hits: SearchHit[], freshness: IndexFreshnessStatus): SearchHit[] {
+  if (!freshness.stale) {
+    return hits
+  }
+
+  return hits.map((hit) => ({
+    ...hit,
+    stale: true
+  }))
+}
+
+async function getWatchDirectories(root: string): Promise<Set<string>> {
+  const manifest = await scanRepositoryManifest(root)
+  const rootPath = resolve(root)
+  const directories = new Set<string>([rootPath])
+
+  for (const file of manifest.files) {
+    let directory = dirname(resolve(rootPath, file.relativePath))
+    while (isPathInsideRoot(rootPath, directory)) {
+      directories.add(directory)
+      if (normalizePath(directory) === normalizePath(rootPath)) {
+        break
+      }
+      directory = dirname(directory)
+    }
+  }
+
+  return directories
+}
+
+function isIgnoredWatchEvent(fileName: string): boolean {
+  const normalized = fileName.replace(/\\/g, '/')
+  return normalized === '.codesift' || normalized.startsWith('.codesift/') || normalized === '.git' || normalized.startsWith('.git/')
+}
+
+function normalizeWatchDebounceMs(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_WATCH_DEBOUNCE_MS
+  }
+
+  return Math.max(100, Math.floor(value))
+}
+
+function mtimeEqual(left: number, right: number): boolean {
+  return Math.abs(left - right) <= MTIME_TOLERANCE_MS
 }
 
 function normalizeKinds(kind: SearchOptions['kind'] | FindSymbolOptions['kind'] | undefined): SymbolKind[] {
@@ -1714,6 +2578,21 @@ function isPathInsideRoot(root: string, target: string): boolean {
   const normalizedRoot = normalizePath(root)
   const normalizedTarget = normalizePath(target)
   return normalizedTarget === normalizedRoot || normalizedTarget.startsWith(`${normalizedRoot}/`)
+}
+
+async function removeDatabaseSidecars(path: string): Promise<void> {
+  await Promise.all([
+    rm(`${path}-shm`, { force: true }),
+    rm(`${path}-wal`, { force: true })
+  ])
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError'
+}
+
+function isNodeErrorCode(error: unknown, code: string): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === code
 }
 
 function normalizePath(value: string): string {

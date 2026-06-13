@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3'
-import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -96,6 +96,24 @@ TokenVerifier is the main entry point described in docs. TokenVerifier appears h
   return repoRoot
 }
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitFor(assertion: () => Promise<boolean>, timeoutMs = 5000): Promise<void> {
+  const startedAt = Date.now()
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await assertion()) {
+      return
+    }
+
+    await sleep(50)
+  }
+
+  throw new Error('Timed out waiting for condition')
+}
+
 async function createLearnedProvider(providerId: string, onEmbed?: (texts: string[], options: EmbeddingBatchOptions) => void): Promise<EmbeddingProvider> {
   const provider: EmbeddingProvider = {
     id: providerId,
@@ -189,6 +207,120 @@ describe('@codesift/core', () => {
     expect(fileRow?.mtime).toBeGreaterThan(0)
   })
 
+  it('detects stale files and incrementally updates changed and removed paths', async () => {
+    const repoRoot = await createDemoRepository('codesift-freshness-')
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+    await sleep(10)
+    await writeFile(
+      join(repoRoot, 'src', 'auth', 'jwt.ts'),
+      `// Validate JWT tokens and mint fresh credentials.
+export function mintFreshToken(subject: string): string {
+  return subject + ':fresh'
+}
+`,
+      'utf8'
+    )
+
+    const staleStatus = await repo.status()
+    const staleHits = await repo.search('verifyJwtToken', { k: 1 })
+
+    expect(staleStatus.stale).toBe(true)
+    expect(staleStatus.staleReasons?.some((reason) => reason.code === 'file_modified')).toBe(true)
+    expect(staleHits[0]?.stale).toBe(true)
+
+    const changedSync = await repo.sync()
+    const freshStatus = await repo.status()
+    const newHits = await repo.search('mintFreshToken', { k: 1 })
+
+    expect(changedSync.indexedFiles).toBe(1)
+    expect(changedSync.removedFiles).toBe(0)
+    expect(freshStatus.stale).toBe(false)
+    expect(newHits[0]?.file).toBe('src/auth/jwt.ts')
+
+    await sleep(10)
+    await unlink(join(repoRoot, 'src', 'network', 'retry.ts'))
+
+    const removedStatus = await repo.status()
+    expect(removedStatus.staleReasons?.some((reason) => reason.code === 'file_removed')).toBe(true)
+
+    const removedSync = await repo.sync()
+    const retryHits = await repo.search('retry backoff for HTTP requests', { k: 5 })
+
+    expect(removedSync.indexedFiles).toBe(0)
+    expect(removedSync.removedFiles).toBe(1)
+    expect(retryHits.some((hit) => hit.file === 'src/network/retry.ts')).toBe(false)
+  })
+
+  it('watch refreshes stale indexes after edits', async () => {
+    const repoRoot = await createDemoRepository('codesift-watch-')
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const stop = await repo.watch({ debounceMs: 100 })
+    try {
+      await sleep(10)
+      await writeFile(
+        join(repoRoot, 'src', 'auth', 'jwt.ts'),
+        `export function watchedToken(): string {
+  return 'watched'
+}
+`,
+        'utf8'
+      )
+
+      await waitFor(async () => {
+        const hits = await repo.search('watchedToken', { k: 1 })
+        return hits[0]?.file === 'src/auth/jwt.ts' && hits[0]?.stale !== true
+      })
+    } finally {
+      await stop()
+    }
+  })
+
+  it('watch refreshes a larger repo edit within five seconds', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-watch-large-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    for (let index = 0; index < 250; index += 1) {
+      await writeFile(
+        join(repoRoot, 'src', `file-${String(index).padStart(3, '0')}.ts`),
+        `export function largeWatch${index}(): string {
+  return 'before-${index}'
+}
+`,
+        'utf8'
+      )
+    }
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+    const stop = await repo.watch({ debounceMs: 100 })
+    const startedAt = Date.now()
+
+    try {
+      await writeFile(
+        join(repoRoot, 'src', 'file-123.ts'),
+        `export function largeWatchChanged(): string {
+  return 'after'
+}
+`,
+        'utf8'
+      )
+
+      await waitFor(async () => {
+        const hits = await repo.search('largeWatchChanged', { k: 1 })
+        return hits[0]?.file === 'src/file-123.ts' && hits[0]?.stale !== true
+      }, 5000)
+    } finally {
+      await stop()
+    }
+
+    expect(Date.now() - startedAt).toBeLessThan(5000)
+  }, 10_000)
+
   it('applies path filters before search truncation', async () => {
     const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-path-filter-'))
     temporaryDirectories.push(repoRoot)
@@ -252,6 +384,104 @@ describe('@codesift/core', () => {
     expect(progressEvents.map((event) => event.completedChunks)).toEqual([2, 4, 5])
   })
 
+  it('reuses content-addressed embeddings for delete+add renames with identical code', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-cache-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    const source = `export function cacheStableToken(): string {
+  return 'stable'
+}
+`
+    await writeFile(join(repoRoot, 'src', 'old-name.ts'), source, 'utf8')
+
+    const documentBatchSizes: number[] = []
+    await createLearnedProvider(`test-provider-cache-${Date.now()}`, (texts, options) => {
+      if (options.role === 'document') {
+        documentBatchSizes.push(texts.length)
+      }
+    })
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+    const initialDocumentEmbeds = documentBatchSizes.reduce((sum, size) => sum + size, 0)
+
+    await unlink(join(repoRoot, 'src', 'old-name.ts'))
+    await writeFile(join(repoRoot, 'src', 'new-name.ts'), source, 'utf8')
+
+    const renameSync = await repo.sync()
+    const finalDocumentEmbeds = documentBatchSizes.reduce((sum, size) => sum + size, 0)
+    const hits = await repo.search('cacheStableToken', { k: 3 })
+
+    expect(initialDocumentEmbeds).toBeGreaterThan(0)
+    expect(renameSync.indexedFiles).toBe(1)
+    expect(renameSync.removedFiles).toBe(1)
+    expect(finalDocumentEmbeds).toBe(initialDocumentEmbeds)
+    expect(hits[0]?.file).toBe('src/new-name.ts')
+  })
+
+  it('keeps the old index and surfaces failed shadow sync state', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-shadow-fail-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    await writeFile(
+      join(repoRoot, 'src', 'token.ts'),
+      `export function oldShadowToken(): string {
+  return 'old'
+}
+`,
+      'utf8'
+    )
+
+    let failEmbeddings = false
+    const providerId = `test-provider-shadow-${Date.now()}`
+    registerEmbeddingProvider({
+      id: providerId,
+      dims: 8,
+      maxTokens: 8192,
+      modelVersion: `${providerId}-model`,
+      isLearned: true,
+      async embedBatch(texts) {
+        if (failEmbeddings) {
+          throw new Error('planned embedding failure')
+        }
+
+        return texts.map((text) => {
+          const vector = new Float32Array(8)
+          vector[0] = text.length || 1
+          return vector
+        })
+      }
+    })
+    process.env.CODESIFT_EMBEDDING_PROVIDER = providerId
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    await writeFile(
+      join(repoRoot, 'src', 'token.ts'),
+      `export function newShadowToken(): string {
+  return 'new'
+}
+`,
+      'utf8'
+    )
+    failEmbeddings = true
+
+    await expect(repo.sync()).rejects.toThrow('planned embedding failure')
+
+    const oldHits = await repo.search('oldShadowToken', { k: 1 })
+    const newHits = await repo.search('newShadowToken', { k: 1 })
+    const status = await repo.status()
+
+    expect(oldHits[0]?.file).toBe('src/token.ts')
+    expect(newHits).toHaveLength(0)
+    expect(status.sync.state).toBe('failed')
+    expect(status.sync.error).toContain('planned embedding failure')
+    expect(status.stale).toBe(true)
+  })
+
   it('aborts cleanly between embedding batches', async () => {
     const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-abort-'))
     temporaryDirectories.push(repoRoot)
@@ -281,6 +511,7 @@ describe('@codesift/core', () => {
     const status = await repo.status()
     expect(status.indexed).toBe(false)
     expect(status.chunkCount).toBe(0)
+    expect(status.sync.state).toBe('aborted')
   })
 
   it('follows safe symlinks, skips unsafe ones, and avoids cycles', async () => {

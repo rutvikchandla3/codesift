@@ -45,6 +45,8 @@ export function formatStatus(status: RepoStatus): string {
     `index: ${status.indexPath}`,
     `indexed: ${status.indexed ? 'yes' : 'no'}`,
     `stale: ${status.stale ? 'yes' : 'no'}`,
+    ...(status.staleReasons?.length ? [`stale reasons: ${status.staleReasons.map((reason) => reason.message).join('; ')}`] : []),
+    `sync: ${formatSyncStatus(status)}`,
     `chunks: ${status.chunkCount}`,
     `symbols: ${status.symbolCount}`,
     `generated files: ${status.generatedFileCount}`,
@@ -66,7 +68,8 @@ export function formatHits(hits: SearchHit[]): string {
       const range = `${hit.range.startLine}-${hit.range.endLine}`
       const symbol = formatHitSymbol(hit)
       const generated = hit.generated ? ' · generated' : ''
-      return `${hit.file}:${range}${symbol}${generated} · ${hit.reason} score=${hit.score.toFixed(4)}\n${hit.snippet}`
+      const stale = hit.stale ? ' · stale' : ''
+      return `${hit.file}:${range}${symbol}${generated}${stale} · ${hit.reason} score=${hit.score.toFixed(4)}\n${hit.snippet}`
     })
     .join('\n\n')
 }
@@ -80,6 +83,7 @@ export function formatCompactHits(hits: SearchHit[]): string {
     .map((hit) => {
       const symbol = formatHitSymbol(hit)
       const generated = hit.generated ? ' [generated]' : ''
+      const stale = hit.stale ? ' [stale]' : ''
       const snippet = hit.snippet
         .split('\n')
         .map((line) => line.trim())
@@ -87,7 +91,7 @@ export function formatCompactHits(hits: SearchHit[]): string {
         .slice(0, 3)
         .join(' ↩ ')
 
-      return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${generated}${snippet ? ` | ${snippet}` : ''}`
+      return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${generated}${stale}${snippet ? ` | ${snippet}` : ''}`
     })
     .join('\n')
 }
@@ -157,6 +161,13 @@ function formatCompatibilityStatus(status: RepoStatus): string {
   return status.compatibility.message ?? 'rebuild required'
 }
 
+function formatSyncStatus(status: RepoStatus): string {
+  const sync = status.sync
+  const timestamp = sync.completedAt ?? sync.startedAt
+  const error = sync.error ? ` — ${sync.error}` : ''
+  return `${sync.state}${timestamp ? ` (${timestamp})` : ''}${error}`
+}
+
 function formatVectorStatus(status: RepoStatus): string {
   const detail = status.vectorSearch.detail ? ` — ${status.vectorSearch.detail}` : ''
 
@@ -193,6 +204,25 @@ async function withCompatibilityHandling(io: CliIo, action: () => Promise<void>)
   }
 }
 
+async function waitForTermination(stop: () => Promise<void>): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let stopping = false
+    const shutdown = () => {
+      if (stopping) {
+        return
+      }
+
+      stopping = true
+      process.off('SIGINT', shutdown)
+      process.off('SIGTERM', shutdown)
+      stop().then(resolve, reject)
+    }
+
+    process.once('SIGINT', shutdown)
+    process.once('SIGTERM', shutdown)
+  })
+}
+
 export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promise<void> {
   const program = new Command()
 
@@ -211,7 +241,9 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
         `Indexed ${result.indexedFiles} files (${result.skippedFiles} skipped, ${result.skippedSymlinks} symlink skips) in ${result.durationMs}ms at ${repo.root}.`
       )
       if (options.watch) {
-        io.stdout('Watch mode is reserved for M4.')
+        const stop = await repo.watch()
+        io.stdout(`Watching ${repo.root} for changes. Press Ctrl+C to stop.`)
+        await waitForTermination(stop)
       }
     })
 

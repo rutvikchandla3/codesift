@@ -33,6 +33,7 @@ describe('codesift CLI formatters', () => {
         indexPath: '/tmp/codesift/.codesift/index.db',
         indexed: false,
         stale: false,
+        sync: { state: 'idle' },
         chunkCount: 0,
         symbolCount: 0,
         generatedFileCount: 0,

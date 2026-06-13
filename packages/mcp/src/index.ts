@@ -110,11 +110,22 @@ export interface McpRouter {
   indexStatus(): Promise<RepoStatus>
 }
 
+export interface McpJsonRpcRequest {
+  jsonrpc?: string
+  id?: string | number | null
+  method?: string
+  params?: unknown
+}
+
+export type McpJsonRpcResponse =
+  | { jsonrpc: '2.0'; id: string | number | null; result: unknown }
+  | { jsonrpc: '2.0'; id: string | number | null; error: { code: number; message: string; data?: unknown } }
+
 export const MCP_SERVER_INSTRUCTIONS = [
   'codesift is the repo search tool. Prefer it before host grep/read-file flows because results are compact and include stable ids for follow-up reads.',
   'Routing policy: use find_symbol for exact identifiers/definitions; use grep_code for literal strings, env vars, error messages, operators, or regex; use search_code for concepts/behaviors/natural language.',
   'For search_code, start with k=5-8, set max_tokens when context is tight, and read_chunk only for the best id. For grep_code, keep context_lines small unless the user asks for surrounding code.',
-  'If index_status reports no index or stale data, suggest running codesift index before relying on results.'
+  'If index_status reports no index, stale data, or a running/failed/aborted sync, suggest running codesift index before relying on results.'
 ].join('\n')
 
 const symbolKindSchema = z.enum(SYMBOL_KINDS)
@@ -156,6 +167,15 @@ const readChunkInputSchema = {
 }
 
 const indexStatusInputSchema = {}
+
+const searchCodeArgsSchema = z.object(searchCodeInputSchema).strict()
+const findSymbolArgsSchema = z.object(findSymbolInputSchema).strict()
+const grepCodeArgsSchema = z.object(grepCodeInputSchema).strict()
+const readChunkArgsSchema = z.object(readChunkInputSchema).strict()
+const toolCallParamsSchema = z.object({
+  name: z.enum(MCP_TOOL_NAMES),
+  arguments: z.unknown().optional()
+}).strict()
 
 class StdioMcpServerHandle implements McpServerHandle {
   readonly transport = 'stdio' as const
@@ -259,7 +279,7 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
     },
     {
       name: 'index_status',
-      description: 'Inspect index freshness, counts, provider, and vector availability before relying on search results.',
+      description: 'Inspect index freshness, sync/crash state, counts, provider, and vector availability before relying on search results.',
       inputSchema: jsonSchema([], {})
     }
   ]
@@ -357,6 +377,77 @@ export function createHttpServer(repo: Repo, options: HttpServerOptions = {}): M
   return new ScaffoldHttpServerHandle(repo, options)
 }
 
+export async function callMcpTool(repo: Repo, name: McpToolName, args: unknown): Promise<string> {
+  const router = createRouter(repo)
+
+  switch (name) {
+    case 'search_code':
+      return formatMcpSearchHits(await router.searchCode(searchCodeArgsSchema.parse(args)))
+    case 'find_symbol':
+      return formatMcpSymbols(await router.findSymbol(findSymbolArgsSchema.parse(args)))
+    case 'grep_code':
+      return formatMcpGrepHits(await router.grepCode(grepCodeArgsSchema.parse(args)))
+    case 'read_chunk':
+      return router.readChunk(readChunkArgsSchema.parse(args))
+    case 'index_status':
+      return JSON.stringify(await router.indexStatus())
+  }
+}
+
+export async function handleMcpJsonRpcRequest(repo: Repo, request: McpJsonRpcRequest): Promise<McpJsonRpcResponse | null> {
+  const id = request.id ?? null
+  const method = request.method
+
+  if (!method) {
+    return jsonRpcError(id, -32600, 'Invalid request')
+  }
+
+  if (method.startsWith('notifications/')) {
+    return null
+  }
+
+  if (method === 'initialize') {
+    const protocolVersion = readProtocolVersion(request.params) ?? '2025-11-25'
+    return jsonRpcResult(id, {
+      protocolVersion,
+      capabilities: { tools: {} },
+      serverInfo: { name: 'codesift', version: '0.0.0' },
+      instructions: MCP_SERVER_INSTRUCTIONS
+    })
+  }
+
+  if (method === 'ping') {
+    return jsonRpcResult(id, {})
+  }
+
+  if (method === 'tools/list') {
+    return jsonRpcResult(id, { tools: getToolDefinitions() })
+  }
+
+  if (method === 'tools/call') {
+    const call = toolCallParamsSchema.safeParse(request.params)
+    if (!call.success) {
+      return jsonRpcResult(id, textErrorResult(`invalid tool call: ${call.error.message}`))
+    }
+
+    try {
+      return jsonRpcResult(id, textResult(await callMcpTool(repo, call.data.name, call.data.arguments ?? {})))
+    } catch (error) {
+      return jsonRpcResult(id, textErrorResult(extractErrorMessage(error)))
+    }
+  }
+
+  if (method === 'resources/list') {
+    return jsonRpcResult(id, { resources: [] })
+  }
+
+  if (method === 'prompts/list') {
+    return jsonRpcResult(id, { prompts: [] })
+  }
+
+  return jsonRpcError(id, -32601, `Method not found: ${method}`)
+}
+
 function createSdkServer(repo: Repo): McpServer {
   const router = createRouter(repo)
   const server = new McpServer(
@@ -387,6 +478,37 @@ function textResult(text: string): { content: Array<{ type: 'text'; text: string
   return { content: [{ type: 'text', text }] }
 }
 
+function textErrorResult(text: string): { content: Array<{ type: 'text'; text: string }>; isError: true } {
+  return { content: [{ type: 'text', text }], isError: true }
+}
+
+function jsonRpcResult(id: string | number | null, result: unknown): McpJsonRpcResponse {
+  return { jsonrpc: '2.0', id, result }
+}
+
+function jsonRpcError(id: string | number | null, code: number, message: string, data?: unknown): McpJsonRpcResponse {
+  return data === undefined
+    ? { jsonrpc: '2.0', id, error: { code, message } }
+    : { jsonrpc: '2.0', id, error: { code, message, data } }
+}
+
+function readProtocolVersion(params: unknown): string | undefined {
+  if (typeof params !== 'object' || params === null || !('protocolVersion' in params)) {
+    return undefined
+  }
+
+  const protocolVersion = (params as { protocolVersion?: unknown }).protocolVersion
+  return typeof protocolVersion === 'string' ? protocolVersion : undefined
+}
+
+function extractErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message
+  }
+
+  return String(error)
+}
+
 function toolDescription(name: McpToolName): string {
   const tool = getToolDefinitions().find((definition) => definition.name === name)
   return tool?.description ?? name
@@ -402,8 +524,9 @@ function formatMcpSearchHits(hits: SearchHit[]): string {
     .map((hit) => {
       const symbol = formatHitSymbol(hit)
       const generated = hit.generated ? ' [generated]' : ''
+      const stale = hit.stale ? ' [stale]' : ''
       const snippet = compactSnippet(hit.snippet, 4)
-      return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${generated}${snippet ? ` | ${snippet}` : ''}`
+      return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${generated}${stale}${snippet ? ` | ${snippet}` : ''}`
     })
     .join('\n')
 

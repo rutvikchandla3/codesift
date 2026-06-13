@@ -109,6 +109,15 @@ export interface SyncResult {
   durationMs: number
 }
 
+export type RepoSyncState = 'idle' | 'running' | 'completed' | 'failed' | 'aborted'
+
+export interface RepoSyncStatus {
+  state: RepoSyncState
+  startedAt?: string
+  completedAt?: string
+  error?: string
+}
+
 export interface WatchOptions {
   debounceMs?: number
   signal?: AbortSignal
@@ -131,6 +140,17 @@ export interface RepoStatusProvider {
   dims?: number
 }
 
+export type RepoStaleReasonCode = 'file_added' | 'file_modified' | 'file_removed' | 'git_branch_changed' | 'git_head_changed'
+
+export interface RepoStaleReason {
+  code: RepoStaleReasonCode
+  message: string
+  count?: number
+  files?: string[]
+  indexed?: string
+  current?: string
+}
+
 export interface IndexCompatibilitySnapshot {
   schemaVersion?: string
   providerId?: string
@@ -151,6 +171,8 @@ export interface RepoStatus {
   indexPath: string
   indexed: boolean
   stale: boolean
+  staleReasons?: RepoStaleReason[]
+  sync: RepoSyncStatus
   chunkCount: number
   symbolCount: number
   generatedFileCount: number

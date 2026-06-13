@@ -8,7 +8,7 @@ Local-first lexical code search for repositories, delivered as one TypeScript co
 
 ## Status
 
-M3 is complete on top of the completed M2 slice.
+M4 freshness/watch implementation is complete on top of the completed M3 slice.
 
 Implemented today:
 
@@ -21,17 +21,23 @@ Implemented today:
 - fallback line-window chunking for other supported text files
 - SQLite-backed local index with FTS and lazy `sqlite-vec` loading
 - end-to-end `index`, `search`, `sym`, `grep`, `status`, and `clean` CLI flows
+- manifest-diff incremental `sync()` / `index` updates for changed, touched, and removed files
+- content-addressed embedding cache so delete+add/rename cases with identical code reuse embeddings
 - stable chunk ids plus on-demand chunk/range reads from disk
 - real MCP stdio transport with `search_code`, `find_symbol`, `grep_code`, `read_chunk`, and `index_status`
-- token-budgeted compact search results (`maxTokens` / `max_tokens`), overlap dedupe, single-best identifier answers, query-centered snippets, and reason tags
+- token-budgeted compact search results (`maxTokens` / `max_tokens`), overlap dedupe, single-best identifier answers, query-centered snippets, reason tags, and stale-hit annotations
 - oversized structural chunk splitting, nested ignore-file handling, default vendor ignores, generated/minified code down-ranking, generated result annotations, and generated counts in status
+- real `status().stale` from mtime/size manifest drift plus git branch/HEAD drift
+- `status().sync` / MCP `index_status` crash-state metadata for running, failed, and aborted syncs
+- shadow database sync writes with atomic index-file swap so failed rebuilds keep the previous index readable
+- native `fs.watch`-based `watch()` / `codesift index --watch` with a safety poll fallback, refreshing through the same incremental path
+- daemon-backed `codesift mcp` shim: the CLI fast-path starts/proxies to a long-lived local daemon so repo handles and MCP routing are amortized across agent sessions
 - pinned-OSS + local M3 fixture eval harness with paired tokens-to-resolution plus stdio cold-start latency vs ripgrep and a checked-in loss budget
 
 Still intentionally deferred to later milestones:
 
 - production learned embedding provider
 - optional future tree-sitter WASM migration if bundled grammars can be added without install pain
-- watch mode and incremental freshness
 - streamable HTTP MCP transport
 - broader M6-quality golden sets and learned-vector ranking work
 
@@ -91,7 +97,7 @@ codesift mcp /path/to/repo
 
 Routing policy for agents: `find_symbol` for identifiers/definitions, `grep_code` for exact strings or regex, and `search_code` for behavior/concept queries. Keep host grep as fallback, not the first tool. `search_code` is compact by default and accepts `max_tokens` for strict context budgets.
 
-Cold-start note: `codesift mcp` has a measured stdio startup cost, but normal MCP clients keep the server process alive, so this is a one-time repo/session tax; subsequent searches use the warm path. The M4 daemon will further reduce this startup cost.
+Cold-start note: `codesift mcp` is now a small stdio shim that starts or reuses a local codesift daemon, then proxies MCP JSON-RPC to it. The daemon exits after an idle timeout and can be pinned with `CODESIFT_DAEMON_SOCKET` / `CODESIFT_DAEMON_IDLE_MS` when tests need isolation.
 
 ## Commands
 

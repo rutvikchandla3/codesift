@@ -116,8 +116,16 @@ describe('@codesift/mcp server', () => {
     const repo = await openRepo(repoRoot)
     await repo.sync()
 
+    const daemonSocket = process.platform === 'win32'
+      ? String.raw`\\.\pipe\codesift-mcp-test-${Date.now()}`
+      : join(repoRoot, '.codesift', 'daemon.sock')
     const child = spawn(process.execPath, [join(process.cwd(), 'packages/cli/dist/bin.js'), 'mcp', repoRoot], {
-      stdio: ['pipe', 'pipe', 'pipe']
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        CODESIFT_DAEMON_SOCKET: daemonSocket,
+        CODESIFT_DAEMON_IDLE_MS: '1000'
+      }
     })
     const messages: unknown[] = []
     const stderrChunks: string[] = []
