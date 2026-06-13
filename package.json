@@ -1,0 +1,26 @@
+{
+  "name": "codesift-workspace",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Local-first hybrid code search engine for CLI, SDK, and MCP.",
+  "license": "MIT",
+  "packageManager": "pnpm@10.33.2",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter './packages/**' build",
+    "clean": "pnpm -r --filter './packages/**' clean && rimraf node_modules coverage",
+    "lint": "pnpm -r --filter './packages/**' lint",
+    "test": "vitest run",
+    "typecheck": "pnpm -r --filter './packages/**' typecheck",
+    "ci": "pnpm build && pnpm test"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.1",
+    "rimraf": "^6.0.1",
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

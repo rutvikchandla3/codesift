@@ -1,0 +1,27 @@
+{
+  "name": "codesift",
+  "version": "0.0.0",
+  "description": "CLI for codesift local-first hybrid code search.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "codesift": "./dist/bin.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "clean": "rimraf dist",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@codesift/core": "workspace:*",
+    "@codesift/mcp": "workspace:*",
+    "commander": "^14.0.0"
+  }
+}
