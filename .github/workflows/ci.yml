@@ -19,6 +19,7 @@ jobs:
           - windows-latest
         node:
           - 20
+          - 22
 
     steps:
       - name: Checkout
@@ -38,8 +39,93 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build
+      - name: Run CI suite
+        run: pnpm run ci
+
+  alpine:
+    name: alpine / node-${{ matrix.node }}
+    runs-on: ubuntu-latest
+    container:
+      image: node:${{ matrix.node }}-alpine
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - 20
+          - 22
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install git
+        run: apk add --no-cache git
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run CI suite
+        run: pnpm run ci
+
+  offline:
+    name: offline / zero-egress local path
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build packages
         run: pnpm build
 
-      - name: Test
-        run: pnpm test
+      - name: Assert offline index/search path
+        run: pnpm run test:offline
+
+  smoke-pack-install:
+    name: pack-install smoke / alpine node-${{ matrix.node }}
+    runs-on: ubuntu-latest
+    container:
+      image: node:${{ matrix.node }}-alpine
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - 20
+          - 22
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build packages
+        run: pnpm build
+
+      - name: Pack + clean-install smoke test
+        run: pnpm run test:smoke-install

@@ -70,6 +70,14 @@ export interface WatchOptions {
 
 export type StopWatching = () => Promise<void>
 
+export interface VectorSearchStatus {
+  available: boolean
+  state: 'lazy' | 'ready' | 'unavailable'
+  reason?: 'native-dependency-unavailable'
+  message?: string
+  detail?: string
+}
+
 export interface RepoStatus {
   root: string
   indexPath: string
@@ -82,6 +90,7 @@ export interface RepoStatus {
     model?: string
     dims?: number
   } | null
+  vectorSearch: VectorSearchStatus
 }
 
 export interface Repo {

@@ -6,7 +6,7 @@
   "license": "MIT",
   "sideEffects": false,
   "engines": {
-    "node": ">=20"
+    "node": "^20.0.0 || ^22.0.0"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -25,7 +25,6 @@
   "scripts": {
     "build": "tsup",
     "clean": "rimraf dist",
-    "lint": "tsc -p tsconfig.json --noEmit",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

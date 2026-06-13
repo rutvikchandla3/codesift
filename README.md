@@ -28,6 +28,22 @@ Still intentionally deferred to later milestones:
 - full MCP transport implementation
 - production local ONNX embedding model
 
+## Supported platforms
+
+| Environment | Node | Notes |
+| --- | --- | --- |
+| macOS (`macos-latest`) | 20.x, 22.x | GitHub Actions coverage |
+| Ubuntu (`ubuntu-latest`) | 20.x, 22.x | glibc coverage |
+| Alpine Linux (`node:<version>-alpine`) | 20.x, 22.x | musl coverage + packed-install smoke test |
+| Windows (`windows-latest`) | 20.x, 22.x | GitHub Actions coverage |
+
+## Trust posture
+
+- Telemetry: **none**.
+- Default local `index` / `search` / `sym` / `status` flows are covered by offline / zero-egress CI checks.
+- `.codesift/` self-installs a local `.gitignore` with `*` on first open/index so the index never shows up in `git status`.
+- If `sqlite-vec` is unavailable, lexical and symbol queries still work; vector search reports degraded mode instead of failing at repo open.
+
 ## Workspace
 
 ```text
@@ -56,7 +72,8 @@ node packages/cli/dist/bin.js sym SqliteRepo
 pnpm build
 pnpm test
 pnpm typecheck
-pnpm lint
+pnpm run test:offline
+pnpm run test:smoke-install
 pnpm run ci
 ```
 

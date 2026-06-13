@@ -11,6 +11,7 @@ export type {
   SymbolKind,
   SyncOptions,
   SyncResult,
+  VectorSearchStatus,
   WatchOptions
 } from './types.js'
 
@@ -22,7 +23,7 @@ export {
   registerEmbeddingProvider
 } from './embedding.js'
 
-export { SqliteRepo } from './repo.js'
+export { SqliteRepo, setVectorExtensionLoaderForTests } from './repo.js'
 
 import { SqliteRepo } from './repo.js'
 import type { Repo } from './types.js'
@@ -32,5 +33,7 @@ export async function openRepo(root: string): Promise<Repo> {
     throw new Error('openRepo requires a repository path')
   }
 
-  return new SqliteRepo(root)
+  const repo = new SqliteRepo(root)
+  await repo.initialize()
+  return repo
 }
