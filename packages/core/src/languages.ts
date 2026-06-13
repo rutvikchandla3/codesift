@@ -17,6 +17,7 @@ const LANGUAGE_BY_EXTENSION: Record<string, string> = {
   '.sh': 'shell',
   '.ts': 'typescript',
   '.tsx': 'typescript',
+  '.toml': 'toml',
   '.txt': 'text',
   '.yaml': 'yaml',
   '.yml': 'yaml'
@@ -24,7 +25,7 @@ const LANGUAGE_BY_EXTENSION: Record<string, string> = {
 
 const TEXT_FILE_NAMES = new Set(['Dockerfile', 'Makefile'])
 const CODE_LANGUAGES = new Set(['go', 'java', 'javascript', 'python', 'ruby', 'rust', 'shell', 'typescript'])
-const DOCUMENTATION_LANGUAGES = new Set(['json', 'markdown', 'text', 'yaml'])
+const DOCUMENTATION_LANGUAGES = new Set(['json', 'markdown', 'text', 'toml', 'yaml'])
 const BINARY_EXTENSIONS = new Set([
   '.avif',
   '.bmp',
@@ -77,6 +78,30 @@ export function isTypeScriptLike(language: string): boolean {
 
 export function isPythonLike(language: string): boolean {
   return language === 'python'
+}
+
+export function isGoLike(language: string): boolean {
+  return language === 'go'
+}
+
+export function isJavaLike(language: string): boolean {
+  return language === 'java'
+}
+
+export function isRubyLike(language: string): boolean {
+  return language === 'ruby'
+}
+
+export function isRustLike(language: string): boolean {
+  return language === 'rust'
+}
+
+export function isMarkdownLike(language: string): boolean {
+  return language === 'markdown'
+}
+
+export function isConfigLike(language: string): boolean {
+  return language === 'json' || language === 'yaml' || language === 'toml'
 }
 
 export function isCodeLanguage(language: string): boolean {

@@ -23,12 +23,17 @@ interface ChunkRow {
   symbol: string | null
   kind: SymbolKind | null
   parent: string | null
+  generated: number | null
 }
 
 interface ChunkLocationRow {
   file_path: string
   start_line: number
   end_line: number
+}
+
+interface TableInfoRow {
+  name: string
 }
 
 interface IndexedChunkRecord extends ChunkRecord {
@@ -53,7 +58,7 @@ interface RankedChunkRow {
   reasons: Set<SearchReasonTag>
 }
 
-const SCHEMA_VERSION = '5'
+const SCHEMA_VERSION = '6'
 const DEFAULT_RRF_K = 60
 const DEFAULT_VECTOR_LIMIT = 50
 const DEFAULT_PATH_FILTERED_LIMIT = 200
@@ -153,7 +158,8 @@ export class SqliteRepo implements Repo {
       language: file.language,
       hash: file.hash,
       size: file.size,
-      mtime: file.mtime
+      mtime: file.mtime,
+      generated: file.generated ? 1 : 0
     }))
 
     const chunkRows: IndexedChunkRecord[] = files.flatMap((file) =>
@@ -166,8 +172,8 @@ export class SqliteRepo implements Repo {
     const batches = buildEmbeddingBatches(chunkRows, provider.maxBatch, provider.maxBatchTokens)
     const insertFile = db.prepare(
       `
-        insert into files(path, language, hash, size, mtime)
-        values (@path, @language, @hash, @size, @mtime)
+        insert into files(path, language, hash, size, mtime, generated)
+        values (@path, @language, @hash, @size, @mtime, @generated)
       `
     )
     const insertChunk = db.prepare(
@@ -183,8 +189,9 @@ export class SqliteRepo implements Repo {
           parent,
           signature,
           snippet,
+          generated,
           embedding
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
     )
     const insertChunkFts = db.prepare(
@@ -244,6 +251,7 @@ export class SqliteRepo implements Repo {
               row.parent ?? null,
               row.signature ?? null,
               row.content,
+              row.generated ? 1 : 0,
               embedding
             )
 
@@ -329,7 +337,8 @@ export class SqliteRepo implements Repo {
                 c.language,
                 c.symbol,
                 c.kind,
-                c.parent
+                c.parent,
+                c.generated
               from chunks_fts
               join chunks c on c.id = chunks_fts.chunk_id
               where chunks_fts match ?
@@ -361,7 +370,8 @@ export class SqliteRepo implements Repo {
                   language,
                   symbol,
                   kind,
-                  parent
+                  parent,
+                  generated
                 from chunks
                 ${whereSql}
                 order by vec_distance_cosine(embedding, ?) asc, file_path asc, start_line asc, id asc
@@ -675,7 +685,8 @@ export class SqliteRepo implements Repo {
         language text not null,
         hash text not null,
         size integer not null,
-        mtime real not null
+        mtime real not null,
+        generated integer not null default 0
       );
 
       create table if not exists chunks(
@@ -689,6 +700,7 @@ export class SqliteRepo implements Repo {
         parent text,
         signature text,
         snippet text not null,
+        generated integer not null default 0,
         embedding blob not null
       );
 
@@ -721,6 +733,9 @@ export class SqliteRepo implements Repo {
       create index if not exists idx_symbols_name on symbols(name);
       create index if not exists idx_symbols_kind on symbols(kind);
     `)
+
+    ensureColumn(db, 'files', 'generated', 'integer not null default 0')
+    ensureColumn(db, 'chunks', 'generated', 'integer not null default 0')
   }
 
   private clearIndex(db: Database.Database): void {
@@ -1118,7 +1133,7 @@ function selectExactCandidateRows(
   const chunkRows = db
     .prepare<unknown[], ChunkRow>(
       `
-        select id, file_path, start_line, end_line, snippet, language, symbol, kind, parent
+        select id, file_path, start_line, end_line, snippet, language, symbol, kind, parent, generated
         from chunks
         ${whereSql ? `${whereSql} and` : 'where'} lower(symbol) in (${placeholders})
         order by file_path asc, start_line asc, end_line asc, id asc
@@ -1139,7 +1154,7 @@ function selectExactCandidateRows(
   const symbolRows = db
     .prepare<unknown[], ChunkRow>(
       `
-        select distinct c.id, c.file_path, c.start_line, c.end_line, c.snippet, c.language, c.symbol, c.kind, c.parent
+        select distinct c.id, c.file_path, c.start_line, c.end_line, c.snippet, c.language, c.symbol, c.kind, c.parent, c.generated
         from symbols s
         join chunks c on c.file_path = s.file_path and s.start_line between c.start_line and c.end_line
         ${whereSql ? `${whereSql.replace(/\bfile_path\b/g, 'c.file_path').replace(/\blanguage\b/g, 'c.language').replace(/\bkind\b/g, 'c.kind')} and` : 'where'} lower(s.name) in (${placeholders})
@@ -1183,7 +1198,8 @@ function selectExactFtsCandidateRows(
             c.language,
             c.symbol,
             c.kind,
-            c.parent
+            c.parent,
+            c.generated
           from chunks_fts
           join chunks c on c.id = chunks_fts.chunk_id
           where chunks_fts match ?
@@ -1307,6 +1323,10 @@ function scoreBoostForRow(row: ChunkRow, query: string): number {
 
   if (row.kind && row.kind !== 'file') {
     boost *= 1.04
+  }
+
+  if (row.generated === 1) {
+    boost *= 0.58
   }
 
   if (isExactSymbolMatch(row, query)) {
@@ -1620,6 +1640,15 @@ function buildCompatibilityMismatch(
     actual,
     expected
   }
+}
+
+function ensureColumn(db: Database.Database, table: string, column: string, definition: string): void {
+  const columns = db.prepare<[], TableInfoRow>(`pragma table_info(${table})`).all()
+  if (columns.some((row) => row.name === column)) {
+    return
+  }
+
+  db.exec(`alter table ${table} add column ${column} ${definition}`)
 }
 
 function readMeta(db: Database.Database, key: string): string | null {

@@ -4,7 +4,7 @@
 
 Hybrid (lexical + semantic) code search for repositories, shipped as one TypeScript core with three thin interfaces: a **CLI** for humans, an **SDK** for programs, and an **MCP server** for AI agents. Open source, MIT.
 
-**Status**: M1 walking skeleton implemented and now in final polish before sign-off.
+**Status**: M3 implementation has started; M2 is complete, with first M3 language/chunker hardening landed locally.
 
 ---
 
@@ -373,3 +373,12 @@ keep the stdio server alive, so the cost is paid once per repo/client session ra
 search. Warm in-process queries are already faster than `rg` on the M2 set. The daemon is pulled into the
 M4 freshness/watch work so it can share the same long-lived process, prepared statements, model
 residency, and background sync lifecycle.
+
+### 12.9 M3 start recorded (2026-06-13)
+
+First M3 implementation slice landed locally: structural chunk/symbol extraction for Go, Java, Ruby,
+and Rust; heading-aware Markdown chunks; top-level key/section-aware JSON/YAML/TOML chunks; nested
+`.gitignore` / `.codesiftignore` handling; default vendor/third-party ignores; generated/minified-source
+flagging with search down-ranking; and oversized structural chunk splitting. This is intentionally a
+pragmatic structural parser slice, not yet the final tree-sitter-quality AST implementation or the full
+per-language OSS eval gate.
