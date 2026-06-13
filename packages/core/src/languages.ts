@@ -23,6 +23,8 @@ const LANGUAGE_BY_EXTENSION: Record<string, string> = {
 }
 
 const TEXT_FILE_NAMES = new Set(['Dockerfile', 'Makefile'])
+const CODE_LANGUAGES = new Set(['go', 'java', 'javascript', 'python', 'ruby', 'rust', 'shell', 'typescript'])
+const DOCUMENTATION_LANGUAGES = new Set(['json', 'markdown', 'text', 'yaml'])
 const BINARY_EXTENSIONS = new Set([
   '.avif',
   '.bmp',
@@ -75,4 +77,12 @@ export function isTypeScriptLike(language: string): boolean {
 
 export function isPythonLike(language: string): boolean {
   return language === 'python'
+}
+
+export function isCodeLanguage(language: string): boolean {
+  return CODE_LANGUAGES.has(language)
+}
+
+export function isDocumentationLanguage(language: string): boolean {
+  return DOCUMENTATION_LANGUAGES.has(language)
 }

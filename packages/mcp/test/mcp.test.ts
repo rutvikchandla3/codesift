@@ -1,4 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+import { afterEach, describe, expect, it } from 'vitest'
 
 import { openRepo } from '@codesift/core'
 
@@ -9,6 +13,16 @@ import {
   createStdioServer,
   getToolDefinitions
 } from '../src/index.js'
+
+const temporaryDirectories: string[] = []
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories.splice(0).map(async (directory) => {
+      await rm(directory, { recursive: true, force: true })
+    })
+  )
+})
 
 describe('@codesift/mcp scaffold', () => {
   it('exposes the planned tool surface', () => {
@@ -21,7 +35,10 @@ describe('@codesift/mcp scaffold', () => {
   })
 
   it('routes scaffold calls through the core repo contract', async () => {
-    const repo = await openRepo(process.cwd())
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-mcp-'))
+    temporaryDirectories.push(repoRoot)
+
+    const repo = await openRepo(repoRoot)
     const router = createRouter(repo)
 
     expect(await router.searchCode({ query: 'jwt validation' })).toEqual([])

@@ -66,15 +66,33 @@ export function applyRetryBackoff(attempt: number): number {
       'utf8'
     )
 
+    await writeFile(
+      join(repoRoot, 'README.md'),
+      `# Demo repo
+
+This project validates JWT tokens before protected requests continue.
+`,
+      'utf8'
+    )
+
+    await writeFile(join(repoRoot, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n', 'utf8')
+
     const repo = await openRepo(repoRoot)
     const result = await repo.sync()
     const status = await repo.status()
     const jwtHits = await repo.search('where do we validate JWT tokens', { k: 3 })
     const retryHits = await repo.search('retry backoff for HTTP requests', { k: 3 })
+    const pythonHits = await repo.search('refresh the api token', { k: 3, lang: ['python'] })
+    const srcOnlyHits = await repo.search('refresh the api token', { k: 3, pathGlob: 'src/**' })
+    const readmeHits = await repo.search('JWT validation for protected requests', {
+      k: 2,
+      lang: ['markdown'],
+      pathGlob: 'README.md'
+    })
     const symbols = await repo.findSymbol('verifyJwtToken')
 
-    expect(result.indexedFiles).toBe(3)
-    expect(result.skippedFiles).toBe(0)
+    expect(result.indexedFiles).toBe(4)
+    expect(result.skippedFiles).toBe(1)
     expect(status.indexed).toBe(true)
     expect(status.chunkCount).toBeGreaterThan(0)
     expect(status.symbolCount).toBeGreaterThan(0)
@@ -82,6 +100,9 @@ export function applyRetryBackoff(attempt: number): number {
 
     expect(jwtHits[0]?.file).toBe('src/auth/jwt.ts')
     expect(retryHits.some((hit) => hit.file === 'src/network/retry.ts')).toBe(true)
+    expect(pythonHits[0]?.file).toBe('client.py')
+    expect(srcOnlyHits.some((hit) => hit.file === 'client.py')).toBe(false)
+    expect(readmeHits[0]?.file).toBe('README.md')
     expect(symbols[0]?.file).toBe('src/auth/jwt.ts')
     expect(symbols[0]?.kind).toBe('function')
   })

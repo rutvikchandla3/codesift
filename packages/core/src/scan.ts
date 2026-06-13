@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { readdir, readFile, stat } from 'node:fs/promises'
-import { join, relative } from 'node:path'
+import { basename, join, relative } from 'node:path'
 
 import ignore from 'ignore'
 
@@ -8,12 +8,30 @@ import { detectLanguage, isBinaryPath } from './languages.js'
 
 const MAX_FILE_SIZE_BYTES = 1024 * 1024
 const DEFAULT_IGNORES = [
+  '.cache',
   '.codesift',
   '.git',
+  '.next',
+  '.turbo',
+  'build',
   'coverage',
   'dist',
   'node_modules'
 ]
+
+const SKIPPED_BASENAMES = new Set([
+  'bun.lock',
+  'bun.lockb',
+  'Cargo.lock',
+  'composer.lock',
+  'Gemfile.lock',
+  'package-lock.json',
+  'pnpm-lock.yaml',
+  'poetry.lock',
+  'Pipfile.lock',
+  'uv.lock',
+  'yarn.lock'
+])
 
 export interface ScannedFile {
   absolutePath: string
@@ -61,7 +79,7 @@ export async function scanRepository(root: string): Promise<ScanResult> {
         continue
       }
 
-      if (!entry.isFile() || isBinaryPath(relativePath)) {
+      if (!entry.isFile() || isBinaryPath(relativePath) || shouldSkipPath(relativePath)) {
         skippedFiles += 1
         continue
       }
@@ -99,4 +117,14 @@ export async function scanRepository(root: string): Promise<ScanResult> {
 
   files.sort((left, right) => left.relativePath.localeCompare(right.relativePath))
   return { files, skippedFiles }
+}
+
+function shouldSkipPath(filePath: string): boolean {
+  const fileName = basename(filePath)
+
+  if (SKIPPED_BASENAMES.has(fileName)) {
+    return true
+  }
+
+  return filePath.endsWith('.map') || filePath.includes('.min.')
 }

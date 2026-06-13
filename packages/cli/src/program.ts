@@ -3,7 +3,13 @@ import { resolve } from 'node:path'
 
 import { Command } from 'commander'
 
-import { openRepo, type RepoStatus, type SearchHit, type SymbolDefinition } from '@codesift/core'
+import {
+  openRepo,
+  type RepoStatus,
+  type SearchHit,
+  type SymbolDefinition,
+  type SymbolKind
+} from '@codesift/core'
 import { createHttpServer, createStdioServer, getToolDefinitions } from '@codesift/mcp'
 
 export interface CliIo {
@@ -59,6 +65,19 @@ export function formatSymbols(definitions: SymbolDefinition[]): string {
     .join('\n')
 }
 
+function parseCsvList(value?: string): string[] | undefined {
+  if (!value) {
+    return undefined
+  }
+
+  const values = value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+
+  return values.length > 0 ? values : undefined
+}
+
 export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promise<void> {
   const program = new Command()
 
@@ -88,10 +107,30 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
     .command('search')
     .argument('<query>', 'natural language or symbol-aware query')
     .option('-k, --k <count>', 'number of hits', '10')
+    .option('--repo <path>', 'repository path', process.cwd())
+    .option('--lang <langs>', 'comma-separated language filter, e.g. ts,typescript,python')
+    .option('--path <glob>', 'path glob filter, e.g. src/**')
     .option('--json', 'print JSON results')
-    .action(async (query: string, options: { k: string; json?: boolean }) => {
-      const repo = await openRepo(process.cwd())
-      const hits = await repo.search(query, { k: Number(options.k) })
+    .action(async (query: string, options: { k: string; repo: string; lang?: string; path?: string; json?: boolean }) => {
+      const repo = await openRepo(options.repo)
+      const languages = parseCsvList(options.lang)
+      const searchOptions: {
+        k: number
+        lang?: string[]
+        pathGlob?: string
+      } = {
+        k: Number(options.k)
+      }
+
+      if (languages) {
+        searchOptions.lang = languages
+      }
+
+      if (options.path) {
+        searchOptions.pathGlob = options.path
+      }
+
+      const hits = await repo.search(query, searchOptions)
 
       io.stdout(options.json ? JSON.stringify(hits, null, 2) : formatHits(hits))
     })
@@ -99,9 +138,25 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
   program
     .command('sym')
     .argument('<name>', 'symbol name to find')
-    .action(async (name: string) => {
-      const repo = await openRepo(process.cwd())
-      const definitions = await repo.findSymbol(name)
+    .option('--repo <path>', 'repository path', process.cwd())
+    .option('--path <glob>', 'path glob filter, e.g. src/**')
+    .option('--kind <kind>', 'symbol kind filter')
+    .action(async (name: string, options: { repo: string; path?: string; kind?: string }) => {
+      const repo = await openRepo(options.repo)
+      const findOptions: {
+        pathGlob?: string
+        kind?: SymbolKind
+      } = {}
+
+      if (options.path) {
+        findOptions.pathGlob = options.path
+      }
+
+      if (options.kind) {
+        findOptions.kind = options.kind as SymbolKind
+      }
+
+      const definitions = await repo.findSymbol(name, findOptions)
       io.stdout(formatSymbols(definitions))
     })
 

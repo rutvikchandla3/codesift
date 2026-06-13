@@ -8,16 +8,25 @@ Local-first hybrid code search for repositories, delivered as one TypeScript cor
 
 ## Status
 
-Milestone 0 scaffold is in place. The repo now has:
+M1 walking skeleton is live and in final polish.
 
-- pnpm workspace layout
-- shared TypeScript + tsup build setup
-- Vitest test harness
-- GitHub Actions CI on macOS, Linux, and Windows
-- MIT licensing
-- package names aligned to the chosen `codesift` brand
+Implemented today:
 
-The next milestone is M1: the walking skeleton for scan → chunk → embed → store → search.
+- repository scan with `.gitignore` / `.codesiftignore` support
+- TS/JS structural chunking via the TypeScript compiler API
+- Python structural definition chunking
+- fallback line-window chunking for other supported text files
+- local semantic embeddings via a built-in provider
+- SQLite-backed local index with `sqlite-vec`
+- end-to-end `index`, `search`, `sym`, `status`, and `clean` CLI flows
+
+Still intentionally deferred to later milestones:
+
+- hybrid BM25 + vector fusion
+- exact-symbol boost
+- incremental freshness / watch mode
+- full MCP transport implementation
+- production local ONNX embedding model
 
 ## Workspace
 
@@ -29,13 +38,26 @@ packages/
   eval/   private eval harness
 ```
 
-## Commands
+## Quickstart
 
 ```bash
 pnpm install
 pnpm build
 pnpm test
+
+node packages/cli/dist/bin.js index .
+node packages/cli/dist/bin.js search "where is the sqlite database opened" -k 5
+node packages/cli/dist/bin.js sym SqliteRepo
+```
+
+## Commands
+
+```bash
+pnpm build
+pnpm test
 pnpm typecheck
+pnpm lint
+pnpm run ci
 ```
 
 See `PLAN.md` for the full product plan.

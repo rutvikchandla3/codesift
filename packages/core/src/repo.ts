@@ -8,6 +8,7 @@ import * as sqliteVec from 'sqlite-vec'
 
 import { buildChunks } from './chunking.js'
 import { getDefaultEmbeddingProvider } from './embedding.js'
+import { isCodeLanguage, isDocumentationLanguage } from './languages.js'
 import { scanRepository } from './scan.js'
 import type {
   FindSymbolOptions,
@@ -198,7 +199,8 @@ export class SqliteRepo implements Repo {
     }
 
     const db = this.openDatabase()
-    const limit = options?.pathGlob ? Math.max((options.k ?? 10) * 25, 200) : (options?.k ?? 10)
+    const requestedK = options?.k ?? 10
+    const limit = options?.pathGlob ? Math.max(requestedK * 25, 200) : Math.max(requestedK * 10, 50)
 
     const whereClauses: string[] = []
     const parameters: Array<Float32Array | string> = [embedding]
@@ -240,32 +242,10 @@ export class SqliteRepo implements Repo {
       ? rows.filter((row: ChunkRow) => minimatch(row.file_path, options.pathGlob!))
       : rows
 
-    return filteredRows.slice(0, options?.k ?? 10).map((row) => {
-      const hit: SearchHit = {
-        id: String(row.id),
-        file: row.file_path,
-        range: {
-          startLine: row.start_line,
-          endLine: row.end_line
-        },
-        score: 1 / (1 + row.distance),
-        snippet: row.snippet
-      }
-
-      if (row.language) {
-        hit.language = row.language
-      }
-
-      if (row.symbol) {
-        hit.symbol = row.symbol
-      }
-
-      if (row.kind) {
-        hit.kind = row.kind
-      }
-
-      return hit
-    })
+    return filteredRows
+      .map((row) => buildSearchHit(row, query))
+      .sort((left, right) => right.score - left.score)
+      .slice(0, requestedK)
   }
 
   async findSymbol(name: string, options?: FindSymbolOptions): Promise<SymbolDefinition[]> {
@@ -482,4 +462,84 @@ function normalizeKinds(kind: SearchOptions['kind'] | FindSymbolOptions['kind'] 
   }
 
   return Array.isArray(kind) ? kind : [kind]
+}
+
+function buildSearchHit(row: ChunkRow, query: string): SearchHit {
+  const semanticScore = 1 / (1 + row.distance)
+  const score = semanticScore * scoreBoostForRow(row, query)
+
+  const hit: SearchHit = {
+    id: String(row.id),
+    file: row.file_path,
+    range: {
+      startLine: row.start_line,
+      endLine: row.end_line
+    },
+    score,
+    snippet: row.snippet
+  }
+
+  if (row.language) {
+    hit.language = row.language
+  }
+
+  if (row.symbol) {
+    hit.symbol = row.symbol
+  }
+
+  if (row.kind) {
+    hit.kind = row.kind
+  }
+
+  return hit
+}
+
+function scoreBoostForRow(row: ChunkRow, query: string): number {
+  let boost = 1
+
+  if (row.language && isCodeLanguage(row.language)) {
+    boost *= 1.12
+  }
+
+  if (row.symbol) {
+    boost *= 1.08
+  }
+
+  if (row.kind && row.kind !== 'file') {
+    boost *= 1.04
+  }
+
+  if (!queryLooksDocumentationOrConfigFocused(query)) {
+    if (row.language && isDocumentationLanguage(row.language)) {
+      boost *= 0.84
+    }
+
+    if (looksLikeProjectMetadata(row.file_path)) {
+      boost *= 0.82
+    }
+  }
+
+  return boost
+}
+
+function looksLikeProjectMetadata(filePath: string): boolean {
+  const lowerPath = filePath.toLowerCase()
+  return (
+    lowerPath.endsWith('/readme.md') ||
+    lowerPath === 'readme.md' ||
+    lowerPath.endsWith('/plan.md') ||
+    lowerPath === 'plan.md' ||
+    lowerPath.endsWith('/package.json') ||
+    lowerPath === 'package.json' ||
+    lowerPath.endsWith('/tsconfig.json') ||
+    lowerPath === 'tsconfig.json' ||
+    lowerPath.endsWith('/vitest.config.ts') ||
+    lowerPath === 'vitest.config.ts'
+  )
+}
+
+function queryLooksDocumentationOrConfigFocused(query: string): boolean {
+  return /\b(readme|plan|doc|docs|documentation|guide|workflow|config|package\.json|pnpm|json|yaml)\b/i.test(
+    query
+  )
 }

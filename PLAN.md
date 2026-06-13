@@ -4,7 +4,7 @@
 
 Hybrid (lexical + semantic) code search for repositories, shipped as one TypeScript core with three thin interfaces: a **CLI** for humans, an **SDK** for programs, and an **MCP server** for AI agents. Open source, MIT.
 
-**Status**: M0 scaffold complete in-repo. Next implementation milestone: **M1 Walking skeleton**.
+**Status**: M1 walking skeleton implemented and now in final polish before sign-off.
 
 ---
 
