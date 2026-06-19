@@ -24,6 +24,7 @@ export { HttpMcpServerHandle, createHttpServerHandle } from './http.js'
 
 export const DEFAULT_SEARCH_K = CORE_DEFAULT_SEARCH_K
 export const DEFAULT_MCP_GREP_MAX_TOKENS = 700
+export const DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS = 700
 export const DEFAULT_MCP_READ_CHUNK_MAX_TOKENS = 1000
 export const MIN_MCP_READ_CHUNK_MAX_TOKENS = 6
 export const MAX_MCP_READ_CHUNK_MAX_TOKENS = 4000
@@ -69,6 +70,7 @@ export interface FindSymbolArgs {
   kind?: FindSymbolOptions['kind'] | undefined
   path_glob?: string | undefined
   with_body?: boolean | undefined
+  max_tokens?: number | undefined
 }
 
 export interface GrepCodeArgs {
@@ -91,6 +93,10 @@ export interface FormatMcpGrepHitsOptions {
 }
 
 export interface FormatMcpReadChunkOptions {
+  maxTokens?: number | undefined
+}
+
+export interface FormatMcpSymbolsOptions {
   maxTokens?: number | undefined
 }
 
@@ -170,7 +176,8 @@ const findSymbolInputSchema = {
   name: z.string().min(1).describe('Exact or partial symbol name, e.g. TokenVerifier or verifyJwtToken.'),
   kind: kindFilterSchema.optional().describe('Optional symbol kind filter.'),
   path_glob: z.string().min(1).optional().describe('Repo-relative glob, e.g. "src/auth/**".'),
-  with_body: z.boolean().optional().describe('Inline the top exact match\'s full definition body so it resolves in one call. Default true; set false for a compact name→location list.')
+  with_body: z.boolean().optional().describe('Inline the top exact match\'s full definition body so it resolves in one call. Default true; set false for a compact name→location list.'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Maximum approximate tokens to return across symbol definitions. Default 700.')
 }
 
 const grepCodeInputSchema = {
@@ -259,7 +266,8 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
         name: { type: 'string' },
         kind: kindJsonSchema(),
         path_glob: { type: 'string' },
-        with_body: { type: 'boolean', default: true }
+        with_body: { type: 'boolean', default: true },
+        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS }
       })
     },
     {
@@ -406,7 +414,10 @@ export async function callMcpTool(repo: Repo, name: McpToolName, args: unknown):
     case 'search_code':
       return formatMcpSearchHits(await router.searchCode(searchCodeArgsSchema.parse(args)))
     case 'find_symbol':
-      return formatMcpSymbols(await router.findSymbol(findSymbolArgsSchema.parse(args)))
+      {
+        const parsed = findSymbolArgsSchema.parse(args)
+        return formatMcpSymbols(await router.findSymbol(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS })
+      }
     case 'grep_code':
       {
         const parsed = grepCodeArgsSchema.parse(args)
@@ -487,7 +498,7 @@ export function createSdkServer(repo: Repo): McpServer {
     textResult(formatMcpSearchHits(await router.searchCode(args)))
   )
   server.registerTool('find_symbol', { description: toolDescription('find_symbol'), inputSchema: findSymbolInputSchema }, async (args) =>
-    textResult(formatMcpSymbols(await router.findSymbol(args)))
+    textResult(formatMcpSymbols(await router.findSymbol(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS }))
   )
   server.registerTool('grep_code', { description: toolDescription('grep_code'), inputSchema: grepCodeInputSchema }, async (args) =>
     textResult(formatMcpGrepHits(await router.grepCode(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_GREP_MAX_TOKENS }))
@@ -596,22 +607,117 @@ function formatHitSymbol(hit: SearchHit): string {
   return ` ${[hit.parent, hit.symbol].filter(Boolean).join(' > ')}`
 }
 
-export function formatMcpSymbols(definitions: SymbolDefinition[]): string {
+export function formatMcpSymbols(definitions: SymbolDefinition[], options: FormatMcpSymbolsOptions = {}): string {
   if (definitions.length === 0) {
     return 'no_symbols'
   }
 
-  return definitions
-    .map((definition, index) => {
-      const header = `#${index + 1} ${definition.kind} ${definition.name} ${definition.file}:${formatRange(definition.range.startLine, definition.range.endLine)}`
-      // The top exact match carries a paste-ready body so the identifier resolves
-      // in a single call; render it with the same line-numbered block as search.
-      if (definition.body !== undefined) {
-        return `${header}\n${formatBodyBlock(definition.body, definition.range.startLine)}`
-      }
-      return header
-    })
-    .join('\n')
+  const rendered = definitions.map(formatMcpSymbolDefinition)
+  const output = rendered.join('\n')
+  const maxTokens = options.maxTokens
+  if (maxTokens === undefined || output.length <= maxTokens * 4) {
+    return output
+  }
+
+  return fitSymbolOutputForBudget(definitions, rendered, maxTokens * 4)
+}
+
+function formatMcpSymbolDefinition(definition: SymbolDefinition, index: number): string {
+  const header = formatMcpSymbolHeader(definition, index)
+  // The top exact match carries a paste-ready body so the identifier resolves
+  // in a single call; render it with the same line-numbered block as search.
+  if (definition.body !== undefined) {
+    return `${header}\n${formatBodyBlock(definition.body, definition.range.startLine)}`
+  }
+  return header
+}
+
+function formatMcpSymbolHeader(definition: SymbolDefinition, index: number): string {
+  return `#${index + 1} ${definition.kind} ${definition.name} ${definition.file}:${formatRange(definition.range.startLine, definition.range.endLine)}`
+}
+
+function fitSymbolOutputForBudget(definitions: SymbolDefinition[], rendered: string[], maxChars: number): string {
+  const omittedAfterFirst = definitions.length - 1
+  const firstOnlyMarker = omittedAfterFirst > 0
+    ? symbolOmissionMarker(omittedAfterFirst, Math.max(0, maxChars - 2))
+    : symbolBodyTruncationMarker(Math.max(0, maxChars - 2))
+  const firstOnlyBudget = maxCharsForFirstHit(maxChars, firstOnlyMarker)
+  if (rendered[0]!.length > firstOnlyBudget) {
+    const first = formatMcpSymbolDefinitionForBudget(definitions[0]!, 0, firstOnlyBudget)
+    return firstOnlyMarker ? [first, firstOnlyMarker].filter(Boolean).join('\n') : first
+  }
+
+  const parts = [rendered[0]!]
+  for (let index = 1; index < rendered.length; index += 1) {
+    const candidate = [...parts, rendered[index]!]
+    const omitted = definitions.length - 1 - (candidate.length - 1)
+    const marker = omitted > 0 ? symbolOmissionMarker(omitted, Math.max(0, maxChars - 2)) : undefined
+    const candidateOutput = marker ? [...candidate, marker].join('\n') : candidate.join('\n')
+    if (candidateOutput.length <= maxChars) {
+      parts.push(rendered[index]!)
+      continue
+    }
+    break
+  }
+
+  const omitted = definitions.length - parts.length
+  const marker = omitted > 0 ? symbolOmissionMarker(omitted, Math.max(0, maxChars - 2)) : undefined
+  const outputParts = marker ? [...parts, marker] : parts
+
+  const output = outputParts.join('\n')
+  return output.length <= maxChars ? output : truncateWithEllipsis(output, maxChars)
+}
+
+function formatMcpSymbolDefinitionForBudget(definition: SymbolDefinition, index: number, maxChars: number): string {
+  const header = formatMcpSymbolHeader(definition, index)
+  if (definition.body === undefined || maxChars <= header.length + 1) {
+    return truncateWithEllipsis(header, maxChars)
+  }
+
+  const bodyBudget = maxChars - header.length - 1
+  const body = truncateSymbolBodyBlock(formatBodyBlock(definition.body, definition.range.startLine), bodyBudget)
+  return body ? `${header}\n${body}` : truncateWithEllipsis(header, maxChars)
+}
+
+function truncateSymbolBodyBlock(body: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return ''
+  }
+  if (body.length <= maxChars) {
+    return body
+  }
+
+  return truncateWithEllipsis(body, maxChars).replace(/\n+$/g, '')
+}
+
+function symbolOmissionMarker(omitted: number, maxChars?: number): string {
+  const full = `symbols_omitted=${omitted}; refine name/kind/path_glob or raise max_tokens.`
+  if (maxChars === undefined || full.length <= maxChars) {
+    return full
+  }
+
+  const compact = `symbols_omitted=${omitted}; raise max_tokens`
+  if (compact.length <= maxChars) {
+    return compact
+  }
+
+  const bare = `symbols_omitted=${omitted}`
+  return bare.length <= maxChars ? bare : ''
+}
+
+function symbolBodyTruncationMarker(maxChars?: number): string {
+  const full = 'symbol_body_truncated=true; refine name/kind/path_glob or raise max_tokens.'
+  if (maxChars === undefined || full.length <= maxChars) {
+    return full
+  }
+
+  const compact = 'symbol_body_truncated=true; raise max_tokens'
+  if (compact.length <= maxChars) {
+    return compact
+  }
+
+  const bare = 'symbol_body_truncated=true'
+  return bare.length <= maxChars ? bare : ''
 }
 
 export function formatMcpGrepHits(hits: GrepHit[], options: FormatMcpGrepHitsOptions = {}): string {

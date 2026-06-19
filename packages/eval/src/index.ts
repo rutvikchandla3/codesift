@@ -7,7 +7,7 @@ import { execFile as execFileCallback, spawn, type ChildProcessWithoutNullStream
 import { promisify } from 'node:util'
 
 import { VOYAGE_RERANK_PROVIDER_ID, openRepo, type FindSymbolOptions, type GrepHit, type GrepOptions, type Range, type SearchHit, type SearchOptions, type SymbolDefinition } from '@codesift/core'
-import { DEFAULT_MCP_GREP_MAX_TOKENS, DEFAULT_MCP_READ_CHUNK_MAX_TOKENS, formatMcpGrepHits, formatMcpReadChunk, formatMcpSearchHits, formatMcpSymbols } from '@codesift/mcp'
+import { DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS, DEFAULT_MCP_GREP_MAX_TOKENS, DEFAULT_MCP_READ_CHUNK_MAX_TOKENS, formatMcpGrepHits, formatMcpReadChunk, formatMcpSearchHits, formatMcpSymbols } from '@codesift/mcp'
 
 const execFile = promisify(execFileCallback)
 
@@ -681,7 +681,7 @@ function buildCodesiftToolCall(query: GoldenQuery, resultLimit: number): { name:
   switch (query.queryType) {
     case 'symbol-def':
     case 'exact-identifier':
-      return { name: 'find_symbol', arguments: { name: query.query, ...pathGlob } }
+      return { name: 'find_symbol', arguments: { name: query.query, max_tokens: DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS, ...pathGlob } }
     case 'string-literal':
     case 'error-trace':
       return {
@@ -829,7 +829,7 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
       // non-top match) still forces a follow-up read — count it as 2 calls. A
       // MULTI-target lookup ("where are all the Xs") is answered by the location set
       // in a single call, so it is never charged a per-body follow-up.
-      let tokensToResolution = estimateTokenCount(formatMcpSymbols(definitions))
+      let tokensToResolution = estimateTokenCount(formatMcpSymbols(definitions, { maxTokens: DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS }))
       let callsToResolution = 1
 
       if (matchingRank !== null && query.expected.length === 1) {

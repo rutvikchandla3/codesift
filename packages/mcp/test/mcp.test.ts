@@ -5,9 +5,10 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { openRepo, registerEmbeddingProvider, type GrepHit, type SearchHit } from '@codesift/core'
+import { openRepo, registerEmbeddingProvider, type GrepHit, type SearchHit, type SymbolDefinition } from '@codesift/core'
 
 import {
+  DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS,
   DEFAULT_MCP_READ_CHUNK_MAX_TOKENS,
   DEFAULT_SEARCH_K,
   MIN_MCP_READ_CHUNK_MAX_TOKENS,
@@ -52,6 +53,9 @@ describe('@codesift/mcp server', () => {
     expect(getToolDefinitions().find((tool) => tool.name === 'grep_code')?.inputSchema.required).toEqual(['pattern'])
     expect(getToolDefinitions().find((tool) => tool.name === 'grep_code')?.inputSchema.properties).toMatchObject({
       max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: 700 }
+    })
+    expect(getToolDefinitions().find((tool) => tool.name === 'find_symbol')?.inputSchema.properties).toMatchObject({
+      max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS }
     })
     expect(getToolDefinitions().find((tool) => tool.name === 'read_chunk')?.inputSchema.properties).toMatchObject({
       max_tokens: { type: 'integer', minimum: MIN_MCP_READ_CHUNK_MAX_TOKENS, maximum: 4000, default: DEFAULT_MCP_READ_CHUNK_MAX_TOKENS }
@@ -142,6 +146,30 @@ describe('@codesift/mcp server', () => {
     expect(await router.readChunk({ id: hits[0]!.id })).toContain("return 'demo'")
     expect((await router.indexStatus()).indexed).toBe(true)
     expect(DEFAULT_SEARCH_K).toBe(8)
+  })
+
+  it('budgets find_symbol output through the MCP call surface', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-mcp-symbol-budget-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    await Promise.all(
+      Array.from({ length: 6 }, async (_, index) => {
+        await writeFile(
+          join(repoRoot, 'src', `shared${index}.ts`),
+          `export function sharedName(): string {\n  const value = 'shared-${index}-${'x'.repeat(40)}'\n  return value\n}\n`,
+          'utf8'
+        )
+      })
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+    const output = await callMcpTool(repo, 'find_symbol', { name: 'sharedName', max_tokens: 35 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(35)
+    expect(output).toContain('#1 function sharedName')
+    expect(output).toContain('symbols_omitted=')
   })
 
   it('creates server handles', async () => {
@@ -268,6 +296,86 @@ function makeHit(overrides: Partial<SearchHit>): SearchHit {
     ...overrides
   }
 }
+
+function makeSymbol(overrides: Partial<Omit<SymbolDefinition, 'body'>> & { body?: string | undefined } = {}): SymbolDefinition {
+  const { body, ...rest } = overrides
+  const definition: SymbolDefinition = {
+    id: 'src/auth.ts:10-13@abcdef01',
+    name: 'verifyToken',
+    kind: 'function',
+    file: 'src/auth.ts',
+    range: { startLine: 10, endLine: 13 },
+    body: 'export function verifyToken(token: string): boolean {\n  return token.length > 0\n}',
+    ...rest
+  }
+
+  if ('body' in overrides) {
+    if (body === undefined) {
+      delete definition.body
+    } else {
+      definition.body = body
+    }
+  }
+
+  return definition
+}
+
+describe('formatMcpSymbols budgeted output', () => {
+  it('preserves no_symbols and under-budget output byte-for-byte', () => {
+    const definitions = [makeSymbol()]
+    const expected = [
+      '#1 function verifyToken src/auth.ts:10-13',
+      '10 | export function verifyToken(token: string): boolean {',
+      '11 |   return token.length > 0',
+      '12 | }'
+    ].join('\n')
+
+    expect(formatMcpSymbols([])).toBe('no_symbols')
+    expect(formatMcpSymbols(definitions)).toBe(expected)
+    expect(formatMcpSymbols(definitions, { maxTokens: 500 })).toBe(expected)
+  })
+
+  it('preserves the first definition and omits later rows when over budget', () => {
+    const definitions = [
+      makeSymbol({
+        body: `export function verifyToken(token: string): boolean {\n  const padded = '${'x'.repeat(180)}'\n  return token + padded !== ''\n}`
+      }),
+      makeSymbol({ name: 'verifyToken', file: 'src/legacy.ts', range: { startLine: 1, endLine: 1 }, body: undefined }),
+      makeSymbol({ name: 'verifyToken', file: 'src/other.ts', range: { startLine: 5, endLine: 5 }, body: undefined })
+    ]
+
+    const output = formatMcpSymbols(definitions, { maxTokens: 45 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(45)
+    expect(output).toContain('#1 function verifyToken src/auth.ts:10-13')
+    expect(output).toContain('10 | export function verifyToken')
+    expect(output).toContain('symbols_omitted=')
+    expect(output).not.toContain('#2 function verifyToken')
+  })
+
+  it('marks a single over-budget symbol body as truncated instead of omitted', () => {
+    const output = formatMcpSymbols([
+      makeSymbol({
+        body: `export function verifyToken(token: string): boolean {\n  const padded = '${'x'.repeat(180)}'\n  return token + padded !== ''\n}`
+      })
+    ], { maxTokens: 35 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(35)
+    expect(output).toContain('#1 function verifyToken src/auth.ts:10-13')
+    expect(output).toContain('symbol_body_truncated=true')
+    expect(output).not.toContain('symbols_omitted=0')
+  })
+
+  it('keeps a recognizable omission marker for tiny budgets when it fits', () => {
+    const output = formatMcpSymbols([
+      makeSymbol({ body: `export function verifyToken() {\n  return '${'x'.repeat(100)}'\n}` }),
+      makeSymbol({ file: 'src/other.ts', body: undefined })
+    ], { maxTokens: 5 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(5)
+    expect(output).toContain('symbols_omitted=1')
+  })
+})
 
 describe('formatMcpSearchHits structure-preserving output', () => {
   it('renders an inlined body as a line-numbered block starting at range.startLine with original indentation', () => {
