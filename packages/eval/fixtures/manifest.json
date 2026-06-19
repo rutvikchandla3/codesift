@@ -42,6 +42,11 @@
       "id": "collision-ts",
       "language": "typescript",
       "repoPath": "./collision-ts"
+    },
+    {
+      "id": "usages-ts",
+      "language": "typescript",
+      "repoPath": "./usages-ts"
     }
   ],
   "queries": [
@@ -475,6 +480,27 @@
             "endLine": 15
           }
         }
+      ]
+    },
+    {
+      "id": "usages-parse-token-identifier",
+      "repoId": "usages-ts",
+      "queryType": "exact-identifier",
+      "query": "parseToken",
+      "grepPattern": "parse bearer auth claims",
+      "expected": [
+        {
+          "file": "src/token.ts",
+          "symbol": "parseToken"
+        }
+      ],
+      "expectedLineRange": {
+        "startLine": 5,
+        "endLine": 8
+      },
+      "expectedUsages": [
+        "src/api.ts",
+        "src/worker.ts"
       ]
     }
   ]

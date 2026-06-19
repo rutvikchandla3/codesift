@@ -4,7 +4,7 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { DEFAULT_MANIFEST_PATH, candidateFromRipgrep, candidateMatchesExpected, createEmptyManifest, diffLossBudgets, evaluateManifest, formatSummary, loadManifest, proveRoutingPolicy, runRipgrep, summarizeEmptyRun, type GoldenQuery, type RipgrepHit } from '../src/index.js'
+import { DEFAULT_MANIFEST_PATH, candidateFromRipgrep, candidateMatchesExpected, createEmptyManifest, diffLossBudgets, evaluateManifest, formatSummary, isRerankEvalEnabled, loadManifest, proveRoutingPolicy, runRipgrep, summarizeEmptyRun, type GoldenQuery, type RipgrepHit } from '../src/index.js'
 
 const temporaryDirectories: string[] = []
 
@@ -35,6 +35,12 @@ describe('@codesift/eval', () => {
         codesiftPreferred: 0,
         hostGrepPreferred: 0,
         selections: []
+      },
+      usagesReport: [],
+      rerankReport: {
+        enabled: false,
+        entries: [],
+        averageMrrAt1Delta: 0
       }
     })
   })
@@ -117,6 +123,68 @@ describe('@codesift/eval', () => {
     const rendered = formatSummary(summary)
     expect(rendered).toContain('calls median')
     expect(rendered).toContain('mrr@1')
+  }, 30_000)
+
+  it('reports with_usages recall and saved-call delta on the local usages fixture', async () => {
+    const manifest = await loadManifest(DEFAULT_MANIFEST_PATH)
+    const usagesManifest = {
+      repos: manifest.repos.filter((repo) => repo.id === 'usages-ts'),
+      queries: manifest.queries.filter((query) => query.repoId === 'usages-ts')
+    }
+    const summary = await evaluateManifest(usagesManifest, { resultLimit: 5, inspectionLimit: 5, latencyToleranceMs: Number.POSITIVE_INFINITY })
+
+    expect(summary.usagesReport).toHaveLength(1)
+    expect(summary.usagesReport[0]).toMatchObject({
+      queryId: 'usages-parse-token-identifier',
+      repoId: 'usages-ts',
+      queryType: 'exact-identifier',
+      usageRecall: 1,
+      expectedUsageCount: 2,
+      matchedUsageFiles: ['src/api.ts', 'src/worker.ts'],
+      missingUsageFiles: []
+    })
+    expect(summary.usagesReport[0]?.withUsagesCallsDelta).toBeGreaterThanOrEqual(1)
+    expect(summary.usagesReport[0]?.withUsagesCallsToResolution).toBeLessThan(summary.usagesReport[0]?.withoutUsagesCallsToResolution ?? 0)
+
+    const rendered = formatSummary(summary)
+    expect(rendered).toContain('with_usages report-only')
+    expect(rendered).toContain('usageRecall=1.00')
+  }, 30_000)
+
+  it('keeps the cloud rerank report disabled when the env gate is unset', async () => {
+    const originalEvalRerank = process.env.CODESIFT_EVAL_RERANK
+    const originalVoyageApiKey = process.env.VOYAGE_API_KEY
+    delete process.env.CODESIFT_EVAL_RERANK
+    delete process.env.VOYAGE_API_KEY
+
+    try {
+      expect(isRerankEvalEnabled()).toBe(false)
+
+      const manifest = await loadManifest(DEFAULT_MANIFEST_PATH)
+      const usagesManifest = {
+        repos: manifest.repos.filter((repo) => repo.id === 'usages-ts'),
+        queries: manifest.queries.filter((query) => query.repoId === 'usages-ts')
+      }
+      const summary = await evaluateManifest(usagesManifest, { resultLimit: 5, inspectionLimit: 5, latencyToleranceMs: Number.POSITIVE_INFINITY })
+
+      expect(summary.rerankReport).toEqual({
+        enabled: false,
+        entries: [],
+        averageMrrAt1Delta: 0
+      })
+    } finally {
+      if (originalEvalRerank === undefined) {
+        delete process.env.CODESIFT_EVAL_RERANK
+      } else {
+        process.env.CODESIFT_EVAL_RERANK = originalEvalRerank
+      }
+
+      if (originalVoyageApiKey === undefined) {
+        delete process.env.VOYAGE_API_KEY
+      } else {
+        process.env.VOYAGE_API_KEY = originalVoyageApiKey
+      }
+    }
   }, 30_000)
 
   it('proves the deterministic agent policy prefers codesift tools over host grep', async () => {
