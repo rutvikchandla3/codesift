@@ -8,13 +8,16 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { openRepo, registerEmbeddingProvider, type GrepHit, type SearchHit } from '@codesift/core'
 
 import {
+  DEFAULT_MCP_READ_CHUNK_MAX_TOKENS,
   DEFAULT_SEARCH_K,
+  MIN_MCP_READ_CHUNK_MAX_TOKENS,
   MCP_SERVER_INSTRUCTIONS,
   createHttpServer,
   createRouter,
   createStdioServer,
   callMcpTool,
   formatMcpGrepHits,
+  formatMcpReadChunk,
   formatMcpSearchHits,
   formatMcpSymbols,
   getToolDefinitions
@@ -49,6 +52,9 @@ describe('@codesift/mcp server', () => {
     expect(getToolDefinitions().find((tool) => tool.name === 'grep_code')?.inputSchema.required).toEqual(['pattern'])
     expect(getToolDefinitions().find((tool) => tool.name === 'grep_code')?.inputSchema.properties).toMatchObject({
       max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: 700 }
+    })
+    expect(getToolDefinitions().find((tool) => tool.name === 'read_chunk')?.inputSchema.properties).toMatchObject({
+      max_tokens: { type: 'integer', minimum: MIN_MCP_READ_CHUNK_MAX_TOKENS, maximum: 4000, default: DEFAULT_MCP_READ_CHUNK_MAX_TOKENS }
     })
     expect(getToolDefinitions().find((tool) => tool.name === 'search_code')?.inputSchema.properties).toMatchObject({
       context: { type: 'string', enum: ['sig', 'body'] },
@@ -463,6 +469,52 @@ describe('grep_code MCP output budgeting', () => {
     expect(output).toContain("src/noisy.ts:1:24 | export const value0 = 'NEEDLE_0'")
     expect(output).toContain('matches_omitted=')
     expect(output).not.toContain('NEEDLE_19')
+  })
+})
+
+describe('read_chunk MCP output budgeting', () => {
+  it('leaves under-budget chunk content byte-for-byte unchanged', () => {
+    const content = 'export function demoValue(): string {\n  return "demo"\n}\n'
+
+    expect(formatMcpReadChunk(content, { maxTokens: 80 })).toBe(content)
+  })
+
+  it('preserves the first source content and appends a compact truncation marker', () => {
+    const content = Array.from({ length: 30 }, (_, index) => `export const noisyValue${index} = '${'x'.repeat(40)}'`).join('\n')
+    const output = formatMcpReadChunk(content, { maxTokens: 45 })
+
+    expect(output).toContain("export const noisyValue0 = '")
+    expect(output).toContain('content_truncated=true; raise max_tokens or narrow the chunk/range.')
+    expect(output).not.toContain('noisyValue29')
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(45)
+  })
+
+  it('keeps tiny-budget output within the approximate budget with a recognizable marker', () => {
+    const output = formatMcpReadChunk('const value = "' + 'x'.repeat(400) + '"', { maxTokens: 6 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(6)
+    expect(output).toContain('content_truncated')
+  })
+
+  it('budgets noisy read_chunk output through callMcpTool while preserving the first lines', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-mcp-read-budget-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    await writeFile(
+      join(repoRoot, 'src', 'noisy.ts'),
+      Array.from({ length: 120 }, (_, index) => `export const noisyValue${index} = '${'x'.repeat(40)}'`).join('\n'),
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const output = await callMcpTool(repo, 'read_chunk', { id: 'src/noisy.ts:1-120', max_tokens: 60 })
+    expect(output).toContain("export const noisyValue0 = '")
+    expect(output).toContain('content_truncated=true')
+    expect(output).not.toContain('noisyValue119')
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(60)
   })
 })
 

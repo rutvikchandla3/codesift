@@ -7,7 +7,7 @@ import { execFile as execFileCallback, spawn, type ChildProcessWithoutNullStream
 import { promisify } from 'node:util'
 
 import { VOYAGE_RERANK_PROVIDER_ID, openRepo, type FindSymbolOptions, type GrepHit, type GrepOptions, type Range, type SearchHit, type SearchOptions, type SymbolDefinition } from '@codesift/core'
-import { DEFAULT_MCP_GREP_MAX_TOKENS, formatMcpGrepHits, formatMcpSearchHits, formatMcpSymbols } from '@codesift/mcp'
+import { DEFAULT_MCP_GREP_MAX_TOKENS, DEFAULT_MCP_READ_CHUNK_MAX_TOKENS, formatMcpGrepHits, formatMcpReadChunk, formatMcpSearchHits, formatMcpSymbols } from '@codesift/mcp'
 
 const execFile = promisify(execFileCallback)
 
@@ -1307,7 +1307,7 @@ function bodyOverlapsExpected(hit: SearchHit, expected: Range): boolean {
 
 async function readChunkSafely(repo: Awaited<ReturnType<typeof openRepo>>, id: string): Promise<string | null> {
   try {
-    return await repo.readChunk(id)
+    return formatMcpReadChunk(await repo.readChunk(id), { maxTokens: DEFAULT_MCP_READ_CHUNK_MAX_TOKENS })
   } catch {
     return null
   }

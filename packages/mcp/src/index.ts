@@ -24,6 +24,9 @@ export { HttpMcpServerHandle, createHttpServerHandle } from './http.js'
 
 export const DEFAULT_SEARCH_K = CORE_DEFAULT_SEARCH_K
 export const DEFAULT_MCP_GREP_MAX_TOKENS = 700
+export const DEFAULT_MCP_READ_CHUNK_MAX_TOKENS = 1000
+export const MIN_MCP_READ_CHUNK_MAX_TOKENS = 6
+export const MAX_MCP_READ_CHUNK_MAX_TOKENS = 4000
 
 const SYMBOL_KINDS = [
   'class',
@@ -87,9 +90,14 @@ export interface FormatMcpGrepHitsOptions {
   maxTokens?: number | undefined
 }
 
+export interface FormatMcpReadChunkOptions {
+  maxTokens?: number | undefined
+}
+
 export interface ReadChunkArgs {
   id: string
   context_lines?: number | undefined
+  max_tokens?: number | undefined
 }
 
 export interface McpToolDefinition {
@@ -182,7 +190,8 @@ const grepCodeInputSchema = {
 
 const readChunkInputSchema = {
   id: z.string().min(1).describe('Stable chunk id returned by search_code.'),
-  context_lines: z.number().int().min(0).max(50).optional().describe('Extra lines before/after the chunk.')
+  context_lines: z.number().int().min(0).max(50).optional().describe('Extra lines before/after the chunk.'),
+  max_tokens: z.number().int().min(MIN_MCP_READ_CHUNK_MAX_TOKENS).max(MAX_MCP_READ_CHUNK_MAX_TOKENS).optional().describe('Maximum approximate tokens to return from this chunk. Default 1000.')
 }
 
 const indexStatusInputSchema = {}
@@ -276,7 +285,8 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
       description: 'Expand an ADDITIONAL search_code hit id into its source chunk, or widen context around one. The top search_code result is already returned inline, so this is rarely needed for the best hit; use it for secondary hits or extra surrounding lines, not as a first step.',
       inputSchema: jsonSchema(['id'], {
         id: { type: 'string' },
-        context_lines: { type: 'integer', minimum: 0, maximum: 50 }
+        context_lines: { type: 'integer', minimum: 0, maximum: 50 },
+        max_tokens: { type: 'integer', minimum: MIN_MCP_READ_CHUNK_MAX_TOKENS, maximum: MAX_MCP_READ_CHUNK_MAX_TOKENS, default: DEFAULT_MCP_READ_CHUNK_MAX_TOKENS }
       })
     },
     {
@@ -403,7 +413,10 @@ export async function callMcpTool(repo: Repo, name: McpToolName, args: unknown):
         return formatMcpGrepHits(await router.grepCode(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_GREP_MAX_TOKENS })
       }
     case 'read_chunk':
-      return router.readChunk(readChunkArgsSchema.parse(args))
+      {
+        const parsed = readChunkArgsSchema.parse(args)
+        return formatMcpReadChunk(await router.readChunk(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_READ_CHUNK_MAX_TOKENS })
+      }
     case 'index_status':
       return JSON.stringify(await router.indexStatus())
   }
@@ -480,7 +493,7 @@ export function createSdkServer(repo: Repo): McpServer {
     textResult(formatMcpGrepHits(await router.grepCode(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_GREP_MAX_TOKENS }))
   )
   server.registerTool('read_chunk', { description: toolDescription('read_chunk'), inputSchema: readChunkInputSchema }, async (args) =>
-    textResult(await router.readChunk(args))
+    textResult(formatMcpReadChunk(await router.readChunk(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_READ_CHUNK_MAX_TOKENS }))
   )
   server.registerTool('index_status', { description: toolDescription('index_status'), inputSchema: indexStatusInputSchema }, async () =>
     textResult(JSON.stringify(await router.indexStatus()))
@@ -636,6 +649,58 @@ export function formatMcpGrepHits(hits: GrepHit[], options: FormatMcpGrepHitsOpt
   }
 
   return rendered.join('\n')
+}
+
+export function formatMcpReadChunk(content: string, options: FormatMcpReadChunkOptions = {}): string {
+  const maxTokens = options.maxTokens
+  if (maxTokens === undefined) {
+    return content
+  }
+
+  const maxChars = maxTokens * 4
+  if (content.length <= maxChars) {
+    return content
+  }
+
+  const marker = readChunkTruncationMarker(Math.max(0, maxChars - 1))
+  if (!marker) {
+    return truncateWithEllipsis('content_truncated=true', maxChars)
+  }
+
+  const contentBudget = Math.max(0, maxChars - marker.length - 1)
+  const truncatedContent = truncateReadChunkContent(content, contentBudget)
+  if (!truncatedContent) {
+    return marker.length <= maxChars ? marker : truncateWithEllipsis(marker, maxChars)
+  }
+
+  return `${truncatedContent}\n${marker}`
+}
+
+function truncateReadChunkContent(content: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return ''
+  }
+  if (content.length <= maxChars) {
+    return content
+  }
+
+  const truncated = truncateWithEllipsis(content, maxChars)
+  return truncated.replace(/\n+$/g, '')
+}
+
+function readChunkTruncationMarker(maxChars?: number): string {
+  const full = 'content_truncated=true; raise max_tokens or narrow the chunk/range.'
+  if (maxChars === undefined || full.length <= maxChars) {
+    return full
+  }
+
+  const compact = 'content_truncated=true; raise max_tokens'
+  if (compact.length <= maxChars) {
+    return compact
+  }
+
+  const bare = 'content_truncated=true'
+  return bare.length <= maxChars ? bare : ''
 }
 
 function formatMcpGrepHit(hit: GrepHit, maxChars?: number): string {
