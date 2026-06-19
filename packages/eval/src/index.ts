@@ -266,8 +266,9 @@ export async function evaluateManifest(manifest: EvalManifest, options: Evaluate
     }
 
     const stagedRepoRoot = await stageBenchmarkRepo(repo)
+    let repoHandle: Awaited<ReturnType<typeof openRepo>> | undefined
     try {
-      const repoHandle = await openRepo(stagedRepoRoot)
+      repoHandle = await openRepo(stagedRepoRoot)
       await repoHandle.sync({ rebuild: true })
 
       for (const query of queries) {
@@ -286,7 +287,8 @@ export async function evaluateManifest(manifest: EvalManifest, options: Evaluate
         }
       }
     } finally {
-      await rm(stagedRepoRoot, { recursive: true, force: true })
+      await repoHandle?.close()
+      await removeStagedRepo(stagedRepoRoot)
     }
   }
 
@@ -470,6 +472,29 @@ async function clonePinnedRepo(gitUrl: string, ref: string, target: string): Pro
   await execFile('git', ['-C', target, 'checkout', '--detach', 'FETCH_HEAD'])
 }
 
+async function removeStagedRepo(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await rm(path, { recursive: true, force: true })
+      return
+    } catch (error) {
+      if (process.platform !== 'win32' || (!isNodeErrorCode(error, 'EBUSY') && !isNodeErrorCode(error, 'EPERM'))) {
+        throw error
+      }
+
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100 * (attempt + 1)))
+    }
+  }
+
+  try {
+    await rm(path, { recursive: true, force: true })
+  } catch (error) {
+    if (process.platform !== 'win32' || (!isNodeErrorCode(error, 'EBUSY') && !isNodeErrorCode(error, 'EPERM'))) {
+      throw error
+    }
+  }
+}
+
 async function measureCodesiftRun(
   repoRoot: string,
   repo: Awaited<ReturnType<typeof openRepo>>,
@@ -626,8 +651,28 @@ async function runCodesiftStdioFirstResult(repoRoot: string, query: GoldenQuery,
     })
     await waitForJsonRpcMessage(messages, (message) => rpcId(message) === 2, () => parseError, child)
   } finally {
+    child.stdin.end()
     child.kill()
+    await waitForChildExit(child)
   }
+}
+
+async function waitForChildExit(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return
+  }
+
+  await new Promise<void>((resolvePromise) => {
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL')
+      resolvePromise()
+    }, 5_000)
+
+    child.once('exit', () => {
+      clearTimeout(timeout)
+      resolvePromise()
+    })
+  })
 }
 
 function buildCodesiftToolCall(query: GoldenQuery, resultLimit: number): { name: string; arguments: Record<string, unknown> } {
@@ -1328,6 +1373,10 @@ function normalizeLatencyTolerance(value: number | undefined): number {
   }
 
   return value
+}
+
+function isNodeErrorCode(error: unknown, code: string): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === code
 }
 
 function isRipgrepMatchEvent(value: unknown): value is RipgrepMatchEvent {

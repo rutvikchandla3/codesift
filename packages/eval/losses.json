@@ -89,6 +89,7 @@
       "queryType": "nl-concept",
       "axes": [
         "latency.cold",
+        "latency.warm",
         "tokens"
       ]
     },

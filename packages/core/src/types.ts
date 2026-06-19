@@ -283,6 +283,7 @@ export interface Repo {
   readRange(file: string, startLine: number, endLine: number, options?: ReadRangeOptions): Promise<string>
   status(): Promise<RepoStatus>
   watch(options?: WatchOptions): Promise<StopWatching>
+  close(): Promise<void>
 }
 
 export interface EmbeddingBatchOptions {

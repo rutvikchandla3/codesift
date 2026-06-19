@@ -850,6 +850,16 @@ export class SqliteRepo implements Repo {
     }
   }
 
+  async close(): Promise<void> {
+    await this.databaseGate
+    await this.waitForDatabaseIdle()
+    if (this.db) {
+      this.db.close()
+      this.db = undefined
+      this.vectorExtensionLoaded = false
+    }
+  }
+
   async watch(options?: WatchOptions): Promise<StopWatching> {
     const debounceMs = normalizeWatchDebounceMs(options?.debounceMs)
     const syncController = new AbortController()
