@@ -7,6 +7,7 @@ import { execFile as execFileCallback, spawn, type ChildProcessWithoutNullStream
 import { promisify } from 'node:util'
 
 import { openRepo, type FindSymbolOptions, type GrepHit, type GrepOptions, type Range, type SearchHit, type SearchOptions, type SymbolDefinition } from '@codesift/core'
+import { formatMcpGrepHits, formatMcpSearchHits, formatMcpSymbols } from '@codesift/mcp'
 
 const execFile = promisify(execFileCallback)
 
@@ -276,7 +277,11 @@ export function formatSummary(summary: EvalSummary): string {
     return 'No benchmark queries configured.'
   }
 
-  const lines = ['codesift eval summary', '']
+  const lines = [
+    'codesift eval summary',
+    '(cold latency = prebuilt-index, MCP-spawn only — does NOT measure first-run indexing)',
+    ''
+  ]
 
   for (const row of summary.perQueryType) {
     lines.push(
@@ -543,8 +548,40 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
 
       const definitions = (await repo.findSymbol(query.query, options)).slice(0, resultLimit)
       const candidates = definitions.map(candidateFromSymbol)
-      const tokens = estimateTokenCount(formatSymbols(definitions))
-      return evaluateRankedCandidates(candidates, query, tokens, inspectionLimit)
+      const matchingRank = firstMatchingRank(candidates, query)
+      const taskSuccess = matchingRank !== null && matchingRank <= inspectionLimit
+
+      // Honest one-call accounting: find_symbol resolves in a single call only when
+      // the matching definition arrives with an inlined body that covers the
+      // expected lines. A body-less match (ambiguous lookup, withBody off, or a
+      // non-top match) still forces a follow-up read — count it as 2 calls.
+      let tokensToResolution = estimateTokenCount(formatMcpSymbols(definitions))
+      let callsToResolution = 1
+
+      if (matchingRank !== null) {
+        const matchingDef = definitions[matchingRank - 1]
+        const bodyResolves =
+          matchingDef?.body !== undefined &&
+          query.expectedLineRange !== undefined &&
+          rangesOverlap(matchingDef.range, query.expectedLineRange)
+
+        if (!bodyResolves && matchingDef) {
+          const followUp = await readRangeSafely(repo, matchingDef.file, matchingDef.range)
+          if (followUp !== null) {
+            tokensToResolution += estimateTokenCount(followUp)
+            callsToResolution = 2
+          }
+        }
+      }
+
+      return {
+        tokensToResolution,
+        callsToResolution,
+        taskSuccess,
+        recallAt5: matchingRank !== null && matchingRank <= 5 ? 1 : 0,
+        recallAt10: matchingRank !== null && matchingRank <= 10 ? 1 : 0,
+        meanReciprocalRank: matchingRank === null ? 0 : 1 / matchingRank
+      }
     }
     case 'string-literal':
     case 'error-trace': {
@@ -558,7 +595,7 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
       const pattern = query.grepPattern ?? query.query
       const hits = await repo.grep(pattern, grepOptions)
       const candidates = hits.map(candidateFromGrep)
-      const tokens = estimateTokenCount(formatGrepHits(hits))
+      const tokens = estimateTokenCount(formatMcpGrepHits(hits))
       return evaluateRankedCandidates(candidates, query, tokens, inspectionLimit)
     }
     case 'nl-concept': {
@@ -575,7 +612,7 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
       const matchingRank = firstMatchingRank(candidates, query)
       const taskSuccess = matchingRank !== null && matchingRank <= inspectionLimit
 
-      let tokensToResolution = hits.reduce((sum, hit) => sum + hit.tokensReturned, 0)
+      let tokensToResolution = estimateTokenCount(formatMcpSearchHits(hits))
       let callsToResolution = 1
 
       if (matchingRank !== null) {
@@ -990,24 +1027,16 @@ async function readChunkSafely(repo: Awaited<ReturnType<typeof openRepo>>, id: s
   }
 }
 
+async function readRangeSafely(repo: Awaited<ReturnType<typeof openRepo>>, file: string, range: Range): Promise<string | null> {
+  try {
+    return await repo.readRange(file, range.startLine, range.endLine)
+  } catch {
+    return null
+  }
+}
+
 function normalizePath(value: string): string {
   return value.replace(/\\/g, '/')
-}
-
-function formatSymbols(definitions: SymbolDefinition[]): string {
-  if (definitions.length === 0) {
-    return 'no_symbols'
-  }
-
-  return definitions.map((definition) => `${definition.kind} ${definition.name} ${definition.file}:${formatRange(definition.range)}`).join('\n')
-}
-
-function formatGrepHits(hits: GrepHit[]): string {
-  if (hits.length === 0) {
-    return 'no_matches'
-  }
-
-  return hits.map((hit) => `${hit.file}:${formatRange(hit.range)}:${hit.column} | ${compactSnippet(hit.snippet, 4)}`).join('\n')
 }
 
 function formatRipgrepHits(hits: RipgrepHit[]): string {
@@ -1022,19 +1051,6 @@ function formatRipgrepHits(hits: RipgrepHit[]): string {
       return `${header}\n${body}`
     })
     .join('\n')
-}
-
-function compactSnippet(snippet: string, lines: number): string {
-  return snippet
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .slice(0, lines)
-    .join(' ↩ ')
-}
-
-function formatRange(range: Range): string {
-  return range.startLine === range.endLine ? String(range.startLine) : `${range.startLine}-${range.endLine}`
 }
 
 function flattenLossAxes(losses: LossEntry[]): string[] {

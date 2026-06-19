@@ -44,8 +44,11 @@ export interface SearchHit {
   snippetRange: Range
   tokensReturned: number
   /**
-   * Full, VERBATIM enclosing-symbol source for an INLINED hit. Original
-   * indentation preserved; not trimmed, not flattened. Absent on compact hits.
+   * Full enclosing-symbol source for an INLINED hit. The block's common leading
+   * indentation is stripped (dedented) and runs of blank lines collapsed to one;
+   * code is never reordered, dropped, or per-line trimmed. The MCP renderer
+   * re-adds `NN | ` line-number prefixes so absolute location stays recoverable.
+   * Absent on compact hits.
    */
   body?: string
   /**
@@ -80,6 +83,14 @@ export interface SymbolDefinition {
   signature?: string
   parent?: string
   language?: string
+  /**
+   * Full enclosing-symbol source for the top exact match when body inlining is
+   * enabled. Dedented and blank-collapsed, then capped like a search hit body
+   * (see {@link SearchHit.body}). Present only on the top definition of an
+   * unambiguous lookup so the caller resolves the identifier in one call. Absent
+   * on compact/ambiguous rows.
+   */
+  body?: string
 }
 
 export interface SearchOptions {
@@ -126,6 +137,14 @@ export interface GrepOptions {
 export interface FindSymbolOptions {
   kind?: SymbolKind | SymbolKind[]
   pathGlob?: string
+  /**
+   * Inline the verbatim enclosing-symbol body for the top exact match, so the
+   * caller resolves an identifier in a SINGLE call (no follow-up read). Default
+   * true. The body is attached only to the top match and only when the lookup is
+   * unambiguous (≤3 exact rows); partial/fuzzy matches and broader collisions stay
+   * compact. Capped like search bodies. Set false for a compact name→location list.
+   */
+  withBody?: boolean
 }
 
 export interface SyncProgressEvent {

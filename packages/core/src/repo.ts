@@ -137,8 +137,19 @@ const DEFAULT_SNIPPET_LINE_CHAR_LIMIT = 40
 const SEARCH_HIT_TOKEN_OVERHEAD = 12
 const INLINE_BODY_MAX_TOKENS = 400
 const INLINE_BODY_MAX_LINES = 50
+// Approximate token cost of the `NN | ` line-number prefix the MCP renderer
+// prepends to every emitted body/snippet line. Folding it into the token math
+// keeps the budget honest about what the agent actually receives.
+const PREFIX_TOKEN_COST = 2
+// The MCP compact (no-body) snippet renderer caps at this many lines; the token
+// estimate mirrors it so prefix cost is not over-counted for compact hits.
+const COMPACT_SNIPPET_MAX_LINES = 4
 const INLINE_BODY_TRUNCATION_MARKER = '… (truncated — read_chunk <id> for full)'
 const INLINE_RANK2_SCORE_MARGIN = 0.6
+// find_symbol inlines the top match's body only when the lookup is unambiguous.
+// Above this many exact rows the identifier collides across the repo, so picking
+// one body to inline would be misleading — keep every row compact instead.
+const FIND_SYMBOL_INLINE_MAX_EXACT_ROWS = 3
 const RERANK_CANDIDATE_LIMIT = 25
 const RERANK_SNIPPET_CHAR_LIMIT = 1000
 const VECTOR_SEARCH_UNAVAILABLE_MESSAGE = 'vector search unavailable (native dep), lexical/symbol still works'
@@ -666,7 +677,28 @@ export class SqliteRepo implements Repo {
 
     const rows = [...exactRows, ...partialRows]
 
-      return rows.map((row) => {
+    // One-call moat: inline the verbatim enclosing-symbol body for the top exact
+    // match when the lookup is unambiguous, so an identifier query resolves
+    // without a mandatory follow-up read. Disk-fresh, capped, never throws.
+    let topBody: string | undefined
+    if (
+      options?.withBody !== false &&
+      exactRows.length > 0 &&
+      exactRows.length <= FIND_SYMBOL_INLINE_MAX_EXACT_ROWS
+    ) {
+      const top = exactRows[0]!
+      try {
+        const source = await this.readRange(top.file_path, top.start_line, top.end_line)
+        const { body } = capInlineBody(source)
+        if (body) {
+          topBody = body
+        }
+      } catch {
+        // A disk failure or out-of-range read leaves every row compact.
+      }
+    }
+
+      return rows.map((row, index) => {
         const definition: SymbolDefinition = {
           id: String(row.id),
           name: row.name,
@@ -688,6 +720,11 @@ export class SqliteRepo implements Repo {
 
         if (row.language) {
           definition.language = row.language
+        }
+
+        // Only the top exact row (rows[0] when exactRows is non-empty) carries a body.
+        if (index === 0 && topBody !== undefined) {
+          definition.body = topBody
         }
 
         return definition
@@ -1958,14 +1995,24 @@ async function tryInlineBody(
 /**
  * Cap an inlined body to ~{@link INLINE_BODY_MAX_TOKENS} tokens OR
  * ~{@link INLINE_BODY_MAX_LINES} lines, whichever is smaller, appending a
- * truncation marker when the source overflows. Indentation is preserved.
+ * truncation marker when the source overflows. Before capping, runs of blank
+ * lines are collapsed to one and the leading indentation common to the whole
+ * block is stripped (dedented) — code is never reordered, dropped, or per-line
+ * trimmed. The MCP renderer re-adds `NN | ` line prefixes, so absolute column
+ * stays recoverable from the line number, and that prefix cost is folded into
+ * the returned token count.
  */
 function capInlineBody(source: string): { body: string; tokens: number } {
   if (!source) {
     return { body: '', tokens: 0 }
   }
 
-  const lines = source.split('\n')
+  let lines = collapseBlankRuns(source.split('\n'))
+  const dedent = commonLeadingWhitespace(lines)
+  if (dedent) {
+    lines = lines.map((line) => (line.startsWith(dedent) ? line.slice(dedent.length) : line))
+  }
+
   let truncated = false
   let kept = lines
 
@@ -1974,13 +2021,61 @@ function capInlineBody(source: string): { body: string; tokens: number } {
     truncated = true
   }
 
-  while (estimateTokenCount(kept.join('\n')) > INLINE_BODY_MAX_TOKENS && kept.length > 1) {
+  while (renderedBodyTokens(kept.join('\n')) > INLINE_BODY_MAX_TOKENS && kept.length > 1) {
     kept = kept.slice(0, -1)
     truncated = true
   }
 
   const body = truncated ? `${kept.join('\n')}\n${INLINE_BODY_TRUNCATION_MARKER}` : kept.join('\n')
-  return { body, tokens: estimateTokenCount(body) }
+  return { body, tokens: renderedBodyTokens(body) }
+}
+
+/** Token count of a body INCLUDING the per-line `NN | ` render prefix. */
+function renderedBodyTokens(text: string): number {
+  if (!text) {
+    return 0
+  }
+  return estimateTokenCount(text) + text.split('\n').length * PREFIX_TOKEN_COST
+}
+
+/** Collapse runs of 2+ consecutive blank lines into a single blank line. */
+function collapseBlankRuns(lines: string[]): string[] {
+  const out: string[] = []
+  let lastBlank = false
+  for (const line of lines) {
+    const blank = line.trim() === ''
+    if (blank && lastBlank) {
+      continue
+    }
+    out.push(line)
+    lastBlank = blank
+  }
+  return out
+}
+
+/** Longest leading-whitespace prefix shared by every non-blank line. */
+function commonLeadingWhitespace(lines: string[]): string {
+  let prefix: string | null = null
+  for (const line of lines) {
+    if (line.trim() === '') {
+      continue
+    }
+    const leading = /^[ \t]*/.exec(line)![0]
+    if (prefix === null) {
+      prefix = leading
+      continue
+    }
+    let index = 0
+    const max = Math.min(prefix.length, leading.length)
+    while (index < max && prefix[index] === leading[index]) {
+      index += 1
+    }
+    prefix = prefix.slice(0, index)
+    if (prefix === '') {
+      break
+    }
+  }
+  return prefix ?? ''
 }
 
 function buildSearchHit(ranked: RankedChunkRow, query: string, snippetTokenBudget: number): SearchHit {
@@ -2036,7 +2131,15 @@ function normalizeSearchTokenBudget(value: number | undefined): number | undefin
 
 function estimateSearchHitTokens(row: ChunkRow, snippet: string): number {
   const header = `${row.file_path}:${row.start_line}-${row.end_line} ${row.symbol ?? ''} ${row.kind ?? ''}`
-  return SEARCH_HIT_TOKEN_OVERHEAD + estimateTokenCount(header) + estimateTokenCount(snippet)
+  // The compact renderer emits up to COMPACT_SNIPPET_MAX_LINES lines, each with a
+  // `NN | ` prefix; reflect that prefix cost so the budget matches the output.
+  const snippetLines = snippet ? Math.min(snippet.split('\n').length, COMPACT_SNIPPET_MAX_LINES) : 0
+  return (
+    SEARCH_HIT_TOKEN_OVERHEAD +
+    estimateTokenCount(header) +
+    estimateTokenCount(snippet) +
+    snippetLines * PREFIX_TOKEN_COST
+  )
 }
 
 function estimateTokenCount(value: string): number {

@@ -15,6 +15,7 @@ import {
   createStdioServer,
   formatMcpGrepHits,
   formatMcpSearchHits,
+  formatMcpSymbols,
   getToolDefinitions
 } from '../src/index.js'
 
@@ -111,7 +112,22 @@ describe('@codesift/mcp server', () => {
 
     expect(hits[0]?.file).toBe('src/demo.ts')
     expect(hits[0]?.body).toContain("return 'demo'")
-    expect(await router.findSymbol({ name: 'demoValue' })).toHaveLength(1)
+
+    const symbols = await router.findSymbol({ name: 'demoValue' })
+    expect(symbols).toHaveLength(1)
+    // find_symbol resolves the identifier in one call: the top match carries a
+    // paste-ready body, rendered as a line-numbered block.
+    expect(symbols[0]?.body).toContain("return 'demo'")
+    const renderedSymbols = formatMcpSymbols(symbols)
+    expect(renderedSymbols).toContain('#1 function demoValue src/demo.ts:')
+    expect(renderedSymbols).toContain("| export function demoValue")
+    expect(renderedSymbols).toContain("return 'demo'")
+
+    // with_body:false yields a compact name→location row (no body block).
+    const compactSymbols = await router.findSymbol({ name: 'demoValue', with_body: false })
+    expect(compactSymbols[0]?.body).toBeUndefined()
+    expect(formatMcpSymbols(compactSymbols)).not.toContain("return 'demo'")
+
     expect(grepHits[0]?.file).toBe('src/demo.ts')
     expect(await router.readChunk({ id: hits[0]!.id })).toContain("return 'demo'")
     expect((await router.indexStatus()).indexed).toBe(true)

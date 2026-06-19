@@ -65,6 +65,9 @@ importers:
       '@codesift/core':
         specifier: workspace:*
         version: link:../core
+      '@codesift/mcp':
+        specifier: workspace:*
+        version: link:../mcp
       better-sqlite3:
         specifier: ^12.10.0
         version: 12.10.0

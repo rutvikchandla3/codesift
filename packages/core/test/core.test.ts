@@ -640,6 +640,81 @@ describe('@codesift/core search body inlining', () => {
   })
 })
 
+describe('@codesift/core find_symbol body inlining', () => {
+  it('inlines the verbatim body for the top exact match by default and suppresses it on withBody:false', async () => {
+    const repoRoot = await createDemoRepository('codesift-findsymbol-body-')
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const [withBody] = await repo.findSymbol('verifyJwtToken')
+    expect(withBody?.file).toBe('src/auth/jwt.ts')
+    const fresh = await repo.readRange(withBody!.file, withBody!.range.startLine, withBody!.range.endLine)
+    expect(withBody?.body).toBe(fresh)
+    expect(withBody?.body).toContain('export function verifyJwtToken')
+
+    const [compact] = await repo.findSymbol('verifyJwtToken', { withBody: false })
+    expect(compact?.file).toBe('src/auth/jwt.ts')
+    expect(compact?.body).toBeUndefined()
+  })
+
+  it('does not inline when the identifier collides across more than three exact rows', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-findsymbol-collide-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    for (let index = 0; index < 4; index += 1) {
+      await writeFile(
+        join(repoRoot, 'src', `mod${index}.ts`),
+        `export function collidingHandler(): number {\n  return ${index}\n}\n`,
+        'utf8'
+      )
+    }
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const defs = await repo.findSymbol('collidingHandler')
+    expect(defs.length).toBe(4)
+    expect(defs.every((def) => def.body === undefined)).toBe(true)
+  })
+
+  it('leaves rows compact when the file is gone at lookup time', async () => {
+    const repoRoot = await createDemoRepository('codesift-findsymbol-missing-')
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    await unlink(join(repoRoot, 'src', 'auth', 'jwt.ts'))
+    const [def] = await repo.findSymbol('verifyJwtToken')
+    expect(def?.file).toBe('src/auth/jwt.ts')
+    expect(def?.body).toBeUndefined()
+  })
+
+  it('dedents the block-common indentation and collapses blank runs in the inlined body', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-findsymbol-dedent-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    await writeFile(
+      join(repoRoot, 'src', 'svc.ts'),
+      `export class Service {\n  computeDeeplyNestedValue(): number {\n    const base = 1\n\n\n    return base + 2\n  }\n}\n`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const [def] = await repo.findSymbol('computeDeeplyNestedValue')
+    expect(def?.body).toBeDefined()
+    const body = def!.body!
+    // The method's own 2-space indent is the block-common prefix and is stripped,
+    // so the signature starts at column 0 while inner indentation is preserved.
+    expect(body.split('\n')[0]).toBe('computeDeeplyNestedValue(): number {')
+    expect(body).toContain('\n  const base = 1')
+    // Runs of 2+ blank lines collapse to one (three newlines never remain).
+    expect(body).not.toMatch(/\n[ \t]*\n[ \t]*\n/)
+    expect(body).toContain('return base + 2')
+  })
+})
+
 describe('@codesift/core import-resolved usages', () => {
   it('bundles TS/JS import-resolved and same-file usages for the top definition hit', async () => {
     const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-usages-ts-'))

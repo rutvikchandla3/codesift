@@ -14,7 +14,8 @@
       "queryId": "cookie-parse-identifier",
       "queryType": "exact-identifier",
       "axes": [
-        "latency.cold"
+        "latency.cold",
+        "tokens"
       ]
     },
     {

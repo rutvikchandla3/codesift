@@ -64,6 +64,7 @@ export interface FindSymbolArgs {
   name: string
   kind?: FindSymbolOptions['kind'] | undefined
   path_glob?: string | undefined
+  with_body?: boolean | undefined
 }
 
 export interface GrepCodeArgs {
@@ -154,7 +155,8 @@ const searchCodeInputSchema = {
 const findSymbolInputSchema = {
   name: z.string().min(1).describe('Exact or partial symbol name, e.g. TokenVerifier or verifyJwtToken.'),
   kind: kindFilterSchema.optional().describe('Optional symbol kind filter.'),
-  path_glob: z.string().min(1).optional().describe('Repo-relative glob, e.g. "src/auth/**".')
+  path_glob: z.string().min(1).optional().describe('Repo-relative glob, e.g. "src/auth/**".'),
+  with_body: z.boolean().optional().describe('Inline the top exact match\'s full definition body so it resolves in one call. Default true; set false for a compact name→location list.')
 }
 
 const grepCodeInputSchema = {
@@ -236,11 +238,12 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
     },
     {
       name: 'find_symbol',
-      description: 'Exact identifier/definition lookup from the symbols table. Use before search_code for class/function/type names.',
+      description: 'Exact identifier/definition lookup from the symbols table. Returns the top match\'s full definition body inline (no follow-up read normally needed). Use before search_code for class/function/type names.',
       inputSchema: jsonSchema(['name'], {
         name: { type: 'string' },
         kind: kindJsonSchema(),
-        path_glob: { type: 'string' }
+        path_glob: { type: 'string' },
+        with_body: { type: 'boolean', default: true }
       })
     },
     {
@@ -317,6 +320,10 @@ export function createRouter(repo: Repo): McpRouter {
 
       if (args.path_glob) {
         options.pathGlob = args.path_glob
+      }
+
+      if (args.with_body !== undefined) {
+        options.withBody = args.with_body
       }
 
       return repo.findSymbol(args.name, options)
@@ -559,13 +566,21 @@ function formatHitSymbol(hit: SearchHit): string {
   return ` ${[hit.parent, hit.symbol].filter(Boolean).join(' > ')}`
 }
 
-function formatMcpSymbols(definitions: SymbolDefinition[]): string {
+export function formatMcpSymbols(definitions: SymbolDefinition[]): string {
   if (definitions.length === 0) {
     return 'no_symbols'
   }
 
   return definitions
-    .map((definition, index) => `#${index + 1} ${definition.kind} ${definition.name} ${definition.file}:${formatRange(definition.range.startLine, definition.range.endLine)}`)
+    .map((definition, index) => {
+      const header = `#${index + 1} ${definition.kind} ${definition.name} ${definition.file}:${formatRange(definition.range.startLine, definition.range.endLine)}`
+      // The top exact match carries a paste-ready body so the identifier resolves
+      // in a single call; render it with the same line-numbered block as search.
+      if (definition.body !== undefined) {
+        return `${header}\n${formatBodyBlock(definition.body, definition.range.startLine)}`
+      }
+      return header
+    })
     .join('\n')
 }
 

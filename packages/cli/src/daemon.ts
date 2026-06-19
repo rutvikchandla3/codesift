@@ -4,7 +4,7 @@ import { rm } from 'node:fs/promises'
 import { resolve } from 'node:path'
 
 import { handleMcpJsonRpcRequest, type McpJsonRpcRequest } from '@codesift/mcp'
-import { openRepo, type Repo } from '@codesift/core'
+import { openRepo, type Repo, type StopWatching } from '@codesift/core'
 
 import { getDefaultDaemonSocketPath } from './daemon-path.js'
 
@@ -15,6 +15,53 @@ interface DaemonEnvelope {
 
 const DEFAULT_DAEMON_IDLE_MS = 5 * 60 * 1000
 
+export interface RepoCache {
+  getRepo(root: string): Promise<Repo>
+  stopAll(): Promise<void>
+}
+
+/**
+ * Cache one Repo per root and keep each one's index fresh by attaching
+ * Repo.watch() the first time a root is opened. watch() is fire-and-forget (it
+ * scans the manifest, so awaiting it would stall the request) and its stop
+ * handle is retained for clean shutdown. `open` is injectable for tests.
+ */
+export function createRepoCache(open: (root: string) => Promise<Repo> = openRepo): RepoCache {
+  const repos = new Map<string, Repo>()
+  const watchers = new Map<string, StopWatching>()
+
+  const getRepo = async (root: string): Promise<Repo> => {
+    const repoRoot = resolve(root)
+    const existing = repos.get(repoRoot)
+    if (existing) {
+      return existing
+    }
+
+    const repo = await open(repoRoot)
+    repos.set(repoRoot, repo)
+    // Do NOT await: watch() scans the manifest before returning its stop handle.
+    void repo
+      .watch()
+      .then((stop) => {
+        watchers.set(repoRoot, stop)
+      })
+      .catch(() => {
+        // A watch failure must never take down the daemon; queries still work,
+        // they just fall back to the existing markStaleHits backstop.
+      })
+    return repo
+  }
+
+  const stopAll = async (): Promise<void> => {
+    const stops = [...watchers.values()]
+    watchers.clear()
+    repos.clear()
+    await Promise.all(stops.map((stop) => stop().catch(() => {})))
+  }
+
+  return { getRepo, stopAll }
+}
+
 export async function runDaemon(argv = process.argv): Promise<void> {
   const socketPath = readOption(argv, '--socket') ?? process.env.CODESIFT_DAEMON_SOCKET ?? getDefaultDaemonSocketPath()
   const idleMs = readNumberOption(argv, '--idle-ms') ?? readNumberEnv('CODESIFT_DAEMON_IDLE_MS') ?? DEFAULT_DAEMON_IDLE_MS
@@ -22,7 +69,8 @@ export async function runDaemon(argv = process.argv): Promise<void> {
 }
 
 async function startDaemon(socketPath: string, idleMs: number): Promise<void> {
-  const repos = new Map<string, Repo>()
+  const cache = createRepoCache()
+  const getRepo = cache.getRepo
   let activeSockets = 0
   let idleTimer: NodeJS.Timeout | undefined
   let server: Server
@@ -35,22 +83,12 @@ async function startDaemon(socketPath: string, idleMs: number): Promise<void> {
 
     if (idleMs > 0 && activeSockets === 0) {
       idleTimer = setTimeout(() => {
-        server.close(() => process.exit(0))
+        void cache.stopAll().finally(() => {
+          server.close(() => process.exit(0))
+        })
       }, idleMs)
       idleTimer.unref()
     }
-  }
-
-  const getRepo = async (root: string): Promise<Repo> => {
-    const repoRoot = resolve(root)
-    const existing = repos.get(repoRoot)
-    if (existing) {
-      return existing
-    }
-
-    const repo = await openRepo(repoRoot)
-    repos.set(repoRoot, repo)
-    return repo
   }
 
   server = createServer((socket) => {
