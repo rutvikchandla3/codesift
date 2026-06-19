@@ -155,55 +155,53 @@ export type McpJsonRpcResponse =
   | { jsonrpc: '2.0'; id: string | number | null; error: { code: number; message: string; data?: unknown } }
 
 export const MCP_SERVER_INSTRUCTIONS = [
-  'codesift is the repo search tool. Prefer it before host grep/read-file flows because results are compact and include stable ids for follow-up reads.',
-  'Routing policy: use find_symbol for exact identifiers/definitions; use grep_code for literal strings, env vars, error messages, operators, or regex; use search_code for concepts/behaviors/natural language.',
-  'search_code returns the complete top result inline (the full enclosing symbol body); no follow-up read is normally needed. Use read_chunk only to expand an ADDITIONAL hit beyond the top result or to widen context.',
-  'For search_code, start with k=5-8 and set max_tokens when context is tight. For grep_code, keep context_lines small unless the user asks for surrounding code.',
-  'If index_status reports no index, stale data, or a running/failed/aborted sync, suggest running codesift index before relying on results.'
+  'Use codesift before host grep/read. Route identifiers/definitions->find_symbol; literals/env/errors/operators/regex->grep_code; concepts/unknown names->search_code.',
+  'Top search_code body is inline; read_chunk only for non-top hits/wider context. Broad search_code: k=5-8. Keep grep_code context small.',
+  'Check index_status; if missing/stale/running/failed/aborted, warn and suggest codesift index/sync.'
 ].join('\n')
 
 const symbolKindSchema = z.enum(SYMBOL_KINDS)
 const kindFilterSchema = z.union([symbolKindSchema, z.array(symbolKindSchema)])
 
 const searchCodeInputSchema = {
-  query: z.string().min(1).describe('Natural-language, behavior, or symbol-aware query. Use grep_code instead for exact literals/regex.'),
-  k: z.number().int().positive().max(50).optional().describe('Maximum hits to return. Default is 8.'),
-  lang: z.array(z.string().min(1)).optional().describe('Language filter, e.g. ["typescript"], ["python"].'),
-  path_glob: z.string().min(1).optional().describe('Repo-relative glob, e.g. "src/**".'),
-  kind: kindFilterSchema.optional().describe('Symbol kind filter for matching chunks.'),
-  max_tokens: z.number().int().positive().max(4000).optional().describe('Maximum approximate tokens to return across compact hits. Default 700.'),
-  single_best: z.boolean().optional().describe('Return only the highest-confidence answer, useful for identifier-exact lookups.'),
-  context: z.enum(['sig', 'body']).optional().describe('Inline policy: sig=compact signatures/snippets only, body=inline full bodies wherever the budget allows.'),
-  with_usages: z.boolean().optional().describe('Bundle top-N import-resolved/local usage sites for the top definition hit (TS/JS + Python only).')
+  query: z.string().min(1).describe('Concept, behavior, or fuzzy name; not exact literals/regex.'),
+  k: z.number().int().positive().max(50).optional().describe('Max hits. Default 8.'),
+  lang: z.array(z.string().min(1)).optional().describe('Language filter, e.g. ["typescript"].'),
+  path_glob: z.string().min(1).optional().describe('Repo glob, e.g. "src/**".'),
+  kind: kindFilterSchema.optional().describe('Symbol kind filter.'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.'),
+  single_best: z.boolean().optional().describe('Return only best hit.'),
+  context: z.enum(['sig', 'body']).optional().describe('sig=snippets; body=inline bodies within budget.'),
+  with_usages: z.boolean().optional().describe('Add top usage sites for the top definition hit.')
 }
 
 const findSymbolInputSchema = {
-  name: z.string().min(1).describe('Exact or partial symbol name, e.g. TokenVerifier or verifyJwtToken.'),
-  kind: kindFilterSchema.optional().describe('Optional symbol kind filter.'),
-  path_glob: z.string().min(1).optional().describe('Repo-relative glob, e.g. "src/auth/**".'),
-  with_body: z.boolean().optional().describe('Inline the top exact match\'s full definition body so it resolves in one call. Default true; set false for a compact name→location list.'),
-  max_tokens: z.number().int().positive().max(4000).optional().describe('Maximum approximate tokens to return across symbol definitions. Default 700.')
+  name: z.string().min(1).describe('Exact/partial symbol name.'),
+  kind: kindFilterSchema.optional().describe('Symbol kind filter.'),
+  path_glob: z.string().min(1).optional().describe('Repo glob, e.g. "src/auth/**".'),
+  with_body: z.boolean().optional().describe('Inline top exact body. Default true.'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.')
 }
 
 const grepCodeInputSchema = {
-  pattern: z.string().min(1).describe('Literal byte/string by default. Set regex=true for regular expressions.'),
-  regex: z.boolean().optional().describe('Treat pattern as a JavaScript regular expression. Default false for byte-exact literal search.'),
-  ignore_case: z.boolean().optional().describe('Case-insensitive matching, like rg -i.'),
-  whole_word: z.boolean().optional().describe('Match only whole identifier/word occurrences, like rg -w.'),
-  multiline: z.boolean().optional().describe('Allow regex dot to span newlines and report multi-line matches.'),
+  pattern: z.string().min(1).describe('Literal by default; set regex=true for regex.'),
+  regex: z.boolean().optional().describe('Use JavaScript regex. Default false.'),
+  ignore_case: z.boolean().optional().describe('Case-insensitive match.'),
+  whole_word: z.boolean().optional().describe('Whole word/identifier match.'),
+  multiline: z.boolean().optional().describe('Allow multi-line regex matches.'),
   lang: z.array(z.string().min(1)).optional().describe('Language filter, e.g. ["typescript"].'),
-  path_glob: z.string().min(1).optional().describe('Repo-relative glob, e.g. "packages/core/**".'),
-  context_lines: z.number().int().min(0).max(20).optional().describe('Symmetric context lines, like rg -C.'),
-  before_context_lines: z.number().int().min(0).max(20).optional().describe('Lines before each match, like rg -B.'),
-  after_context_lines: z.number().int().min(0).max(20).optional().describe('Lines after each match, like rg -A.'),
-  max_matches: z.number().int().positive().max(1000).optional().describe('Maximum matches to return. Default 1000.'),
-  max_tokens: z.number().int().positive().max(4000).optional().describe('Maximum approximate tokens to return across compact matches. Default 700.')
+  path_glob: z.string().min(1).optional().describe('Repo glob, e.g. "packages/core/**".'),
+  context_lines: z.number().int().min(0).max(20).optional().describe('Lines before/after each match.'),
+  before_context_lines: z.number().int().min(0).max(20).optional().describe('Lines before each match.'),
+  after_context_lines: z.number().int().min(0).max(20).optional().describe('Lines after each match.'),
+  max_matches: z.number().int().positive().max(1000).optional().describe('Max matches. Default 1000.'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.')
 }
 
 const readChunkInputSchema = {
-  id: z.string().min(1).describe('Stable chunk id returned by search_code.'),
-  context_lines: z.number().int().min(0).max(50).optional().describe('Extra lines before/after the chunk.'),
-  max_tokens: z.number().int().min(MIN_MCP_READ_CHUNK_MAX_TOKENS).max(MAX_MCP_READ_CHUNK_MAX_TOKENS).optional().describe('Maximum approximate tokens to return from this chunk. Default 1000.')
+  id: z.string().min(1).describe('Stable search_code hit id.'),
+  context_lines: z.number().int().min(0).max(50).optional().describe('Extra surrounding lines.'),
+  max_tokens: z.number().int().min(MIN_MCP_READ_CHUNK_MAX_TOKENS).max(MAX_MCP_READ_CHUNK_MAX_TOKENS).optional().describe('Approx output tokens. Default 1000.')
 }
 
 const indexStatusInputSchema = {}
@@ -245,8 +243,8 @@ class StdioMcpServerHandle implements McpServerHandle {
 export function getToolDefinitions(): readonly McpToolDefinition[] {
   const provider = getDefaultEmbeddingProvider()
   const searchDescription = isLearnedEmbeddingProvider(provider)
-    ? 'Concept/behavior search over the current repo using hybrid lexical + semantic retrieval. Returns the complete top result inline (full enclosing symbol body); no follow-up read is normally needed. Use for natural-language questions; prefer grep_code for exact literals/regex and find_symbol for definitions.'
-    : 'Concept/behavior search over the current repo using lexical retrieval. Returns the complete top result inline (full enclosing symbol body); no follow-up read is normally needed. Use for natural-language questions; prefer grep_code for exact literals/regex and find_symbol for definitions.'
+    ? 'Hybrid lexical + semantic repo search for concepts/unknown names. Top body inline; read_chunk for other hits. Use grep_code for literals/regex, find_symbol for definitions.'
+    : 'Lexical repo search for concepts/unknown names. Top body inline; read_chunk for other hits. Use grep_code for literals/regex, find_symbol for definitions.'
 
   return [
     {
@@ -266,7 +264,7 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
     },
     {
       name: 'find_symbol',
-      description: 'Exact identifier/definition lookup from the symbols table. Returns the top match\'s full definition body inline (no follow-up read normally needed). Use before search_code for class/function/type names.',
+      description: 'Exact identifier/definition lookup. Top unambiguous body inline; use before search_code for names.',
       inputSchema: jsonSchema(['name'], {
         name: { type: 'string' },
         kind: kindJsonSchema(),
@@ -277,7 +275,7 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
     },
     {
       name: 'grep_code',
-      description: 'Literal, byte-exact, or regex search over indexed repo files. Use instead of host grep for env vars, error strings, operators, and regex.',
+      description: 'Literal/regex indexed-file search for env vars, errors, operators, exact strings; keep context small.',
       inputSchema: jsonSchema(['pattern'], {
         pattern: { type: 'string' },
         regex: { type: 'boolean', default: false },
@@ -295,7 +293,7 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
     },
     {
       name: 'read_chunk',
-      description: 'Expand an ADDITIONAL search_code hit id into its source chunk, or widen context around one. The top search_code result is already returned inline, so this is rarely needed for the best hit; use it for secondary hits or extra surrounding lines, not as a first step.',
+      description: 'Read non-top hit/wider context by id. Not needed for top search_code/find_symbol hits returned inline.',
       inputSchema: jsonSchema(['id'], {
         id: { type: 'string' },
         context_lines: { type: 'integer', minimum: 0, maximum: 50 },
@@ -304,7 +302,7 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
     },
     {
       name: 'index_status',
-      description: 'Inspect index freshness, sync/crash state, counts, provider, and vector availability before relying on search results.',
+      description: 'Inspect index freshness, sync state, counts, provider, vectors.',
       inputSchema: jsonSchema([], {})
     }
   ]

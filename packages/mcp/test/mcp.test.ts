@@ -66,25 +66,49 @@ describe('@codesift/mcp server', () => {
       context: { type: 'string', enum: ['sig', 'body'] },
       with_usages: { type: 'boolean' }
     })
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('use grep_code for literal strings')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('literals/env/errors/operators/regex->grep_code')
   })
 
   it('asserts single-call sufficiency in instructions and tool descriptions', () => {
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('search_code returns the complete top result inline')
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('no follow-up read is normally needed')
-    expect(MCP_SERVER_INSTRUCTIONS.toLowerCase()).toContain('read_chunk only to expand an additional hit')
+    const lowerInstructions = MCP_SERVER_INSTRUCTIONS.toLowerCase()
+    expect(lowerInstructions).toContain('top search_code body is inline')
+    expect(lowerInstructions).toContain('read_chunk only for non-top hits/wider context')
 
     const tools = getToolDefinitions()
     const searchDescription = tools.find((tool) => tool.name === 'search_code')?.description ?? ''
-    expect(searchDescription).toContain('complete top result inline')
-    expect(searchDescription.toLowerCase()).toContain('no follow-up read is normally needed')
+    expect(searchDescription.toLowerCase()).toContain('top body inline')
+
+    const findDescription = tools.find((tool) => tool.name === 'find_symbol')?.description ?? ''
+    expect(findDescription.toLowerCase()).toContain('top unambiguous body inline')
 
     const readDescription = tools.find((tool) => tool.name === 'read_chunk')?.description ?? ''
-    expect(readDescription).toContain('ADDITIONAL')
-    expect(readDescription.toLowerCase()).toContain('already returned inline')
+    expect(readDescription.toLowerCase()).toContain('not needed for top search_code/find_symbol hits')
+    expect(readDescription.toLowerCase()).toContain('returned inline')
 
     // The routing guidance for find_symbol/grep_code is preserved.
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('use find_symbol for exact identifiers/definitions')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('identifiers/definitions->find_symbol')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('concepts/unknown names->search_code')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('Broad search_code: k=5-8')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('Check index_status')
+  })
+
+  it('keeps control-plane metadata under the MCP budget', () => {
+    const tools = getToolDefinitions()
+    const payload = JSON.stringify({ instructions: MCP_SERVER_INSTRUCTIONS, tools })
+    const toolDescriptionCeilings = new Map([
+      ['search_code', 190],
+      ['find_symbol', 130],
+      ['grep_code', 120],
+      ['read_chunk', 120],
+      ['index_status', 90]
+    ])
+
+    expect(payload.length).toBeLessThanOrEqual(3500)
+    expect(Math.ceil(payload.length / 4)).toBeLessThanOrEqual(875)
+    expect(MCP_SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(430)
+    for (const tool of tools) {
+      expect(tool.description.length).toBeLessThanOrEqual(toolDescriptionCeilings.get(tool.name) ?? 120)
+    }
   })
 
   it('uses honest lexical wording by default and semantic wording with a learned provider', () => {
