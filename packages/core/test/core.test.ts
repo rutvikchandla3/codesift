@@ -21,7 +21,7 @@ import {
   type EmbeddingProvider,
   type SyncProgressEvent
 } from '../src/index.js'
-import { buildFtsQuery, queryShouldUseVectorSearch } from '../src/repo.js'
+import { buildFtsQuery, nameTermCoverage, queryConceptTerms, queryShouldUseVectorSearch } from '../src/repo.js'
 
 const temporaryDirectories: string[] = []
 const originalEmbeddingProvider = process.env.CODESIFT_EMBEDDING_PROVIDER
@@ -919,5 +919,243 @@ validate token signature credential check validate token signature credential ch
     const reranked = await repo.search(RERANK_QUERY, { k: 5, context: 'sig', rerank: true })
 
     expect(reranked.map((hit) => hit.file)).toEqual(fused.map((hit) => hit.file))
+  })
+})
+
+describe('@codesift/core progressive FTS relaxation', () => {
+  it('recalls the target when an over-constrained concept query names a word the target lacks', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-relax-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    await writeFile(
+      join(repoRoot, 'src', 'signature.ts'),
+      `// Validate the JWT token signature before continuing.
+export function validateJwtSignature(token: string): boolean {
+  return token.split('.').length === 3
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'verify.ts'),
+      `// Verify a JWT token signature against the configured key.
+export function verifyTokenSignature(token: string): boolean {
+  return validateJwtSignature(token)
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'decode.ts'),
+      `// Decode a JWT token and read its signature payload.
+export function decodeJwtToken(token: string): string {
+  return token.split('.')[1] ?? ''
+}
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    // "webauthn" is indexed nowhere, so the unrelaxed full-AND FTS query requires a
+    // term the target lacks — it would match zero rows.
+    const overConstrained = 'validate jwt token signature webauthn'
+    expect(buildFtsQuery(overConstrained)).toContain('"webauthn"')
+    expect(buildFtsQuery(overConstrained)).toContain(' AND ')
+
+    // The relaxation ladder drops the absent word and still recalls the function.
+    const hits = await repo.search(overConstrained, { k: 5 })
+    expect(hits.length).toBeGreaterThan(0)
+    expect(hits.some((hit) => hit.file.endsWith('signature.ts'))).toBe(true)
+
+    // Sanity: the absent word in isolation recalls nothing, so the hit above came
+    // from relaxation widening the query, not from "webauthn" matching anything.
+    const absentOnly = await repo.search('webauthn', { k: 5 })
+    expect(absentOnly).toHaveLength(0)
+  })
+})
+
+describe('@codesift/core query-aware ranking', () => {
+  it('extracts distinct concept terms, dropping stop words and 1-char tokens', () => {
+    const terms = queryConceptTerms('parse the Cookie header with keys and values')
+    // camelCase already lowercase here; stop words ("the", "with", "and") dropped.
+    expect(terms).toEqual(expect.arrayContaining(['parse', 'cookie', 'header', 'keys', 'values']))
+    expect(terms).not.toContain('the')
+    expect(terms).not.toContain('and')
+    expect(terms).not.toContain('with')
+  })
+
+  it('measures concept-term coverage over the name/parent/signature surface', () => {
+    const terms = queryConceptTerms('parse cookie header pairs')
+
+    // symbol "parseCookieHeader" covers parse+cookie+header (3/4).
+    const named = nameTermCoverage(
+      { symbol: 'parseCookieHeader', parent: null, signature: '(header: string): Record<string, string>' },
+      terms
+    )
+    expect(named).toBeCloseTo(3 / 4)
+
+    // Coverage reaches through the parent and signature surfaces, not just symbol.
+    const viaParentAndSig = nameTermCoverage(
+      { symbol: 'split', parent: 'CookieHeader', signature: '(input: string, pairs: number)' },
+      terms
+    )
+    expect(viaParentAndSig).toBeCloseTo(3 / 4) // cookie+header (parent) + pairs (sig)
+
+    // A name that shares none of the concept words covers nothing, even if its body
+    // would mention them — body text is not part of the name surface.
+    expect(nameTermCoverage({ symbol: 'unrelatedHelper', parent: null, signature: '(value: number)' }, terms)).toBe(0)
+
+    // No concept terms (or no name surface) => no coverage signal.
+    expect(nameTermCoverage({ symbol: 'parseCookieHeader', parent: null, signature: null }, [])).toBe(0)
+    expect(nameTermCoverage({ symbol: null, parent: null, signature: null }, terms)).toBe(0)
+  })
+
+  it('keeps a documentation heading from outranking the code it documents on a code query', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-docrank-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    // The real code definition the query is about.
+    await writeFile(
+      join(repoRoot, 'src', 'cookie.ts'),
+      `export function parseCookieValues(header: string): string[] {
+  return header.split(';').map((segment) => segment.trim())
+}
+`,
+      'utf8'
+    )
+
+    // A README whose H1 ("cookie") matches the identifier-shaped query token. Indexed
+    // as a "symbol", it would otherwise claim the high-weight exact arm and float the
+    // prose title above the function it documents.
+    await writeFile(
+      join(repoRoot, 'README.md'),
+      `# cookie
+
+Parse the cookie header into values. This documents how the cookie header parse
+and its values work for the cookie header.
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const hits = await repo.search('parse cookie header values', { k: 5 })
+    expect(hits.length).toBeGreaterThan(0)
+    // The code function, not the README heading, must lead a code-concept query.
+    expect(hits[0]?.file).toBe('src/cookie.ts')
+    expect(hits[0]?.symbol).toBe('parseCookieValues')
+    const readmeRank = hits.findIndex((hit) => hit.file === 'README.md')
+    expect(readmeRank === -1 || readmeRank > 0).toBe(true)
+  })
+
+  it('still surfaces a documentation heading when the query is documentation-focused', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-docfocus-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    await writeFile(
+      join(repoRoot, 'src', 'cookie.ts'),
+      `export function parseCookieValues(header: string): string[] {
+  return header.split(';').map((segment) => segment.trim())
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'README.md'),
+      `# cookie
+
+Parse the cookie header into values.
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    // A doc-focused query (mentions "readme") keeps doc headings eligible.
+    const hits = await repo.search('cookie readme overview', { k: 5 })
+    expect(hits.some((hit) => hit.file === 'README.md')).toBe(true)
+  })
+})
+
+describe('@codesift/core confidence-gated single_best', () => {
+  async function buildLoadConfigCollision(fileCount: number): Promise<Awaited<ReturnType<typeof openRepo>>> {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-collide-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    const areas = ['db', 'http', 'cache', 'auth', 'queue']
+    for (let index = 0; index < fileCount; index += 1) {
+      const area = areas[index]!
+      await writeFile(
+        join(repoRoot, 'src', `${area}.ts`),
+        `export function loadConfig(): Record<string, string> {
+  return { area: ${JSON.stringify(area)} }
+}
+`,
+        'utf8'
+      )
+    }
+
+    // A uniquely-named definition for the single-definition (collapsing) case.
+    await writeFile(
+      join(repoRoot, 'src', 'widget.ts'),
+      `export function uniqueWidgetRenderer(): string {
+  return 'widget'
+}
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+    return repo
+  }
+
+  it('does NOT collapse a colliding identifier; caps the set and flags the collision', async () => {
+    const repo = await buildLoadConfigCollision(4)
+
+    // Four same-named defs: instead of silently collapsing to one, return a capped
+    // candidate set (AMBIGUOUS_IDENTIFIER_MAX_K = 3) with the collision count on top.
+    const hits = await repo.search('loadConfig', { k: 10 })
+    expect(hits).toHaveLength(3)
+    expect(hits.every((hit) => hit.symbol === 'loadConfig')).toBe(true)
+    expect(hits[0]?.ambiguousDefCount).toBe(4)
+    // Distinct definitions, not three chunks of one file.
+    expect(new Set(hits.map((hit) => hit.file)).size).toBe(3)
+  })
+
+  it('still collapses an identifier that resolves to a single definition', async () => {
+    const repo = await buildLoadConfigCollision(1)
+
+    const hits = await repo.search('loadConfig', { k: 10 })
+    expect(hits).toHaveLength(1)
+    expect(hits[0]?.symbol).toBe('loadConfig')
+    expect(hits[0]?.ambiguousDefCount).toBeUndefined()
+
+    // A uniquely-named identifier collapses too.
+    const unique = await repo.search('uniqueWidgetRenderer', { k: 10 })
+    expect(unique).toHaveLength(1)
+    expect(unique[0]?.ambiguousDefCount).toBeUndefined()
+  })
+
+  it('honors an explicit single_best override even on a collision', async () => {
+    const repo = await buildLoadConfigCollision(4)
+
+    // The caller forced single_best, so collapse to one and do not flag ambiguity.
+    const forced = await repo.search('loadConfig', { k: 10, singleBest: true })
+    expect(forced).toHaveLength(1)
+    expect(forced[0]?.ambiguousDefCount).toBeUndefined()
+
+    // Explicit single_best:false returns the full set, also without the auto hint.
+    const expanded = await repo.search('loadConfig', { k: 10, singleBest: false })
+    expect(expanded.length).toBeGreaterThan(3)
+    expect(expanded[0]?.ambiguousDefCount).toBeUndefined()
   })
 })

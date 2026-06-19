@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { execFile as execFileCallback, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { promisify } from 'node:util'
 
-import { openRepo, type FindSymbolOptions, type GrepHit, type GrepOptions, type Range, type SearchHit, type SearchOptions, type SymbolDefinition } from '@codesift/core'
+import { VOYAGE_RERANK_PROVIDER_ID, openRepo, type FindSymbolOptions, type GrepHit, type GrepOptions, type Range, type SearchHit, type SearchOptions, type SymbolDefinition } from '@codesift/core'
 import { formatMcpGrepHits, formatMcpSearchHits, formatMcpSymbols } from '@codesift/mcp'
 
 const execFile = promisify(execFileCallback)
@@ -23,7 +23,7 @@ export const DEFAULT_LOSSES_PATH = resolve(moduleDir, '../losses.json')
 
 export type GoldenQueryType = (typeof QUERY_TYPE_ORDER)[number]
 export type EvalTool = 'codesift' | 'ripgrep'
-export type LossAxis = 'success' | 'tokens' | 'latency.cold' | 'latency.warm'
+export type LossAxis = 'success' | 'tokens' | 'latency.cold' | 'latency.warm' | 'precision'
 
 export interface BenchmarkRepo {
   id: string
@@ -36,6 +36,13 @@ export interface BenchmarkRepo {
 export interface ExpectedTarget {
   file: string
   symbol?: string
+  /**
+   * Per-target line range for a MULTI-TARGET golden (one entry per co-relevant
+   * definition). When present it scopes the match to this specific target's lines,
+   * so distinct same-named definitions in different files are scored independently.
+   * Single-target goldens keep using the query-level {@link GoldenQuery.expectedLineRange}.
+   */
+  lineRange?: Range
 }
 
 export interface GoldenQuery {
@@ -45,6 +52,7 @@ export interface GoldenQuery {
   query: string
   expected: ExpectedTarget[]
   expectedLineRange?: Range
+  expectedUsages?: string[]
   grepPattern?: string
   pathGlob?: string
 }
@@ -110,12 +118,41 @@ export interface RoutingProof {
   selections: Array<{ queryId: string; queryType: GoldenQueryType; selectedTool: 'search_code' | 'find_symbol' | 'grep_code' }>
 }
 
+export interface UsageReportEntry {
+  repoId: string
+  queryId: string
+  queryType: GoldenQueryType
+  usageRecall: number
+  withUsagesCallsDelta: number
+  expectedUsageCount: number
+  matchedUsageFiles: string[]
+  missingUsageFiles: string[]
+  withoutUsagesCallsToResolution: number
+  withUsagesCallsToResolution: number
+}
+
+export interface RerankReportEntry {
+  repoId: string
+  queryId: string
+  baselineMrrAt1: number
+  rerankMrrAt1: number
+  mrrAt1Delta: number
+}
+
+export interface RerankReport {
+  enabled: boolean
+  entries: RerankReportEntry[]
+  averageMrrAt1Delta: number
+}
+
 export interface EvalSummary {
   runs: EvalRun[]
   perQueryType: QueryTypeSummary[]
   losses: LossEntry[]
   exactRecallViolations: Array<{ queryId: string; repoId: string; queryType: GoldenQueryType; recallAt5: number }>
   routingProof: RoutingProof
+  usagesReport: UsageReportEntry[]
+  rerankReport: RerankReport
 }
 
 export interface EvalManifest {
@@ -146,6 +183,10 @@ interface PolicyRun {
   meanReciprocalRank: number
 }
 
+interface SearchPolicyRun extends PolicyRun {
+  hits: SearchHit[]
+}
+
 interface ManifestFileShape {
   repos?: BenchmarkRepo[]
   queries?: GoldenQuery[]
@@ -173,7 +214,9 @@ export function summarizeEmptyRun(): EvalSummary {
     perQueryType: [],
     losses: [],
     exactRecallViolations: [],
-    routingProof: proveRoutingPolicy([])
+    routingProof: proveRoutingPolicy([]),
+    usagesReport: [],
+    rerankReport: emptyRerankReport()
   }
 }
 
@@ -211,8 +254,10 @@ export async function evaluateManifest(manifest: EvalManifest, options: Evaluate
   const inspectionLimit = normalizePositiveInteger(options.inspectionLimit, DEFAULT_INSPECTION_LIMIT)
   const latencyToleranceMs = normalizeLatencyTolerance(options.latencyToleranceMs)
 
-  const repoById = new Map(manifest.repos.map((repo) => [repo.id, repo]))
   const runs: EvalRun[] = []
+  const usagesReport: UsageReportEntry[] = []
+  const rerankEntries: RerankReportEntry[] = []
+  const rerankEnabled = isRerankEvalEnabled()
 
   for (const repo of manifest.repos) {
     const queries = manifest.queries.filter((query) => query.repoId === repo.id)
@@ -226,10 +271,19 @@ export async function evaluateManifest(manifest: EvalManifest, options: Evaluate
       await repoHandle.sync({ rebuild: true })
 
       for (const query of queries) {
-        const codesiftRun = await measureCodesiftRun(stagedRepoRoot, query, resultLimit, inspectionLimit)
+        const codesiftRun = await measureCodesiftRun(stagedRepoRoot, repoHandle, query, resultLimit, inspectionLimit)
         const ripgrepRun = await measureRipgrepRun(stagedRepoRoot, query, resultLimit, inspectionLimit)
 
         runs.push(codesiftRun, ripgrepRun)
+
+        const usagesEntry = await measureWithUsagesReport(repoHandle, query, codesiftRun, resultLimit, inspectionLimit)
+        if (usagesEntry) {
+          usagesReport.push(usagesEntry)
+        }
+
+        if (rerankEnabled && query.queryType === 'nl-concept') {
+          rerankEntries.push(await measureRerankReport(repoHandle, query, codesiftRun, resultLimit, inspectionLimit))
+        }
       }
     } finally {
       await rm(stagedRepoRoot, { recursive: true, force: true })
@@ -247,7 +301,15 @@ export async function evaluateManifest(manifest: EvalManifest, options: Evaluate
     perQueryType: summarizeByQueryType(runs, manifest),
     losses,
     exactRecallViolations,
-    routingProof: proveRoutingPolicy(manifest.queries)
+    routingProof: proveRoutingPolicy(manifest.queries),
+    usagesReport,
+    rerankReport: rerankEnabled
+      ? {
+          enabled: true,
+          entries: rerankEntries,
+          averageMrrAt1Delta: average(rerankEntries.map((entry) => entry.mrrAt1Delta))
+        }
+      : emptyRerankReport()
   }
 }
 
@@ -280,6 +342,7 @@ export function formatSummary(summary: EvalSummary): string {
   const lines = [
     'codesift eval summary',
     '(cold latency = prebuilt-index, MCP-spawn only — does NOT measure first-run indexing)',
+    '(recall = set-recall: fraction of co-relevant targets in top-k; mrr@1 = rank-1 precision)',
     ''
   ]
 
@@ -295,6 +358,26 @@ export function formatSummary(summary: EvalSummary): string {
       `  mrr@1            codesift=${formatRatio(row.codesift.mrrAt1)} rg=${formatRatio(row.ripgrep.mrrAt1)}`,
       ''
     )
+  }
+
+  if (summary.usagesReport.length > 0) {
+    lines.push('with_usages report-only')
+    for (const entry of summary.usagesReport) {
+      lines.push(
+        `  - ${entry.queryId}: usageRecall=${formatRatio(entry.usageRecall)} savedCallsΔ=${formatSignedNumber(entry.withUsagesCallsDelta)} bundled=${formatNumber(entry.withUsagesCallsToResolution)} baseline=${formatNumber(entry.withoutUsagesCallsToResolution)} matched=${entry.matchedUsageFiles.join(', ') || 'none'} missing=${entry.missingUsageFiles.join(', ') || 'none'}`
+      )
+    }
+    lines.push('')
+  }
+
+  if (summary.rerankReport.enabled) {
+    lines.push(`rerank report-only (avg mrr@1 Δ=${formatSignedNumber(summary.rerankReport.averageMrrAt1Delta)})`)
+    for (const entry of summary.rerankReport.entries) {
+      lines.push(
+        `  - ${entry.queryId}: baseline=${formatRatio(entry.baselineMrrAt1)} rerank=${formatRatio(entry.rerankMrrAt1)} mrr@1Δ=${formatSignedNumber(entry.mrrAt1Delta)}`
+      )
+    }
+    lines.push('')
   }
 
   if (summary.exactRecallViolations.length > 0) {
@@ -321,6 +404,18 @@ export function formatSummary(summary: EvalSummary): string {
   return lines.join('\n').trimEnd()
 }
 
+export function isRerankEvalEnabled(): boolean {
+  return process.env.CODESIFT_EVAL_RERANK === '1' && Boolean(process.env.VOYAGE_API_KEY?.trim())
+}
+
+function emptyRerankReport(): RerankReport {
+  return {
+    enabled: false,
+    entries: [],
+    averageMrrAt1Delta: 0
+  }
+}
+
 function normalizeRepos(repos: BenchmarkRepo[], manifestDir: string): BenchmarkRepo[] {
   return repos.map((repo) => {
     if (!repo.repoPath && (!repo.gitUrl || !repo.ref)) {
@@ -337,7 +432,8 @@ function normalizeRepos(repos: BenchmarkRepo[], manifestDir: string): BenchmarkR
 function normalizeQueries(queries: GoldenQuery[]): GoldenQuery[] {
   return queries.map((query) => ({
     ...query,
-    expected: query.expected.map((target) => ({ ...target }))
+    expected: query.expected.map((target) => ({ ...target })),
+    ...(query.expectedUsages ? { expectedUsages: [...query.expectedUsages] } : {})
   }))
 }
 
@@ -374,8 +470,13 @@ async function clonePinnedRepo(gitUrl: string, ref: string, target: string): Pro
   await execFile('git', ['-C', target, 'checkout', '--detach', 'FETCH_HEAD'])
 }
 
-async function measureCodesiftRun(repoRoot: string, query: GoldenQuery, resultLimit: number, inspectionLimit: number): Promise<EvalRun> {
-  const repo = await openRepo(repoRoot)
+async function measureCodesiftRun(
+  repoRoot: string,
+  repo: Awaited<ReturnType<typeof openRepo>>,
+  query: GoldenQuery,
+  resultLimit: number,
+  inspectionLimit: number
+): Promise<EvalRun> {
   const coldMeasurement = await measure(async () => {
     await runCodesiftStdioFirstResult(repoRoot, query, resultLimit)
     return runCodesiftPolicy(repo, query, resultLimit, inspectionLimit)
@@ -419,6 +520,61 @@ async function measureRipgrepRun(repoRoot: string, query: GoldenQuery, resultLim
     recallAt5: coldMeasurement.value.recallAt5,
     recallAt10: coldMeasurement.value.recallAt10,
     meanReciprocalRank: coldMeasurement.value.meanReciprocalRank
+  }
+}
+
+async function measureWithUsagesReport(
+  repo: Awaited<ReturnType<typeof openRepo>>,
+  query: GoldenQuery,
+  baselineRun: EvalRun,
+  resultLimit: number,
+  inspectionLimit: number
+): Promise<UsageReportEntry | null> {
+  if (!query.expectedUsages || query.expectedUsages.length === 0) {
+    return null
+  }
+
+  const withUsagesRun = await runSearchPolicy(repo, query, resultLimit, inspectionLimit, { withUsages: true })
+  const topDefinitionHit = withUsagesRun.hits.find((hit) => hit.symbol && hit.kind && hit.kind !== 'file' && hit.language)
+  const actualUsageFiles = [...new Set((topDefinitionHit?.usages ?? []).map((usage) => normalizePath(usage.file)))].sort()
+  const expectedUsageFiles = [...new Set(query.expectedUsages.map((file) => normalizePath(file)))].sort()
+  const matchedUsageFiles = expectedUsageFiles.filter((file) => actualUsageFiles.includes(file))
+  const missingUsageFiles = expectedUsageFiles.filter((file) => !actualUsageFiles.includes(file))
+  // Report-only saved-call model: without bundling, the agent first resolves the
+  // definition (existing policy) and then spends one extra "who calls X?" lookup.
+  const withoutUsagesCallsToResolution = baselineRun.callsToResolution + 1
+
+  return {
+    repoId: query.repoId,
+    queryId: query.id,
+    queryType: query.queryType,
+    usageRecall: expectedUsageFiles.length === 0 ? 0 : matchedUsageFiles.length / expectedUsageFiles.length,
+    withUsagesCallsDelta: withoutUsagesCallsToResolution - withUsagesRun.callsToResolution,
+    expectedUsageCount: expectedUsageFiles.length,
+    matchedUsageFiles,
+    missingUsageFiles,
+    withoutUsagesCallsToResolution,
+    withUsagesCallsToResolution: withUsagesRun.callsToResolution
+  }
+}
+
+async function measureRerankReport(
+  repo: Awaited<ReturnType<typeof openRepo>>,
+  query: GoldenQuery,
+  baselineRun: EvalRun,
+  resultLimit: number,
+  inspectionLimit: number
+): Promise<RerankReportEntry> {
+  const reranked = await withConfiguredVoyageReranker(() => runSearchPolicy(repo, query, resultLimit, inspectionLimit, { rerank: true }))
+  const baselineMrrAt1 = baselineRun.meanReciprocalRank === 1 ? 1 : 0
+  const rerankMrrAt1 = reranked.meanReciprocalRank === 1 ? 1 : 0
+
+  return {
+    repoId: query.repoId,
+    queryId: query.id,
+    baselineMrrAt1,
+    rerankMrrAt1,
+    mrrAt1Delta: rerankMrrAt1 - baselineMrrAt1
   }
 }
 
@@ -537,6 +693,77 @@ function rpcId(message: unknown): number | undefined {
   return typeof id === 'number' ? id : undefined
 }
 
+function buildSearchOptions(query: GoldenQuery, resultLimit: number, overrides: Partial<SearchOptions> = {}): SearchOptions {
+  const options: SearchOptions = {
+    k: resultLimit,
+    maxTokens: 700,
+    ...overrides
+  }
+
+  if (query.pathGlob) {
+    options.pathGlob = query.pathGlob
+  }
+
+  return options
+}
+
+async function runSearchPolicy(
+  repo: Awaited<ReturnType<typeof openRepo>>,
+  query: GoldenQuery,
+  resultLimit: number,
+  inspectionLimit: number,
+  overrides: Partial<SearchOptions> = {}
+): Promise<SearchPolicyRun> {
+  const hits = await repo.search(query.query, buildSearchOptions(query, resultLimit, overrides))
+  const candidates = hits.map(candidateFromSearch)
+  const score = scoreCandidates(candidates, query, inspectionLimit)
+  const matchingRank = score.matchingRank
+
+  let tokensToResolution = estimateTokenCount(formatMcpSearchHits(hits))
+  let callsToResolution = 1
+
+  if (matchingRank !== null && query.expected.length === 1) {
+    const matchingHit = hits[matchingRank - 1]
+    const bodyResolves =
+      matchingHit?.body !== undefined &&
+      query.expectedLineRange !== undefined &&
+      bodyOverlapsExpected(matchingHit, query.expectedLineRange)
+
+    if (!bodyResolves && matchingHit?.id) {
+      const followUp = await readChunkSafely(repo, matchingHit.id)
+      if (followUp !== null) {
+        tokensToResolution += estimateTokenCount(followUp)
+        callsToResolution = 2
+      }
+    }
+  }
+
+  return {
+    hits,
+    tokensToResolution,
+    callsToResolution,
+    taskSuccess: score.taskSuccess,
+    recallAt5: score.recallAt5,
+    recallAt10: score.recallAt10,
+    meanReciprocalRank: score.meanReciprocalRank
+  }
+}
+
+async function withConfiguredVoyageReranker<T>(operation: () => Promise<T>): Promise<T> {
+  const previousReranker = process.env.CODESIFT_RERANKER
+  process.env.CODESIFT_RERANKER = VOYAGE_RERANK_PROVIDER_ID
+
+  try {
+    return await operation()
+  } finally {
+    if (previousReranker === undefined) {
+      delete process.env.CODESIFT_RERANKER
+    } else {
+      process.env.CODESIFT_RERANKER = previousReranker
+    }
+  }
+}
+
 async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, query: GoldenQuery, resultLimit: number, inspectionLimit: number): Promise<PolicyRun> {
   switch (query.queryType) {
     case 'symbol-def':
@@ -548,17 +775,19 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
 
       const definitions = (await repo.findSymbol(query.query, options)).slice(0, resultLimit)
       const candidates = definitions.map(candidateFromSymbol)
-      const matchingRank = firstMatchingRank(candidates, query)
-      const taskSuccess = matchingRank !== null && matchingRank <= inspectionLimit
+      const score = scoreCandidates(candidates, query, inspectionLimit)
+      const matchingRank = score.matchingRank
 
-      // Honest one-call accounting: find_symbol resolves in a single call only when
-      // the matching definition arrives with an inlined body that covers the
-      // expected lines. A body-less match (ambiguous lookup, withBody off, or a
-      // non-top match) still forces a follow-up read — count it as 2 calls.
+      // Honest one-call accounting: a SINGLE-target find_symbol resolves in one call
+      // only when the matching definition arrives with an inlined body covering the
+      // expected lines; a body-less match (ambiguous lookup, withBody off, or a
+      // non-top match) still forces a follow-up read — count it as 2 calls. A
+      // MULTI-target lookup ("where are all the Xs") is answered by the location set
+      // in a single call, so it is never charged a per-body follow-up.
       let tokensToResolution = estimateTokenCount(formatMcpSymbols(definitions))
       let callsToResolution = 1
 
-      if (matchingRank !== null) {
+      if (matchingRank !== null && query.expected.length === 1) {
         const matchingDef = definitions[matchingRank - 1]
         const bodyResolves =
           matchingDef?.body !== undefined &&
@@ -577,10 +806,10 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
       return {
         tokensToResolution,
         callsToResolution,
-        taskSuccess,
-        recallAt5: matchingRank !== null && matchingRank <= 5 ? 1 : 0,
-        recallAt10: matchingRank !== null && matchingRank <= 10 ? 1 : 0,
-        meanReciprocalRank: matchingRank === null ? 0 : 1 / matchingRank
+        taskSuccess: score.taskSuccess,
+        recallAt5: score.recallAt5,
+        recallAt10: score.recallAt10,
+        meanReciprocalRank: score.meanReciprocalRank
       }
     }
     case 'string-literal':
@@ -599,46 +828,7 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
       return evaluateRankedCandidates(candidates, query, tokens, inspectionLimit)
     }
     case 'nl-concept': {
-      const options: SearchOptions = {
-        k: resultLimit,
-        maxTokens: 700
-      }
-      if (query.pathGlob) {
-        options.pathGlob = query.pathGlob
-      }
-
-      const hits = await repo.search(query.query, options)
-      const candidates = hits.map(candidateFromSearch)
-      const matchingRank = firstMatchingRank(candidates, query)
-      const taskSuccess = matchingRank !== null && matchingRank <= inspectionLimit
-
-      let tokensToResolution = estimateTokenCount(formatMcpSearchHits(hits))
-      let callsToResolution = 1
-
-      if (matchingRank !== null) {
-        const matchingHit = hits[matchingRank - 1]
-        const bodyResolves =
-          matchingHit?.body !== undefined &&
-          query.expectedLineRange !== undefined &&
-          bodyOverlapsExpected(matchingHit, query.expectedLineRange)
-
-        if (!bodyResolves && matchingHit?.id) {
-          const followUp = await readChunkSafely(repo, matchingHit.id)
-          if (followUp !== null) {
-            tokensToResolution += estimateTokenCount(followUp)
-            callsToResolution = 2
-          }
-        }
-      }
-
-      return {
-        tokensToResolution,
-        callsToResolution,
-        taskSuccess,
-        recallAt5: matchingRank !== null && matchingRank <= 5 ? 1 : 0,
-        recallAt10: matchingRank !== null && matchingRank <= 10 ? 1 : 0,
-        meanReciprocalRank: matchingRank === null ? 0 : 1 / matchingRank
-      }
+      return runSearchPolicy(repo, query, resultLimit, inspectionLimit)
     }
   }
 }
@@ -764,15 +954,15 @@ function collectRipgrepContext(
 }
 
 function evaluateRankedCandidates(candidates: CandidateResult[], query: GoldenQuery, tokensToResolution: number, inspectionLimit: number): PolicyRun {
-  const matchingRank = firstMatchingRank(candidates, query)
+  const score = scoreCandidates(candidates, query, inspectionLimit)
 
   return {
     tokensToResolution,
     callsToResolution: 1,
-    taskSuccess: matchingRank !== null && matchingRank <= inspectionLimit,
-    recallAt5: matchingRank !== null && matchingRank <= 5 ? 1 : 0,
-    recallAt10: matchingRank !== null && matchingRank <= 10 ? 1 : 0,
-    meanReciprocalRank: matchingRank === null ? 0 : 1 / matchingRank
+    taskSuccess: score.taskSuccess,
+    recallAt5: score.recallAt5,
+    recallAt10: score.recallAt10,
+    meanReciprocalRank: score.meanReciprocalRank
   }
 }
 
@@ -782,21 +972,62 @@ function firstMatchingRank(candidates: CandidateResult[], query: GoldenQuery): n
 }
 
 export function candidateMatchesExpected(candidate: CandidateResult, query: GoldenQuery): boolean {
-  return query.expected.some((expected) => {
-    if (normalizePath(candidate.file) !== normalizePath(expected.file)) {
-      return false
-    }
+  return query.expected.some((target) => candidateMatchesTarget(candidate, target, query))
+}
 
-    if (expected.symbol && candidate.symbol && expected.symbol.toLowerCase() !== candidate.symbol.toLowerCase()) {
-      return false
-    }
+function candidateMatchesTarget(candidate: CandidateResult, target: ExpectedTarget, query: GoldenQuery): boolean {
+  if (normalizePath(candidate.file) !== normalizePath(target.file)) {
+    return false
+  }
 
-    if (query.expectedLineRange) {
-      return rangesOverlap(candidate.range, query.expectedLineRange)
-    }
+  if (target.symbol && candidate.symbol && target.symbol.toLowerCase() !== candidate.symbol.toLowerCase()) {
+    return false
+  }
 
-    return true
-  })
+  // A per-target lineRange scopes a multi-target match to that one definition;
+  // single-target goldens fall back to the query-level expectedLineRange. A target
+  // with neither matches on file (+ symbol) alone.
+  const lineRange = target.lineRange ?? (query.expected.length === 1 ? query.expectedLineRange : undefined)
+  if (lineRange) {
+    return rangesOverlap(candidate.range, lineRange)
+  }
+
+  return true
+}
+
+// Number of DISTINCT expected targets covered by some candidate within the top-k.
+// For single-target goldens this is 0 or 1, so set-recall reduces exactly to today's
+// binary recall; for multi-target goldens it is the count of co-relevant definitions
+// surfaced, so a ranking change that silently drops a co-relevant hit is now visible.
+function coveredTargetCount(candidates: CandidateResult[], query: GoldenQuery, k: number): number {
+  const top = candidates.slice(0, k)
+  let covered = 0
+  for (const target of query.expected) {
+    if (top.some((candidate) => candidateMatchesTarget(candidate, target, query))) {
+      covered += 1
+    }
+  }
+  return covered
+}
+
+// Shared ranking scorer. taskSuccess requires EVERY co-relevant target within the
+// inspection window (for single-target this is "first match within inspectionLimit");
+// recall is set-recall (fraction of targets in top-k); MRR remains first-relevant-rank.
+function scoreCandidates(
+  candidates: CandidateResult[],
+  query: GoldenQuery,
+  inspectionLimit: number
+): { matchingRank: number | null; taskSuccess: boolean; recallAt5: number; recallAt10: number; meanReciprocalRank: number } {
+  const matchingRank = firstMatchingRank(candidates, query)
+  const targetCount = Math.max(1, query.expected.length)
+
+  return {
+    matchingRank,
+    taskSuccess: coveredTargetCount(candidates, query, inspectionLimit) === query.expected.length,
+    recallAt5: coveredTargetCount(candidates, query, 5) / targetCount,
+    recallAt10: coveredTargetCount(candidates, query, 10) / targetCount,
+    meanReciprocalRank: matchingRank === null ? 0 : 1 / matchingRank
+  }
 }
 
 function candidateFromSearch(hit: SearchHit): CandidateResult {
@@ -902,6 +1133,16 @@ function computeLosses(manifest: EvalManifest, runs: EvalRun[], latencyTolerance
 
     if (codesift.taskSuccess && ripgrep.taskSuccess && codesift.wallClockMs.warm > ripgrep.wallClockMs.warm + latencyToleranceMs) {
       axes.push('latency.warm')
+    }
+
+    // Precision regression guard (self-referential, independent of ripgrep): codesift
+    // resolves the answer but a false positive outranks the first relevant hit, so the
+    // most-trusted rank-1 result is wrong. mrr === 1 iff the first relevant target is at
+    // rank 1. Recorded in the baseline for queries where it already holds, so it gates
+    // only NEW rank-1 regressions — exactly the accuracy-for-recall trade a relaxation
+    // or re-ranking change can otherwise make invisibly.
+    if (codesift.taskSuccess && codesift.meanReciprocalRank !== 1) {
+      axes.push('precision')
     }
 
     if (axes.length > 0) {

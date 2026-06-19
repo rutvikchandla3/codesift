@@ -37,6 +37,16 @@
       "id": "m3-rust",
       "language": "rust",
       "repoPath": "./m3-rust"
+    },
+    {
+      "id": "collision-ts",
+      "language": "typescript",
+      "repoPath": "./collision-ts"
+    },
+    {
+      "id": "usages-ts",
+      "language": "typescript",
+      "repoPath": "./usages-ts"
     }
   ],
   "queries": [
@@ -438,6 +448,60 @@
         "startLine": 14,
         "endLine": 14
       }
+    },
+    {
+      "id": "collision-validate-symbol",
+      "repoId": "collision-ts",
+      "queryType": "symbol-def",
+      "query": "validate",
+      "grepPattern": "validate",
+      "expected": [
+        {
+          "file": "src/auth/token.ts",
+          "symbol": "validate",
+          "lineRange": {
+            "startLine": 3,
+            "endLine": 10
+          }
+        },
+        {
+          "file": "src/schema/validator.ts",
+          "symbol": "validate",
+          "lineRange": {
+            "startLine": 1,
+            "endLine": 13
+          }
+        },
+        {
+          "file": "src/forms/checkout.ts",
+          "symbol": "validate",
+          "lineRange": {
+            "startLine": 6,
+            "endLine": 15
+          }
+        }
+      ]
+    },
+    {
+      "id": "usages-parse-token-identifier",
+      "repoId": "usages-ts",
+      "queryType": "exact-identifier",
+      "query": "parseToken",
+      "grepPattern": "parse bearer auth claims",
+      "expected": [
+        {
+          "file": "src/token.ts",
+          "symbol": "parseToken"
+        }
+      ],
+      "expectedLineRange": {
+        "startLine": 5,
+        "endLine": 8
+      },
+      "expectedUsages": [
+        "src/api.ts",
+        "src/worker.ts"
+      ]
     }
   ]
 }

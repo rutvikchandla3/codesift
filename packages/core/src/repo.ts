@@ -27,6 +27,7 @@ interface ChunkRow {
   symbol: string | null
   kind: SymbolKind | null
   parent: string | null
+  signature: string | null
   generated: number | null
 }
 
@@ -146,10 +147,19 @@ const PREFIX_TOKEN_COST = 2
 const COMPACT_SNIPPET_MAX_LINES = 4
 const INLINE_BODY_TRUNCATION_MARKER = '… (truncated — read_chunk <id> for full)'
 const INLINE_RANK2_SCORE_MARGIN = 0.6
+// Below this lexical-row count, an over-constrained FTS query is progressively
+// relaxed (drop-rarest term, then full OR) so a concept phrased with a word the
+// target lacks still recalls it. ~3 keeps a handful of candidates for fusion.
+const MIN_RELAXATION_ROWS = 3
 // find_symbol inlines the top match's body only when the lookup is unambiguous.
 // Above this many exact rows the identifier collides across the repo, so picking
 // one body to inline would be misleading — keep every row compact instead.
 const FIND_SYMBOL_INLINE_MAX_EXACT_ROWS = 3
+// When an identifier-shaped query collides across ≥2 definitions, single_best does
+// NOT collapse to one (that would hide the collision and silently pick a winner);
+// instead it returns up to this many candidates with an "ambiguous: N defs" hint so
+// the caller can disambiguate in the same call. Capped low to stay terse.
+const AMBIGUOUS_IDENTIFIER_MAX_K = 3
 const RERANK_CANDIDATE_LIMIT = 25
 const RERANK_SNIPPET_CHAR_LIMIT = 1000
 const VECTOR_SEARCH_UNAVAILABLE_MESSAGE = 'vector search unavailable (native dep), lexical/symbol still works'
@@ -474,32 +484,7 @@ export class SqliteRepo implements Repo {
     const { whereSql, params } = buildChunkSearchFilters(options)
     const exactRows = selectExactCandidateRows(db, query, options, Math.max(requestedK * 10, DEFAULT_PATH_FILTERED_LIMIT))
 
-    const ftsQuery = buildFtsQuery(query)
-    const lexicalRows = ftsQuery
-      ? db
-          .prepare<unknown[], ChunkRow>(
-            `
-              select
-                c.id,
-                c.file_path,
-                c.start_line,
-                c.end_line,
-                c.snippet,
-                c.language,
-                c.symbol,
-                c.kind,
-                c.parent,
-                c.generated
-              from chunks_fts
-              join chunks c on c.id = chunks_fts.chunk_id
-              where chunks_fts match ?
-              ${whereSql ? `and ${whereSql.replace(/^where\s+/i, '')}` : ''}
-              order by bm25(chunks_fts, 1.0, 6.0, 2.5, 2.0) asc, c.file_path asc, c.start_line asc, c.id asc
-              limit ${limit}
-            `
-          )
-          .all(ftsQuery, ...params)
-      : []
+    const lexicalRows = selectRelaxedLexicalRows(db, query, whereSql, params, limit)
 
     const provider = this.resolveProvider()
     const shouldUseVectorSearch = isLearnedEmbeddingProvider(provider) && queryShouldUseVectorSearch(query)
@@ -522,6 +507,7 @@ export class SqliteRepo implements Repo {
                   symbol,
                   kind,
                   parent,
+                  signature,
                   generated
                 from chunks
                 ${whereSql}
@@ -536,7 +522,21 @@ export class SqliteRepo implements Repo {
     const fusedRows = fuseRankedRows(query, exactRows, vectorRows, lexicalRows)
     const dedupedRows = dedupeContainedRows(fusedRows)
     const distinctRows = await this.applyRerankStage(query, dedupedRows, options)
-    const effectiveK = (options?.singleBest ?? (exactRows.length > 0 && isSingleBestIdentifierQuery(query))) ? 1 : requestedK
+
+    // Confidence-gated single_best (#7): an identifier-shaped lookup collapses to the
+    // one best answer ONLY when it resolves to a single definition. When the identifier
+    // collides across ≥2 definitions, collapsing would silently pick a winner and hide
+    // the ambiguity, so return a capped candidate set plus an "ambiguous: N defs" hint
+    // instead. An explicit options.singleBest always wins (a caller can force k=1).
+    const singleTokenIdentifier = isSingleBestIdentifierQuery(query)
+    const exactDefCount = singleTokenIdentifier ? distinctExactSymbolDefinitions(exactRows, query) : 0
+    const ambiguousIdentifier = options?.singleBest === undefined && singleTokenIdentifier && exactDefCount >= 2
+    const autoSingleBest = exactRows.length > 0 && singleTokenIdentifier && !ambiguousIdentifier
+    const effectiveK = (options?.singleBest ?? autoSingleBest)
+      ? 1
+      : ambiguousIdentifier
+        ? Math.min(requestedK, AMBIGUOUS_IDENTIFIER_MAX_K)
+        : requestedK
 
       const budgetedHits = await buildBudgetedSearchHits(
         query,
@@ -547,6 +547,11 @@ export class SqliteRepo implements Repo {
         (file, startLine, endLine) => this.readRange(file, startLine, endLine)
       )
       const staleHits = markStaleHits(budgetedHits, freshness)
+      // Surface the collision count on the top hit so the caller knows the set is
+      // "one of N same-named definitions", not a single confident answer.
+      if (ambiguousIdentifier && staleHits.length > 0) {
+        staleHits[0]!.ambiguousDefCount = exactDefCount
+      }
       if (options?.withUsages) {
         await attachUsagesToTopDefinitionHit(db, this.root, staleHits, options)
       }
@@ -2781,7 +2786,7 @@ function selectExactCandidateRows(
   const chunkRows = db
     .prepare<unknown[], ChunkRow>(
       `
-        select id, file_path, start_line, end_line, snippet, language, symbol, kind, parent, generated
+        select id, file_path, start_line, end_line, snippet, language, symbol, kind, parent, signature, generated
         from chunks
         ${whereSql ? `${whereSql} and` : 'where'} lower(symbol) in (${placeholders})
         order by file_path asc, start_line asc, end_line asc, id asc
@@ -2802,7 +2807,7 @@ function selectExactCandidateRows(
   const symbolRows = db
     .prepare<unknown[], ChunkRow>(
       `
-        select distinct c.id, c.file_path, c.start_line, c.end_line, c.snippet, c.language, c.symbol, c.kind, c.parent, c.generated
+        select distinct c.id, c.file_path, c.start_line, c.end_line, c.snippet, c.language, c.symbol, c.kind, c.parent, c.signature, c.generated
         from symbols s
         join chunks c on c.file_path = s.file_path and s.start_line between c.start_line and c.end_line
         ${whereSql ? `${whereSql.replace(/\bfile_path\b/g, 'c.file_path').replace(/\blanguage\b/g, 'c.language').replace(/\bkind\b/g, 'c.kind')} and` : 'where'} lower(s.name) in (${placeholders})
@@ -2816,7 +2821,20 @@ function selectExactCandidateRows(
     rowsById.set(row.id, row)
   }
 
-  return [...rowsById.values()]
+  const rows = [...rowsById.values()]
+
+  // A documentation heading (a markdown H1, etc.) gets indexed as a "symbol", so an
+  // identifier-shaped query token can match it exactly and float a prose title into
+  // the high-weight (×4) exact arm — where, ordered only by path, it can outrank the
+  // very function it documents (e.g. a README "cookie" heading over `parseCookie`).
+  // For a code-concept query, drop doc-language rows from the exact arm; they still
+  // surface via the lexical arm at their honest bm25 rank. A doc-focused query keeps
+  // them, since then the heading is a legitimate answer.
+  if (queryLooksDocumentationOrConfigFocused(query)) {
+    return rows
+  }
+
+  return rows.filter((row) => !(row.language && isDocumentationLanguage(row.language)))
 }
 
 function selectExactFtsCandidateRows(
@@ -2847,6 +2865,7 @@ function selectExactFtsCandidateRows(
             c.symbol,
             c.kind,
             c.parent,
+            c.signature,
             c.generated
           from chunks_fts
           join chunks c on c.id = chunks_fts.chunk_id
@@ -2926,6 +2945,8 @@ function fuseRankedRows(query: string, exactRows: ChunkRow[], vectorRows: ChunkR
   addReciprocalRanks(byId, vectorRows, '+')
   addReciprocalRanks(byId, lexicalRows, '~')
 
+  const terms = queryConceptTerms(query)
+
   return [...byId.values()].sort((left, right) => {
     const leftScore = left.score * scoreBoostForRow(left.row, query)
     const rightScore = right.score * scoreBoostForRow(right.row, query)
@@ -2933,6 +2954,20 @@ function fuseRankedRows(query: string, exactRows: ChunkRow[], vectorRows: ChunkR
 
     if (Math.abs(scoreDelta) > 1e-12) {
       return scoreDelta
+    }
+
+    // Meaningful tiebreak (#6): when fused scores tie, prefer the row whose
+    // name/signature covers more of the query, then a real definition over a
+    // file/container chunk, then the stable location key so order stays
+    // deterministic across runs.
+    const coverageDelta = nameTermCoverage(right.row, terms) - nameTermCoverage(left.row, terms)
+    if (Math.abs(coverageDelta) > 1e-9) {
+      return coverageDelta
+    }
+
+    const kindDelta = definitionKindRank(left.row) - definitionKindRank(right.row)
+    if (kindDelta !== 0) {
+      return kindDelta
     }
 
     return stableChunkSortKey(left.row).localeCompare(stableChunkSortKey(right.row))
@@ -2998,6 +3033,66 @@ function addReciprocalRanks(target: Map<string, RankedChunkRow>, rows: ChunkRow[
   })
 }
 
+// Query-aware ranking (#6) is intentionally a TIEBREAK, not a score multiplier. An
+// early prototype multiplied the fused score by ~(1 + 0.3·coverage); the eval's
+// precision axis caught it demoting a correct rank-1 (the "validate signed timestamp"
+// concept resolves to TimestampSigner.unsign, but a coverage lift floated the thin
+// `validate` wrapper above it) while resolving nothing — a pure accuracy-for-nothing
+// trade. So coverage now only orders rows whose primary fused score is already tied,
+// where the prior lexicographic file-path tiebreak was arbitrary. The signature is
+// loaded into ChunkRow so this signal (and find_symbol callers) can see it.
+
+// Distinct concept terms of a query (camelCase-split, stop-words and 1-char tokens
+// dropped) — the same token set buildFtsTermGroups searches, before OR-expansion.
+export function queryConceptTerms(query: string): string[] {
+  return [...new Set(buildNormalizedTerms(query).filter((term) => !DEFAULT_STOP_WORDS.has(term) && term.length > 1))]
+}
+
+// Fraction of the query's concept terms present in the row's declared NAME surface
+// (symbol + parent + signature), tokenized the same way. Returns 0 when the row has
+// no name surface or the query carries no concept terms.
+export function nameTermCoverage(
+  row: { symbol: string | null; parent: string | null; signature: string | null },
+  terms: string[]
+): number {
+  if (terms.length === 0) {
+    return 0
+  }
+
+  const nameTerms = new Set([
+    ...buildNormalizedTerms(row.symbol ?? undefined),
+    ...buildNormalizedTerms(row.parent ?? undefined),
+    ...buildNormalizedTerms(row.signature ?? undefined)
+  ])
+  if (nameTerms.size === 0) {
+    return 0
+  }
+
+  let covered = 0
+  for (const term of terms) {
+    if (nameTerms.has(term)) {
+      covered += 1
+    }
+  }
+
+  return covered / terms.length
+}
+
+// Tiebreak preference among rows with an equal fused score: a real definition
+// (function/method) over a container or other symbol, over a plain file chunk.
+// Lower rank sorts first.
+function definitionKindRank(row: ChunkRow): number {
+  switch (row.kind) {
+    case 'function':
+    case 'method':
+      return 0
+    case 'file':
+      return 2
+    default:
+      return 1
+  }
+}
+
 function scoreBoostForRow(row: ChunkRow, query: string): number {
   let boost = 1
 
@@ -3009,7 +3104,15 @@ function scoreBoostForRow(row: ChunkRow, query: string): number {
     boost *= 1.08
   }
 
-  if (row.kind && row.kind !== 'file') {
+  // A "how/where is X done" concept query describes behavior, so a pure type/interface
+  // declaration (a shape, not an operation) should not outrank the function/method or
+  // class that implements it. Demote interface/type mildly rather than boosting
+  // functions — boosting functions would lift a same-named method over a class chunk
+  // that legitimately answers the query, which the precision axis catches. Other
+  // symbols keep the flat boost; a bare file chunk gets none.
+  if (row.kind === 'interface' || row.kind === 'type') {
+    boost *= 0.92
+  } else if (row.kind && row.kind !== 'file') {
     boost *= 1.04
   }
 
@@ -3017,7 +3120,10 @@ function scoreBoostForRow(row: ChunkRow, query: string): number {
     boost *= 0.58
   }
 
-  if (isExactSymbolMatch(row, query)) {
+  // The 1.85× "this is THE definition" boost is for code symbols. A documentation
+  // heading that merely shares a word with a code-concept query is not a definition,
+  // so it does not earn the boost (it is also dropped from the exact arm upstream).
+  if (isExactSymbolMatch(row, query) && !(row.language && isDocumentationLanguage(row.language) && !queryLooksDocumentationOrConfigFocused(query))) {
     boost *= 1.85
   }
 
@@ -3032,6 +3138,20 @@ function scoreBoostForRow(row: ChunkRow, query: string): number {
   }
 
   return boost
+}
+
+// Number of DISTINCT definitions an identifier query resolves to in the exact arm.
+// Keyed by (file, symbol, parent) so multiple chunks of one symbol count once, while
+// same-named symbols in different files (or under different parents) count separately
+// — the collision signal the confidence gate keys on.
+function distinctExactSymbolDefinitions(exactRows: ChunkRow[], query: string): number {
+  const seen = new Set<string>()
+  for (const row of exactRows) {
+    if (isExactSymbolMatch(row, query)) {
+      seen.add(`${row.file_path} ${(row.symbol ?? '').toLowerCase()} ${(row.parent ?? '').toLowerCase()}`)
+    }
+  }
+  return seen.size
 }
 
 function isExactSymbolMatch(row: ChunkRow, query: string): boolean {
@@ -3089,10 +3209,113 @@ function extractSymbolCandidates(query: string): string[] {
   return [...matches]
 }
 
-export function buildFtsQuery(query: string): string | null {
+// Progressive FTS relaxation ladder. Each tier is a strict SUPERSET of the one
+// before, so relaxing never drops a stricter-tier match — it only widens recall:
+//   1. full AND     — every concept word present (the common case)
+//   2. drop-rarest   — drop the single highest-IDF group (fewest docs = the most
+//                      likely AND-killer), so a query word the target happens to
+//                      lack no longer excludes it
+//   3. full OR       — any concept word, the recall backstop
+// Tiers 2–3 fire ONLY when the prior tier under-recalls (< MIN_RELAXATION_ROWS),
+// so a query that already matches stays byte-for-byte unchanged and pays no IDF
+// cost. Widening is guarded by the eval precision axis (a relaxed tier that pushes
+// a false positive to rank-1 shows up as a precision regression). bm25 still orders
+// within the chosen tier, so the densest match stays on top.
+function selectRelaxedLexicalRows(
+  db: Database.Database,
+  query: string,
+  whereSql: string,
+  params: unknown[],
+  limit: number
+): ChunkRow[] {
+  const groups = buildFtsTermGroups(query)
+  if (groups.length === 0) {
+    return []
+  }
+
+  const andClause = whereSql ? `and ${whereSql.replace(/^where\s+/i, '')}` : ''
+  const statement = db.prepare<unknown[], ChunkRow>(
+    `
+      select
+        c.id,
+        c.file_path,
+        c.start_line,
+        c.end_line,
+        c.snippet,
+        c.language,
+        c.symbol,
+        c.kind,
+        c.parent,
+        c.signature,
+        c.generated
+      from chunks_fts
+      join chunks c on c.id = chunks_fts.chunk_id
+      where chunks_fts match ?
+      ${andClause}
+      order by bm25(chunks_fts, 1.0, 6.0, 2.5, 2.0) asc, c.file_path asc, c.start_line asc, c.id asc
+      limit ${limit}
+    `
+  )
+  const run = (ftsQuery: string): ChunkRow[] => statement.all(ftsQuery, ...params)
+
+  const tierOne = run(groups.join(' AND '))
+  // Relaxation is a CONCEPT-recall safety net. A symbol-dominated query ("fooBarToken")
+  // wants that identifier, not a lexically-adjacent one — widening it (even drop-rarest)
+  // would surface a different symbol that merely shares a sub-word. Keep those strict.
+  if (tierOne.length >= MIN_RELAXATION_ROWS || groups.length < 2 || isSymbolDominatedQuery(query)) {
+    return tierOne
+  }
+
+  let best = tierOne
+  const rarest = rarestTermGroupIndex(db, groups, andClause, params)
+  if (rarest !== -1) {
+    const tierTwo = run(groups.filter((_, index) => index !== rarest).join(' AND '))
+    if (tierTwo.length >= MIN_RELAXATION_ROWS) {
+      return tierTwo
+    }
+    if (tierTwo.length > best.length) {
+      best = tierTwo
+    }
+  }
+
+  const tierThree = run(groups.join(' OR '))
+  return tierThree.length > best.length ? tierThree : best
+}
+
+// Index of the term-group present in the FEWEST indexed chunks (highest IDF). Run
+// lazily — only when tier-1 under-recalls — so the per-group count queries are paid
+// once per under-recalled search, never on the common path.
+function rarestTermGroupIndex(db: Database.Database, groups: string[], andClause: string, params: unknown[]): number {
+  const statement = db.prepare<unknown[], { n: number }>(
+    `
+      select count(*) as n
+      from chunks_fts
+      join chunks c on c.id = chunks_fts.chunk_id
+      where chunks_fts match ?
+      ${andClause}
+    `
+  )
+
+  let rarestIndex = -1
+  let rarestCount = Number.POSITIVE_INFINITY
+  groups.forEach((group, index) => {
+    const count = statement.get(group, ...params)?.n ?? 0
+    if (count < rarestCount) {
+      rarestCount = count
+      rarestIndex = index
+    }
+  })
+
+  return rarestIndex
+}
+
+// Ordered list of FTS5 term-groups for a query, one per distinct concept word
+// (each group OR-expands its synonyms). Order follows the query's word order; the
+// relaxation ladder reorders only by IDF when it drops the rarest group.
+function buildFtsTermGroups(query: string): string[] {
   const terms = [...new Set(buildNormalizedTerms(query).filter((term) => !DEFAULT_STOP_WORDS.has(term) && term.length > 1))]
   if (terms.length === 0) {
-    return null
+    return []
   }
 
   const groups: string[] = []
@@ -3115,7 +3338,12 @@ export function buildFtsQuery(query: string): string | null {
     groups.push(members.length > 1 ? `(${members.map(quoteFtsTerm).join(' OR ')})` : quoteFtsTerm(term))
   }
 
-  return groups.join(' AND ')
+  return groups
+}
+
+export function buildFtsQuery(query: string): string | null {
+  const groups = buildFtsTermGroups(query)
+  return groups.length === 0 ? null : groups.join(' AND ')
 }
 
 function quoteFtsTerm(term: string): string {

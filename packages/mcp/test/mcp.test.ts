@@ -342,6 +342,21 @@ describe('formatMcpSearchHits structure-preserving output', () => {
   it('returns no_hits for an empty result set', () => {
     expect(formatMcpSearchHits([])).toBe('no_hits')
   })
+
+  it('leads with an "ambiguous: N defs" hint when the top hit flags a collision', () => {
+    const output = formatMcpSearchHits([
+      makeHit({ ambiguousDefCount: 3, file: 'src/a.ts' }),
+      makeHit({ file: 'src/b.ts', id: 'src/b.ts:1-3@beef0002' })
+    ])
+
+    expect(output.split('\n')[0]).toBe('ambiguous: 3 defs')
+    expect(output).toContain('tokensReturned=')
+  })
+
+  it('omits the ambiguity hint for an ordinary (non-colliding) result set', () => {
+    const output = formatMcpSearchHits([makeHit({})])
+    expect(output).not.toContain('ambiguous:')
+  })
 })
 
 describe('formatMcpGrepHits keeps its single-line ↩-joined format', () => {

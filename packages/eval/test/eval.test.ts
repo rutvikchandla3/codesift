@@ -4,7 +4,7 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { DEFAULT_MANIFEST_PATH, candidateFromRipgrep, candidateMatchesExpected, createEmptyManifest, diffLossBudgets, evaluateManifest, formatSummary, loadManifest, proveRoutingPolicy, runRipgrep, summarizeEmptyRun, type GoldenQuery, type RipgrepHit } from '../src/index.js'
+import { DEFAULT_MANIFEST_PATH, candidateFromRipgrep, candidateMatchesExpected, createEmptyManifest, diffLossBudgets, evaluateManifest, formatSummary, isRerankEvalEnabled, loadManifest, proveRoutingPolicy, runRipgrep, summarizeEmptyRun, type GoldenQuery, type RipgrepHit } from '../src/index.js'
 
 const temporaryDirectories: string[] = []
 
@@ -35,6 +35,12 @@ describe('@codesift/eval', () => {
         codesiftPreferred: 0,
         hostGrepPreferred: 0,
         selections: []
+      },
+      usagesReport: [],
+      rerankReport: {
+        enabled: false,
+        entries: [],
+        averageMrrAt1Delta: 0
       }
     })
   })
@@ -42,8 +48,11 @@ describe('@codesift/eval', () => {
   it('loads the default fixture manifest', async () => {
     const manifest = await loadManifest(DEFAULT_MANIFEST_PATH)
 
-    expect(manifest.repos).toHaveLength(7)
+    expect(manifest.repos.length).toBeGreaterThanOrEqual(8)
     expect(manifest.queries.length).toBeGreaterThanOrEqual(20)
+    expect(manifest.repos.some((repo) => repo.id === 'collision-ts')).toBe(true)
+    // A multi-target ambiguous-identifier golden now exists for set-recall coverage.
+    expect(manifest.queries.some((query) => query.expected.length > 1)).toBe(true)
     expect(manifest.queries.some((query) => query.queryType === 'exact-identifier')).toBe(true)
     expect(manifest.queries.some((query) => query.queryType === 'nl-concept')).toBe(true)
     expect(manifest.repos.map((repo) => repo.language)).toEqual(
@@ -116,6 +125,68 @@ describe('@codesift/eval', () => {
     expect(rendered).toContain('mrr@1')
   }, 30_000)
 
+  it('reports with_usages recall and saved-call delta on the local usages fixture', async () => {
+    const manifest = await loadManifest(DEFAULT_MANIFEST_PATH)
+    const usagesManifest = {
+      repos: manifest.repos.filter((repo) => repo.id === 'usages-ts'),
+      queries: manifest.queries.filter((query) => query.repoId === 'usages-ts')
+    }
+    const summary = await evaluateManifest(usagesManifest, { resultLimit: 5, inspectionLimit: 5, latencyToleranceMs: Number.POSITIVE_INFINITY })
+
+    expect(summary.usagesReport).toHaveLength(1)
+    expect(summary.usagesReport[0]).toMatchObject({
+      queryId: 'usages-parse-token-identifier',
+      repoId: 'usages-ts',
+      queryType: 'exact-identifier',
+      usageRecall: 1,
+      expectedUsageCount: 2,
+      matchedUsageFiles: ['src/api.ts', 'src/worker.ts'],
+      missingUsageFiles: []
+    })
+    expect(summary.usagesReport[0]?.withUsagesCallsDelta).toBeGreaterThanOrEqual(1)
+    expect(summary.usagesReport[0]?.withUsagesCallsToResolution).toBeLessThan(summary.usagesReport[0]?.withoutUsagesCallsToResolution ?? 0)
+
+    const rendered = formatSummary(summary)
+    expect(rendered).toContain('with_usages report-only')
+    expect(rendered).toContain('usageRecall=1.00')
+  }, 30_000)
+
+  it('keeps the cloud rerank report disabled when the env gate is unset', async () => {
+    const originalEvalRerank = process.env.CODESIFT_EVAL_RERANK
+    const originalVoyageApiKey = process.env.VOYAGE_API_KEY
+    delete process.env.CODESIFT_EVAL_RERANK
+    delete process.env.VOYAGE_API_KEY
+
+    try {
+      expect(isRerankEvalEnabled()).toBe(false)
+
+      const manifest = await loadManifest(DEFAULT_MANIFEST_PATH)
+      const usagesManifest = {
+        repos: manifest.repos.filter((repo) => repo.id === 'usages-ts'),
+        queries: manifest.queries.filter((query) => query.repoId === 'usages-ts')
+      }
+      const summary = await evaluateManifest(usagesManifest, { resultLimit: 5, inspectionLimit: 5, latencyToleranceMs: Number.POSITIVE_INFINITY })
+
+      expect(summary.rerankReport).toEqual({
+        enabled: false,
+        entries: [],
+        averageMrrAt1Delta: 0
+      })
+    } finally {
+      if (originalEvalRerank === undefined) {
+        delete process.env.CODESIFT_EVAL_RERANK
+      } else {
+        process.env.CODESIFT_EVAL_RERANK = originalEvalRerank
+      }
+
+      if (originalVoyageApiKey === undefined) {
+        delete process.env.VOYAGE_API_KEY
+      } else {
+        process.env.VOYAGE_API_KEY = originalVoyageApiKey
+      }
+    }
+  }, 30_000)
+
   it('proves the deterministic agent policy prefers codesift tools over host grep', async () => {
     const manifest = await loadManifest(DEFAULT_MANIFEST_PATH)
     const proof = proveRoutingPolicy(manifest.queries)
@@ -163,6 +234,49 @@ describe('@codesift/eval', () => {
       resolvedLosses: []
     })
   })
+
+  it('matches multi-target goldens per-target by file and lineRange', () => {
+    const query: GoldenQuery = {
+      id: 'multi-validate',
+      repoId: 'tmp',
+      queryType: 'symbol-def',
+      query: 'validate',
+      expected: [
+        { file: 'src/a.ts', symbol: 'validate', lineRange: { startLine: 3, endLine: 10 } },
+        { file: 'src/b.ts', symbol: 'validate', lineRange: { startLine: 1, endLine: 13 } }
+      ]
+    }
+
+    // A candidate inside target A's own range matches that target.
+    expect(candidateMatchesExpected({ file: 'src/a.ts', symbol: 'validate', range: { startLine: 4, endLine: 9 } }, query)).toBe(true)
+    // Same file + symbol but OUTSIDE the per-target range is not a match — per-target
+    // lineRange scopes each co-relevant definition independently.
+    expect(candidateMatchesExpected({ file: 'src/a.ts', symbol: 'validate', range: { startLine: 40, endLine: 45 } }, query)).toBe(false)
+    // The second target is matched on its own file + range.
+    expect(candidateMatchesExpected({ file: 'src/b.ts', symbol: 'validate', range: { startLine: 5, endLine: 5 } }, query)).toBe(true)
+  })
+
+  it('measures multi-target set-recall on the ambiguous-identifier collision fixture', async () => {
+    const manifest = await loadManifest(DEFAULT_MANIFEST_PATH)
+    const collisionManifest = {
+      repos: manifest.repos.filter((repo) => repo.id === 'collision-ts'),
+      queries: manifest.queries.filter((query) => query.repoId === 'collision-ts')
+    }
+    const summary = await evaluateManifest(collisionManifest, { resultLimit: 10, inspectionLimit: 5, latencyToleranceMs: Number.POSITIVE_INFINITY })
+
+    const collisionRun = summary.runs.find((run) => run.tool === 'codesift' && run.queryId === 'collision-validate-symbol')
+    expect(collisionRun).toBeDefined()
+    // All three same-named definitions surface in the top-5 → full set-recall, and a
+    // multi-target task only succeeds when EVERY co-relevant def is found.
+    expect(collisionRun?.recallAt5).toBe(1)
+    expect(collisionRun?.taskSuccess).toBe(true)
+    // The whole location set arrives in a single find_symbol call — a multi-target
+    // "where are all the Xs" lookup is never charged a per-body follow-up read.
+    expect(collisionRun?.callsToResolution).toBe(1)
+    // rank-1 is one of the relevant defs, so the precision axis must not fire here.
+    const collisionLoss = summary.losses.find((loss) => loss.queryId === 'collision-validate-symbol')
+    expect(collisionLoss?.axes ?? []).not.toContain('precision')
+  }, 30_000)
 
   it('collects ripgrep context lines after the match line, not just before', async () => {
     const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-eval-rg-context-'))

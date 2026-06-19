@@ -1,6 +1,14 @@
 {
   "losses": [
     {
+      "repoId": "collision-ts",
+      "queryId": "collision-validate-symbol",
+      "queryType": "symbol-def",
+      "axes": [
+        "latency.cold"
+      ]
+    },
+    {
       "repoId": "cookie",
       "queryId": "cookie-parse-concept",
       "queryType": "nl-concept",
@@ -33,6 +41,14 @@
       "axes": [
         "latency.cold",
         "tokens"
+      ]
+    },
+    {
+      "repoId": "escape-string-regexp",
+      "queryId": "escape-regexp-symbol",
+      "queryType": "symbol-def",
+      "axes": [
+        "precision"
       ]
     },
     {
