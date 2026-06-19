@@ -1323,36 +1323,34 @@ export function formatMcpGrepHits(hits: GrepHit[], options: FormatMcpGrepHitsOpt
     return 'no_matches'
   }
 
+  const entries = buildMcpGrepEntries(hits)
   const maxTokens = options.maxTokens
   if (maxTokens === undefined) {
-    return hits.map((hit) => formatMcpGrepHit(hit)).join('\n')
+    return entries.map((entry) => entry.text).join('\n')
   }
 
   const maxChars = maxTokens * 4
-  const rendered: string[] = []
+  const rendered: McpRenderedGrepEntry[] = []
   let usedChars = 0
 
-  for (let index = 0; index < hits.length; index += 1) {
-    const hit = hits[index]!
-    const line = formatMcpGrepHit(hit)
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]!
+    const line = entry.text
     const separatorChars = rendered.length === 0 ? 0 : 1
     if (usedChars + separatorChars + line.length <= maxChars) {
-      rendered.push(line)
+      rendered.push({ text: line, hits: entry.hits, matchCount: entry.hits.length })
       usedChars += separatorChars + line.length
       continue
     }
 
     if (rendered.length === 0) {
-      const omitted = hits.length - 1
-      const marker = omitted > 0 ? grepOmissionMarker(omitted, Math.max(0, maxChars - 2)) : undefined
-      const firstHit = formatMcpGrepHit(hit, maxCharsForFirstHit(maxChars, marker))
-      return marker ? withGrepOmissionMarker([firstHit], marker) : firstHit
+      return formatMcpGrepEntryForBudget(entry, hits.length - entry.hits.length, maxChars)
     }
 
-    return fitGrepOutputWithMarker(rendered, hits.length - index, maxChars)
+    return fitGrepOutputWithMarker(rendered, countGrepEntryMatches(entries, index), maxChars)
   }
 
-  return rendered.join('\n')
+  return rendered.map((entry) => entry.text).join('\n')
 }
 
 export function formatMcpReadChunk(content: string, options: FormatMcpReadChunkOptions = {}): string {
@@ -1420,6 +1418,162 @@ function formatMcpGrepHit(hit: GrepHit, maxChars?: number): string {
   return `${prefix}${truncateWithEllipsis(snippet, maxChars - prefix.length)}`
 }
 
+interface McpGrepEntry {
+  hits: GrepHit[]
+  text: string
+}
+
+interface McpRenderedGrepEntry {
+  text: string
+  hits: GrepHit[]
+  matchCount: number
+}
+
+function buildMcpGrepEntries(hits: GrepHit[]): McpGrepEntry[] {
+  const entries: McpGrepEntry[] = []
+
+  for (let index = 0; index < hits.length;) {
+    const group = collectOverlappingGrepHits(hits, index)
+    if (group.length > 1) {
+      entries.push({ hits: group, text: formatMcpGrepGroup(group) })
+      index += group.length
+      continue
+    }
+
+    const hit = hits[index]!
+    entries.push({ hits: [hit], text: formatMcpGrepHit(hit) })
+    index += 1
+  }
+
+  return entries
+}
+
+function collectOverlappingGrepHits(hits: GrepHit[], startIndex: number): GrepHit[] {
+  const first = hits[startIndex]!
+  if (!isGroupableGrepHit(first)) {
+    return [first]
+  }
+
+  const group = [first]
+  let mergedEndLine = first.snippetRange.endLine
+
+  for (let index = startIndex + 1; index < hits.length; index += 1) {
+    const hit = hits[index]!
+    if (!isGroupableGrepHit(hit) || hit.file !== first.file || hit.snippetRange.startLine > mergedEndLine + 1) {
+      break
+    }
+
+    group.push(hit)
+    mergedEndLine = Math.max(mergedEndLine, hit.snippetRange.endLine)
+  }
+
+  return group
+}
+
+function isGroupableGrepHit(hit: GrepHit): hit is GrepHit & { snippetRange: NonNullable<GrepHit['snippetRange']> } {
+  return hit.snippetRange !== undefined &&
+    (hit.snippetRange.startLine < hit.range.startLine || hit.snippetRange.endLine > hit.range.endLine)
+}
+
+function formatMcpGrepGroup(hits: GrepHit[]): string {
+  return [
+    ...hits.map((hit) => formatMcpGrepLocator(hit)),
+    formatMcpGrepMergedSnippet(hits)
+  ].join('\n')
+}
+
+function formatMcpGrepLocator(hit: GrepHit): string {
+  return `${hit.file}:${formatRange(hit.range.startLine, hit.range.endLine)}:${hit.column}`
+}
+
+function formatMcpGrepMergedSnippet(hits: GrepHit[]): string {
+  const sourceLines = new Map<number, string>()
+
+  for (const hit of hits) {
+    if (!hit.snippetRange) {
+      continue
+    }
+
+    const lines = hit.snippet.split('\n')
+    for (let offset = 0; offset < lines.length; offset += 1) {
+      const lineNumber = hit.snippetRange.startLine + offset
+      if (lineNumber <= hit.snippetRange.endLine && !sourceLines.has(lineNumber)) {
+        sourceLines.set(lineNumber, lines[offset]!)
+      }
+    }
+  }
+
+  return [...sourceLines.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([lineNumber, line]) => `${lineNumber} | ${line}`)
+    .join('\n')
+}
+
+function countGrepEntryMatches(entries: McpGrepEntry[], startIndex: number): number {
+  let count = 0
+  for (let index = startIndex; index < entries.length; index += 1) {
+    count += entries[index]!.hits.length
+  }
+  return count
+}
+
+function formatMcpGrepEntryForBudget(entry: McpGrepEntry, omittedAfter: number, maxChars: number): string {
+  if (entry.hits.length === 1) {
+    const marker = omittedAfter > 0 ? grepOmissionMarker(omittedAfter, Math.max(0, maxChars - 2)) : undefined
+    const firstHit = formatMcpGrepHit(entry.hits[0]!, maxCharsForFirstHit(maxChars, marker))
+    return marker ? withGrepOmissionMarker([firstHit], marker) : firstHit
+  }
+
+  return formatMcpGrepGroupForBudget(entry.hits, omittedAfter, maxChars)
+}
+
+function formatMcpGrepGroupForBudget(hits: GrepHit[], omittedAfter: number, maxChars: number): string {
+  for (let locatorCount = hits.length; locatorCount >= 1; locatorCount -= 1) {
+    const omitted = omittedAfter + hits.length - locatorCount
+    const marker = omitted > 0 ? grepOmissionMarker(omitted, Math.max(0, maxChars - 2)) : undefined
+    const locators = hits.slice(0, locatorCount).map((hit) => formatMcpGrepLocator(hit))
+    const locatorText = locators.join('\n')
+    const locatorOutput = marker ? withGrepOmissionMarker(locators, marker) : locatorText
+
+    if (locatorOutput.length > maxChars) {
+      continue
+    }
+
+    const snippetBudget = marker === undefined
+      ? maxChars - locatorText.length - 1
+      : maxChars - locatorText.length - marker.length - 2
+    if (snippetBudget <= 0) {
+      return locatorOutput
+    }
+
+    const snippet = truncateGrepGroupSnippet(formatMcpGrepMergedSnippet(hits.slice(0, locatorCount)), snippetBudget)
+    if (!snippet) {
+      return locatorOutput
+    }
+
+    const withSnippet = marker
+      ? withGrepOmissionMarker([...locators, snippet], marker)
+      : `${locatorText}\n${snippet}`
+    if (withSnippet.length <= maxChars) {
+      return withSnippet
+    }
+  }
+
+  const marker = grepOmissionMarker(Math.max(0, omittedAfter + hits.length - 1), Math.max(0, maxChars - 2))
+  const firstHit = formatMcpGrepHit(hits[0]!, maxCharsForFirstHit(maxChars, marker))
+  return marker ? withGrepOmissionMarker([firstHit], marker) : firstHit
+}
+
+function truncateGrepGroupSnippet(snippet: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return ''
+  }
+  if (snippet.length <= maxChars) {
+    return snippet
+  }
+  return truncateWithEllipsis(snippet, maxChars).replace(/\n+$/g, '')
+}
+
 function formatGrepPrefix(file: string, suffix: string, maxChars: number): string {
   const prefix = `${file}${suffix}`
   if (prefix.length <= maxChars) {
@@ -1434,26 +1588,31 @@ function formatGrepPrefix(file: string, suffix: string, maxChars: number): strin
   return suffix.length <= maxChars ? suffix : suffix.slice(-maxChars)
 }
 
-function fitGrepOutputWithMarker(rendered: string[], omitted: number, maxChars: number): string {
+function fitGrepOutputWithMarker(rendered: McpRenderedGrepEntry[], omitted: number, maxChars: number): string {
   const kept = [...rendered]
   let omittedCount = omitted
   let marker = grepOmissionMarker(omittedCount, Math.max(0, maxChars - 2))
 
-  while (kept.length > 1 && joinedLength(kept, marker) > maxChars) {
-    kept.pop()
-    omittedCount += 1
+  while (kept.length > 1 && joinedLength(kept.map((entry) => entry.text), marker) > maxChars) {
+    omittedCount += kept.pop()!.matchCount
     marker = grepOmissionMarker(omittedCount, Math.max(0, maxChars - 2))
   }
 
   if (!marker) {
-    return formatMcpGrepLineForBudget(kept[0]!, maxChars)
+    return formatMcpGrepLineForBudget(kept[0]!.text, maxChars)
   }
 
-  if (joinedLength(kept, marker) <= maxChars) {
-    return withGrepOmissionMarker(kept, marker)
+  const keptText = kept.map((entry) => entry.text)
+  if (joinedLength(keptText, marker) <= maxChars) {
+    return withGrepOmissionMarker(keptText, marker)
   }
 
-  const line = formatMcpGrepLineForBudget(kept[0]!, maxCharsForFirstHit(maxChars, marker))
+  const firstEntry = kept[0]!
+  if (firstEntry.matchCount > 1) {
+    return formatMcpGrepEntryForBudget({ hits: firstEntry.hits, text: firstEntry.text }, omittedCount, maxChars)
+  }
+
+  const line = formatMcpGrepLineForBudget(firstEntry.text, maxCharsForFirstHit(maxChars, marker))
   return marker ? withGrepOmissionMarker([line], marker) : line
 }
 

@@ -78,6 +78,7 @@ export interface GrepHit {
   column: number
   match: string
   snippet: string
+  snippetRange?: Range
   language?: string
 }
 

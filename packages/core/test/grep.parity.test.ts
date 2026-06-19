@@ -61,6 +61,34 @@ describe('@codesift/core grep parity', () => {
       expect(codesiftHits).toEqual(ripgrepHits)
     }
   })
+
+  it('returns the snippet range used to build contextual grep snippets', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-grep-snippet-range-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    await writeFile(
+      join(repoRoot, 'src', 'demo.ts'),
+      [
+        'const before = true',
+        "const value = 'NEEDLE'",
+        'const after = true'
+      ].join('\n'),
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    await expect(repo.grep('NEEDLE', { pathGlob: 'src/**', contextLines: 1 })).resolves.toMatchObject([
+      {
+        file: 'src/demo.ts',
+        range: { startLine: 2, endLine: 2 },
+        snippet: "const before = true\nconst value = 'NEEDLE'\nconst after = true",
+        snippetRange: { startLine: 1, endLine: 3 }
+      }
+    ])
+  })
 })
 
 async function runRipgrep(repoRoot: string, pattern: string, options?: GrepOptions): Promise<Array<{ file: string; startLine: number; endLine: number; column: number; match: string }>> {

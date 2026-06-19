@@ -623,7 +623,8 @@ export class SqliteRepo implements Repo {
             line: startLine,
             column: startOffset - lineStarts[startLine - 1]! + 1,
             match: matchedText,
-            snippet: lines.slice(snippetStartLine - 1, snippetEndLine).join('\n')
+            snippet: lines.slice(snippetStartLine - 1, snippetEndLine).join('\n'),
+            snippetRange: { startLine: snippetStartLine, endLine: snippetEndLine }
           }
 
           if (file.language) {

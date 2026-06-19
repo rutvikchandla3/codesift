@@ -840,6 +840,125 @@ describe('formatMcpGrepHits keeps its single-line ↩-joined format', () => {
     expect(output).toBe('src/auth.ts:10-12:3 | function verify() { ↩ return true ↩ }')
   })
 
+  it('merges overlapping same-file context windows while keeping every match locator', () => {
+    const output = formatMcpGrepHits([
+      makeGrepHit({
+        range: { startLine: 2, endLine: 2 },
+        line: 2,
+        column: 16,
+        match: 'NEEDLE',
+        snippet: "const before = true\nconst first = 'NEEDLE'\nconst shared = true",
+        snippetRange: { startLine: 1, endLine: 3 }
+      }),
+      makeGrepHit({
+        range: { startLine: 4, endLine: 4 },
+        line: 4,
+        column: 17,
+        match: 'NEEDLE',
+        snippet: "const shared = true\nconst second = 'NEEDLE'\nconst after = true",
+        snippetRange: { startLine: 3, endLine: 5 }
+      })
+    ])
+
+    expect(output).toBe([
+      'src/auth.ts:2:16',
+      'src/auth.ts:4:17',
+      '1 | const before = true',
+      "2 | const first = 'NEEDLE'",
+      '3 | const shared = true',
+      "4 | const second = 'NEEDLE'",
+      '5 | const after = true'
+    ].join('\n'))
+    expect(output.match(/3 \| const shared = true/g)).toHaveLength(1)
+  })
+
+  it('keeps no-context adjacent hits in the existing compact format', () => {
+    const output = formatMcpGrepHits([
+      makeGrepHit({
+        range: { startLine: 2, endLine: 2 },
+        line: 2,
+        snippet: "const first = 'NEEDLE'",
+        snippetRange: { startLine: 2, endLine: 2 }
+      }),
+      makeGrepHit({
+        range: { startLine: 3, endLine: 3 },
+        line: 3,
+        snippet: "const second = 'NEEDLE'",
+        snippetRange: { startLine: 3, endLine: 3 }
+      })
+    ])
+
+    expect(output).toBe([
+      "src/auth.ts:2:3 | const first = 'NEEDLE'",
+      "src/auth.ts:3:3 | const second = 'NEEDLE'"
+    ].join('\n'))
+  })
+
+  it('counts omitted grouped grep entries by matches rather than groups', () => {
+    const output = formatMcpGrepHits([
+      makeGrepHit({
+        range: { startLine: 2, endLine: 2 },
+        line: 2,
+        snippet: "a\nconst first = 'NEEDLE'\nb",
+        snippetRange: { startLine: 1, endLine: 3 }
+      }),
+      makeGrepHit({
+        range: { startLine: 4, endLine: 4 },
+        line: 4,
+        snippet: "b\nconst second = 'NEEDLE'\nc",
+        snippetRange: { startLine: 3, endLine: 5 }
+      }),
+      makeGrepHit({
+        range: { startLine: 20, endLine: 20 },
+        line: 20,
+        snippet: "x\nconst third = 'NEEDLE'\ny",
+        snippetRange: { startLine: 19, endLine: 21 }
+      }),
+      makeGrepHit({
+        range: { startLine: 22, endLine: 22 },
+        line: 22,
+        snippet: "y\nconst fourth = 'NEEDLE'\nz",
+        snippetRange: { startLine: 21, endLine: 23 }
+      })
+    ], { maxTokens: 45 })
+
+    expect(output).toContain('src/auth.ts:2:3')
+    expect(output).toContain('src/auth.ts:4:3')
+    expect(output).not.toContain('src/auth.ts:20:3')
+    expect(output).not.toContain('src/auth.ts:22:3')
+    expect(output).toContain('matches_omitted=2')
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(45)
+  })
+
+  it('keeps all locators from the first merged group when its snippet is over budget', () => {
+    const output = formatMcpGrepHits([
+      makeGrepHit({
+        range: { startLine: 2, endLine: 2 },
+        line: 2,
+        snippet: `${'a'.repeat(80)}\nconst first = 'NEEDLE'\n${'b'.repeat(80)}`,
+        snippetRange: { startLine: 1, endLine: 3 }
+      }),
+      makeGrepHit({
+        range: { startLine: 4, endLine: 4 },
+        line: 4,
+        snippet: `${'b'.repeat(80)}\nconst second = 'NEEDLE'\n${'c'.repeat(80)}`,
+        snippetRange: { startLine: 3, endLine: 5 }
+      }),
+      makeGrepHit({
+        range: { startLine: 20, endLine: 20 },
+        line: 20,
+        snippet: "const third = 'NEEDLE'",
+        snippetRange: { startLine: 20, endLine: 20 }
+      })
+    ], { maxTokens: 35 })
+
+    expect(output).toContain('src/auth.ts:2:3')
+    expect(output).toContain('src/auth.ts:4:3')
+    expect(output).not.toContain('src/auth.ts:20:3')
+    expect(output).toContain('matches_omitted=1')
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(35)
+  })
+
   it('preserves first hits and appends a compact omission marker when maxTokens truncates matches', () => {
     const hits = Array.from({ length: 6 }, (_, index) =>
       makeGrepHit({
@@ -912,6 +1031,34 @@ describe('grep_code MCP output budgeting', () => {
     expect(output).toContain("src/noisy.ts:1:24 | export const value0 = 'NEEDLE_0'")
     expect(output).toContain('matches_omitted=')
     expect(output).not.toContain('NEEDLE_19')
+  })
+
+  it('merges nearby grep_code context windows through callMcpTool', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-mcp-grep-context-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    await writeFile(
+      join(repoRoot, 'src', 'cluster.ts'),
+      [
+        'const before = true',
+        "const first = 'NEEDLE'",
+        'const shared = true',
+        "const second = 'NEEDLE'",
+        'const after = true'
+      ].join('\n'),
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const output = await callMcpTool(repo, 'grep_code', { pattern: 'NEEDLE', path_glob: 'src/**', context_lines: 1 })
+    expect(output).toContain('src/cluster.ts:2:16')
+    expect(output).toContain('src/cluster.ts:4:17')
+    expect(output.match(/3 \| const shared = true/g)).toHaveLength(1)
+    expect(output).toContain("2 | const first = 'NEEDLE'")
+    expect(output).toContain("4 | const second = 'NEEDLE'")
   })
 })
 
