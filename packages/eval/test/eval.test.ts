@@ -204,10 +204,12 @@ describe('@codesift/eval', () => {
       missingUsageFiles: []
     })
     expect(summary.usagesReport[0]?.withUsagesCallsDelta).toBeGreaterThanOrEqual(1)
+    expect(summary.usagesReport[0]?.withUsagesTokensToResolution).toBeGreaterThan(0)
     expect(summary.usagesReport[0]?.withUsagesCallsToResolution).toBeLessThan(summary.usagesReport[0]?.withoutUsagesCallsToResolution ?? 0)
 
     const rendered = formatSummary(summary)
     expect(rendered).toContain('with_usages report-only')
+    expect(rendered).toContain('bundledTokens=')
     expect(rendered).toContain('usageRecall=1.00')
   }, 30_000)
 

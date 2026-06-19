@@ -9,6 +9,7 @@ import { openRepo, registerEmbeddingProvider, type GrepHit, type SearchHit, type
 
 import {
   DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS,
+  DEFAULT_MCP_SEARCH_MAX_TOKENS,
   DEFAULT_MCP_READ_CHUNK_MAX_TOKENS,
   DEFAULT_SEARCH_K,
   MIN_MCP_READ_CHUNK_MAX_TOKENS,
@@ -61,6 +62,7 @@ describe('@codesift/mcp server', () => {
       max_tokens: { type: 'integer', minimum: MIN_MCP_READ_CHUNK_MAX_TOKENS, maximum: 4000, default: DEFAULT_MCP_READ_CHUNK_MAX_TOKENS }
     })
     expect(getToolDefinitions().find((tool) => tool.name === 'search_code')?.inputSchema.properties).toMatchObject({
+      max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_SEARCH_MAX_TOKENS },
       context: { type: 'string', enum: ['sig', 'body'] },
       with_usages: { type: 'boolean' }
     })
@@ -170,6 +172,46 @@ describe('@codesift/mcp server', () => {
     expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(35)
     expect(output).toContain('#1 function sharedName')
     expect(output).toContain('symbols_omitted=')
+  })
+
+  it('budgets search_code output through the MCP call surface, including bundled usages', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-mcp-search-budget-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    await writeFile(
+      join(repoRoot, 'src', 'demo.ts'),
+      [
+        'export function demoValue(input: string): string {',
+        `  const message = \`${'x'.repeat(160)}:${'y'.repeat(160)}\``,
+        '  return `${input}:${message}`',
+        '}',
+        ''
+      ].join('\n'),
+      'utf8'
+    )
+    await Promise.all(([
+      ['app.ts', "import { demoValue } from './demo'\nexport const appResult = demoValue('app' + '-'.repeat(80))\n"],
+      ['worker.ts', "import { demoValue } from './demo'\nexport const workerResult = demoValue('worker' + '-'.repeat(80))\n"],
+      ['job.ts', "import { demoValue } from './demo'\nexport const jobResult = demoValue('job' + '-'.repeat(80))\n"],
+      ['cli.ts', "import { demoValue } from './demo'\nexport const cliResult = demoValue('cli' + '-'.repeat(80))\n"]
+    ] satisfies Array<[string, string]>).map(async ([file, content]) => {
+      await writeFile(join(repoRoot, 'src', file), content, 'utf8')
+    }))
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+    const output = await callMcpTool(repo, 'search_code', {
+      query: 'demoValue',
+      k: 3,
+      context: 'body',
+      with_usages: true,
+      max_tokens: 45
+    })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(45)
+    expect(output).toContain('src/demo.ts')
+    expect(output).toContain('usages_omitted=')
   })
 
   it('creates server handles', async () => {
@@ -484,6 +526,131 @@ describe('formatMcpSearchHits structure-preserving output', () => {
   it('omits the ambiguity hint for an ordinary (non-colliding) result set', () => {
     const output = formatMcpSearchHits([makeHit({})])
     expect(output).not.toContain('ambiguous:')
+  })
+})
+
+describe('formatMcpSearchHits budgeted output', () => {
+  it('preserves no_hits and under-budget output byte-for-byte', () => {
+    expect(formatMcpSearchHits([], { maxTokens: DEFAULT_MCP_SEARCH_MAX_TOKENS })).toBe('no_hits')
+
+    const usageSnippet = "  return verify(token)\n    // keep trailing spaces  "
+    const hits = [makeHit({
+      body: 'export function verify() {\n  return true\n}',
+      usages: [
+        { file: 'src/server.ts', range: { startLine: 4, endLine: 5 }, line: 4, snippet: usageSnippet, resolution: 'import-resolved' }
+      ]
+    })]
+    const expected = [
+      '~ src/auth.ts:10-14 verify',
+      '10 | export function verify() {',
+      '11 |   return true',
+      '12 | }',
+      'usages (import-resolved):',
+      `- src/server.ts:4 | ${usageSnippet}`,
+      'tokensReturned=42'
+    ].join('\n')
+
+    expect(formatMcpSearchHits(hits)).toBe(expected)
+    expect(formatMcpSearchHits(hits, { maxTokens: 200 })).toBe(expected)
+  })
+
+  it('preserves the first hit and appends a hits_omitted marker when later hits are dropped', () => {
+    const hits = Array.from({ length: 5 }, (_, index) =>
+      makeHit({
+        id: `src/file-${index}.ts:${index + 1}-${index + 4}@abcdef0${index}`,
+        file: `src/file-${index}.ts`,
+        range: { startLine: index + 1, endLine: index + 4 },
+        snippetRange: { startLine: index + 1, endLine: index + 4 },
+        body: `export function repeated${index}() {\n  return '${'x'.repeat(70)}-${index}'\n}`,
+        tokensReturned: 30 + index
+      })
+    )
+
+    const output = formatMcpSearchHits(hits, { maxTokens: 40 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(40)
+    expect(output).toContain('src/file-0.ts:1-4')
+    expect(output).not.toContain('src/file-4.ts')
+    expect(output).toContain('hits_omitted=')
+  })
+
+  it('truncates usage snippets without losing file:line locators and reports omitted usages', () => {
+    const output = formatMcpSearchHits([
+      makeHit({
+        body: 'export function verify() {\n  return true\n}',
+        usages: Array.from({ length: 5 }, (_, index) => ({
+          file: `src/callers/${index}.ts`,
+          range: { startLine: index + 40, endLine: index + 40 },
+          line: index + 40,
+          snippet: `  return verify(token, '${'x'.repeat(90)}', '${'y'.repeat(90)}')`,
+          resolution: 'import-resolved' as const
+        }))
+      })
+    ], { maxTokens: 42 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(42)
+    expect(output).toContain('usages (import-resolved):')
+    expect(output).toMatch(/- src\/callers\/0\.ts:40 \| /)
+    expect(output).toContain('usages_omitted=')
+  })
+
+  it('keeps the bare usage omission marker when that is the only variant that fits', () => {
+    const output = formatMcpSearchHits([
+      makeHit({
+        body: 'export function verify() {\n  const normalized = token.trim()\n  return normalized.length > 0\n}',
+        usages: Array.from({ length: 5 }, (_, index) => ({
+          file: `src/usage/${index}.ts`,
+          range: { startLine: index + 10, endLine: index + 10 },
+          line: index + 10,
+          snippet: `  return verify(token, '${'x'.repeat(80)}')`,
+          resolution: 'import-resolved' as const
+        }))
+      })
+    ], { maxTokens: 12 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(12)
+    expect(output).toContain('usages_omitted=5')
+    expect(output).not.toContain('raise max_tokens')
+  })
+
+  it('keeps a recognizable omission marker for tiny budgets when it fits', () => {
+    const output = formatMcpSearchHits([
+      makeHit({ body: `export function verify() {\n  return '${'x'.repeat(120)}'\n}` }),
+      makeHit({ file: 'src/other.ts', id: 'src/other.ts:1-1@beef0002' })
+    ], { maxTokens: 5 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(5)
+    expect(output).toContain('hits_omitted=1')
+  })
+
+  it('falls back to a truncated hit omission marker instead of a misleading bare hit when the budget is microscopic', () => {
+    const output = formatMcpSearchHits([
+      makeHit({ body: `export function verify() {\n  return '${'x'.repeat(120)}'\n}` }),
+      makeHit({ file: 'src/other.ts', id: 'src/other.ts:1-1@beef0002' })
+    ], { maxTokens: 3 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(3)
+    expect(output).toContain('hits_omit')
+    expect(output).not.toContain('src/auth.ts:10-14 verify')
+  })
+
+  it('falls back to a truncated usage omission marker instead of silently dropping usages', () => {
+    const output = formatMcpSearchHits([
+      makeHit({
+        body: 'export function verify() {\n  const normalized = token.trim()\n  return normalized.length > 0\n}',
+        usages: Array.from({ length: 5 }, (_, index) => ({
+          file: `src/usage/${index}.ts`,
+          range: { startLine: index + 10, endLine: index + 10 },
+          line: index + 10,
+          snippet: `  return verify(token, '${'x'.repeat(80)}')`,
+          resolution: 'import-resolved' as const
+        }))
+      })
+    ], { maxTokens: 4 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(4)
+    expect(output).toContain('usages_omit')
+    expect(output).not.toContain('usages (import-resolved):')
   })
 })
 

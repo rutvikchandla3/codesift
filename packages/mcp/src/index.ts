@@ -23,6 +23,7 @@ import { createHttpServerHandle } from './http.js'
 export { HttpMcpServerHandle, createHttpServerHandle } from './http.js'
 
 export const DEFAULT_SEARCH_K = CORE_DEFAULT_SEARCH_K
+export const DEFAULT_MCP_SEARCH_MAX_TOKENS = 700
 export const DEFAULT_MCP_GREP_MAX_TOKENS = 700
 export const DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS = 700
 export const DEFAULT_MCP_READ_CHUNK_MAX_TOKENS = 1000
@@ -89,6 +90,10 @@ export interface GrepCodeArgs {
 }
 
 export interface FormatMcpGrepHitsOptions {
+  maxTokens?: number | undefined
+}
+
+export interface FormatMcpSearchHitsOptions {
   maxTokens?: number | undefined
 }
 
@@ -253,7 +258,7 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
         lang: { type: 'array', items: { type: 'string' } },
         path_glob: { type: 'string' },
         kind: kindJsonSchema(),
-        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: 700 },
+        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_SEARCH_MAX_TOKENS },
         single_best: { type: 'boolean' },
         context: { type: 'string', enum: ['sig', 'body'] },
         with_usages: { type: 'boolean' }
@@ -324,7 +329,7 @@ export function createRouter(repo: Repo): McpRouter {
         options.kind = args.kind
       }
 
-      options.maxTokens = args.max_tokens ?? 700
+      options.maxTokens = args.max_tokens ?? DEFAULT_MCP_SEARCH_MAX_TOKENS
       if (args.single_best !== undefined) {
         options.singleBest = args.single_best
       }
@@ -412,7 +417,10 @@ export async function callMcpTool(repo: Repo, name: McpToolName, args: unknown):
 
   switch (name) {
     case 'search_code':
-      return formatMcpSearchHits(await router.searchCode(searchCodeArgsSchema.parse(args)))
+      {
+        const parsed = searchCodeArgsSchema.parse(args)
+        return formatMcpSearchHits(await router.searchCode(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_SEARCH_MAX_TOKENS })
+      }
     case 'find_symbol':
       {
         const parsed = findSymbolArgsSchema.parse(args)
@@ -495,7 +503,7 @@ export function createSdkServer(repo: Repo): McpServer {
   )
 
   server.registerTool('search_code', { description: toolDescription('search_code'), inputSchema: searchCodeInputSchema }, async (args) =>
-    textResult(formatMcpSearchHits(await router.searchCode(args)))
+    textResult(formatMcpSearchHits(await router.searchCode(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_SEARCH_MAX_TOKENS }))
   )
   server.registerTool('find_symbol', { description: toolDescription('find_symbol'), inputSchema: findSymbolInputSchema }, async (args) =>
     textResult(formatMcpSymbols(await router.findSymbol(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS }))
@@ -553,37 +561,314 @@ function toolDescription(name: McpToolName): string {
   return tool?.description ?? name
 }
 
-export function formatMcpSearchHits(hits: SearchHit[]): string {
+export function formatMcpSearchHits(hits: SearchHit[], options: FormatMcpSearchHitsOptions = {}): string {
   if (hits.length === 0) {
     return 'no_hits'
   }
 
+  const ambiguityHint = formatSearchAmbiguityHint(hits[0])
+  const tokensLine = formatSearchTokensLine(hits)
+  const renderedHits = hits.map((hit) => formatMcpSearchHit(hit))
+  const output = joinSections([ambiguityHint, ...renderedHits, tokensLine])
+  const maxTokens = options.maxTokens
+  if (maxTokens === undefined || output.length <= maxTokens * 4) {
+    return output
+  }
+
+  return fitSearchOutputForBudget(hits, renderedHits, ambiguityHint, tokensLine, maxTokens * 4)
+}
+
+function formatSearchAmbiguityHint(hit: SearchHit | undefined): string {
   // An identifier that collides across multiple definitions is returned as a candidate
   // set, not a single confident answer — lead with the collision count so the caller
   // disambiguates instead of trusting the first row.
-  const ambiguousDefCount = hits[0]?.ambiguousDefCount
-  const ambiguityHint = ambiguousDefCount && ambiguousDefCount >= 2 ? `ambiguous: ${ambiguousDefCount} defs\n` : ''
+  const ambiguousDefCount = hit?.ambiguousDefCount
+  return ambiguousDefCount && ambiguousDefCount >= 2 ? `ambiguous: ${ambiguousDefCount} defs` : ''
+}
 
+function formatSearchTokensLine(hits: SearchHit[]): string {
   const tokensReturned = hits.reduce((sum, hit) => sum + hit.tokensReturned, 0)
-  const body = hits
-    .map((hit) => {
-      const symbol = formatHitSymbol(hit)
-      const generated = hit.generated ? ' [generated]' : ''
-      const stale = hit.stale ? ' [stale]' : ''
-      const header = `${hit.reason} ${formatChunkId(hit.id)}${symbol}${generated}${stale}`
+  return `tokensReturned=${tokensReturned}`
+}
 
-      if (hit.body !== undefined) {
-        const block = `${header}\n${formatBodyBlock(hit.body, hit.range.startLine ?? hit.snippetRange.startLine)}`
-        return hit.usages?.length ? `${block}\n${formatUsageBlock(hit.usages)}` : block
+function formatMcpSearchHit(hit: SearchHit): string {
+  const sections = [formatSearchHitHeader(hit)]
+  const content = formatSearchHitContent(hit)
+  if (content) {
+    sections.push(content)
+  }
+  if (hit.usages?.length) {
+    sections.push(formatUsageBlock(hit.usages))
+  }
+  return joinSections(sections)
+}
+
+function formatSearchHitHeader(hit: SearchHit): string {
+  const symbol = formatHitSymbol(hit)
+  const generated = hit.generated ? ' [generated]' : ''
+  const stale = hit.stale ? ' [stale]' : ''
+  return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${generated}${stale}`
+}
+
+function formatSearchHitContent(hit: SearchHit): string {
+  if (hit.body !== undefined) {
+    return formatBodyBlock(hit.body, hit.range.startLine ?? hit.snippetRange.startLine)
+  }
+
+  return compactHitSnippet(hit.snippet, hit.snippetRange.startLine ?? hit.range.startLine, 4)
+}
+
+function fitSearchOutputForBudget(
+  hits: SearchHit[],
+  renderedHits: string[],
+  ambiguityHint: string,
+  tokensLine: string,
+  maxChars: number
+): string {
+  const leadingSections = ambiguityHint ? [ambiguityHint] : []
+  const hitsOnlyOutput = joinSections([...leadingSections, ...renderedHits])
+  if (hitsOnlyOutput.length <= maxChars) {
+    return appendSearchTokensLineIfFits(hitsOnlyOutput, tokensLine, maxChars)
+  }
+
+  const keptHits: string[] = []
+  for (let index = 0; index < renderedHits.length; index += 1) {
+    const candidateHits = [...keptHits, renderedHits[index]!]
+    const omitted = renderedHits.length - candidateHits.length
+    const marker = omitted > 0
+      ? searchHitOmissionMarker(omitted, remainingCharsForTrailingLine([...leadingSections, ...candidateHits], maxChars))
+      : ''
+    const candidateOutput = joinSections([...leadingSections, ...candidateHits, marker])
+    if (candidateOutput.length <= maxChars) {
+      keptHits.push(renderedHits[index]!)
+      continue
+    }
+
+    if (keptHits.length === 0) {
+      const output = fitSearchSingleHitOutput(hits[0]!, leadingSections, omitted, maxChars)
+      return appendSearchTokensLineIfFits(output, tokensLine, maxChars)
+    }
+
+    break
+  }
+
+  const outputHits = [...keptHits]
+  let omitted = renderedHits.length - outputHits.length
+  let marker = omitted > 0
+    ? searchHitOmissionMarker(omitted, remainingCharsForTrailingLine([...leadingSections, ...outputHits], maxChars))
+    : ''
+
+  while (omitted > 0 && !marker && outputHits.length > 1) {
+    outputHits.pop()
+    omitted += 1
+    marker = searchHitOmissionMarker(omitted, remainingCharsForTrailingLine([...leadingSections, ...outputHits], maxChars))
+  }
+
+  if (omitted > 0 && !marker && outputHits.length === 1) {
+    const output = fitSearchSingleHitOutput(hits[0]!, leadingSections, omitted, maxChars)
+    return appendSearchTokensLineIfFits(output, tokensLine, maxChars)
+  }
+
+  const output = joinSections([...leadingSections, ...outputHits, marker])
+  return appendSearchTokensLineIfFits(output, tokensLine, maxChars)
+}
+
+function fitSearchSingleHitOutput(hit: SearchHit, leadingSections: string[], omittedHits: number, maxChars: number): string {
+  const leadingOnly = joinSections(leadingSections)
+  const header = formatSearchHitHeader(hit)
+  const trailingVariants = omittedHits > 0 ? searchHitOmissionMarkerVariants(omittedHits) : ['']
+
+  for (const trailingLine of trailingVariants) {
+    const reservedHitBudget = maxChars
+      - (leadingOnly ? leadingOnly.length + 1 : 0)
+      - (trailingLine ? trailingLine.length + 1 : 0)
+    if (reservedHitBudget <= 0) {
+      continue
+    }
+
+    const hitOutput = formatSearchHitForBudget(hit, reservedHitBudget)
+    if (hitOutput) {
+      const candidate = joinSections([...leadingSections, hitOutput, trailingLine])
+      if (candidate.length <= maxChars) {
+        return candidate
+      }
+    }
+  }
+
+  const hitBudget = maxChars - (leadingOnly ? leadingOnly.length + 1 : 0)
+  if (omittedHits === 0 && hitBudget > 0 && hitBudget >= header.length) {
+    const hitOnly = formatSearchHitForBudget(hit, hitBudget)
+    if (hitOnly) {
+      const candidate = joinSections([...leadingSections, hitOnly])
+      if (candidate.length <= maxChars) {
+        return candidate
+      }
+    }
+  }
+
+  if (omittedHits > 0) {
+    const markerWithLeading = fitMarkerWithLeadingSections(leadingSections, trailingVariants, maxChars)
+    if (markerWithLeading) {
+      return markerWithLeading
+    }
+
+    return bestEffortOmissionMarker(trailingVariants, maxChars)
+  }
+
+  for (const trailingLine of trailingVariants) {
+    if (trailingLine && trailingLine.length <= maxChars) {
+      return trailingLine
+    }
+  }
+
+  if (leadingOnly && leadingOnly.length <= maxChars) {
+    return leadingOnly
+  }
+
+  return formatSearchHitForBudget(hit, maxChars)
+}
+
+function formatSearchHitForBudget(hit: SearchHit, maxChars: number): string {
+  const full = formatMcpSearchHit(hit)
+  if (full.length <= maxChars) {
+    return full
+  }
+
+  const header = formatSearchHitHeader(hit)
+  const content = formatSearchHitContent(hit)
+  const usageCount = hit.usages?.length ?? 0
+  if (maxChars <= header.length) {
+    if (usageCount > 0) {
+      return reserveUsageMarkerForSearchHit(header, content || undefined, maxChars, usageCount)
+    }
+    return truncateWithEllipsis(header, maxChars)
+  }
+
+  const sections = [header]
+
+  if (content) {
+    const remainingAfterHeader = maxChars - header.length - 1
+    if (content.length + 1 <= remainingAfterHeader) {
+      sections.push(content)
+      if (usageCount > 0) {
+        const usageBlock = formatUsageBlockForBudget(hit.usages!, maxChars - joinSections(sections).length - 1)
+        if (usageBlock) {
+          sections.push(usageBlock)
+          return joinSections(sections)
+        }
+
+        return reserveUsageMarkerForSearchHit(header, content, maxChars, usageCount)
+      }
+      return joinSections(sections)
+    }
+
+    if (usageCount > 0) {
+      return reserveUsageMarkerForSearchHit(header, content, maxChars, usageCount)
+    }
+
+    const truncatedContent = truncateSearchBlock(content, remainingAfterHeader)
+    if (truncatedContent) {
+      sections.push(truncatedContent)
+    }
+    const fallback = joinSections(sections)
+    return fallback.length <= maxChars ? fallback : truncateWithEllipsis(fallback, maxChars)
+  }
+
+  if (usageCount > 0) {
+    const usageBlock = formatUsageBlockForBudget(hit.usages!, maxChars - header.length - 1)
+    if (usageBlock) {
+      return joinSections([header, usageBlock])
+    }
+
+    return reserveUsageMarkerForSearchHit(header, undefined, maxChars, usageCount)
+  }
+
+  return truncateWithEllipsis(header, maxChars)
+}
+
+function reserveUsageMarkerForSearchHit(header: string, content: string | undefined, maxChars: number, omittedUsages: number): string {
+  const markers = usageOmissionMarkerVariants(omittedUsages)
+
+  if (content !== undefined) {
+    for (const marker of markers) {
+      const contentBudget = maxChars - header.length - 1 - marker.length - 1
+      if (contentBudget <= 0) {
+        continue
       }
 
-      const snippet = compactHitSnippet(hit.snippet, hit.snippetRange.startLine ?? hit.range.startLine, 4)
-      const block = snippet ? `${header}\n${snippet}` : header
-      return hit.usages?.length ? `${block}\n${formatUsageBlock(hit.usages)}` : block
-    })
-    .join('\n')
+      const truncatedContent = truncateSearchBlock(content, contentBudget)
+      if (!truncatedContent) {
+        continue
+      }
 
-  return `${ambiguityHint}${body}\ntokensReturned=${tokensReturned}`
+      const candidate = joinSections([header, truncatedContent, marker])
+      if (candidate.length <= maxChars) {
+        return candidate
+      }
+    }
+  }
+
+  const headerWithMarker = fitMarkerWithLeadingSections([header], markers, maxChars)
+  if (headerWithMarker) {
+    return headerWithMarker
+  }
+
+  if (content !== undefined) {
+    for (const marker of markers) {
+      const contentBudget = maxChars - marker.length - 1
+      if (contentBudget <= 0) {
+        continue
+      }
+
+      const truncatedContent = truncateSearchBlock(content, contentBudget)
+      if (!truncatedContent) {
+        continue
+      }
+
+      const candidate = joinSections([truncatedContent, marker])
+      if (candidate.length <= maxChars) {
+        return candidate
+      }
+    }
+  }
+
+  return bestEffortOmissionMarker(markers, maxChars)
+}
+
+function fitMarkerWithLeadingSections(leadingSections: string[], markers: string[], maxChars: number): string {
+  for (const marker of markers) {
+    const markerWithLeading = joinSections([...leadingSections, marker])
+    if (markerWithLeading && markerWithLeading.length <= maxChars) {
+      return markerWithLeading
+    }
+  }
+
+  const leadingOutput = joinSections(leadingSections)
+  const remainingForMarker = maxChars - (leadingOutput ? leadingOutput.length + 1 : 0)
+  if (remainingForMarker > 0) {
+    const truncatedMarker = bestEffortOmissionMarker(markers, remainingForMarker)
+    if (truncatedMarker) {
+      const candidate = joinSections([...leadingSections, truncatedMarker])
+      if (candidate.length <= maxChars) {
+        return candidate
+      }
+    }
+  }
+
+  return ''
+}
+
+function bestEffortOmissionMarker(markers: string[], maxChars: number): string {
+  if (maxChars <= 0 || markers.length === 0) {
+    return ''
+  }
+
+  const fittingMarker = firstMarkerThatFits(markers, maxChars)
+  if (fittingMarker) {
+    return fittingMarker
+  }
+
+  return truncateWithEllipsis(markers[0]!, maxChars)
 }
 
 function formatBodyBlock(body: string, startLine: number): string {
@@ -594,9 +879,97 @@ function formatBodyBlock(body: string, startLine: number): string {
 function formatUsageBlock(usages: SymbolUsage[]): string {
   const lines = ['usages (import-resolved):']
   for (const usage of usages) {
-    lines.push(`- ${usage.file}:${usage.line} | ${usage.snippet}`)
+    lines.push(formatUsageLineRaw(usage))
   }
   return lines.join('\n')
+}
+
+function formatUsageBlockForBudget(usages: SymbolUsage[], maxChars: number): string {
+  if (maxChars <= 0) {
+    return ''
+  }
+
+  const full = formatUsageBlock(usages)
+  if (full.length <= maxChars) {
+    return full
+  }
+
+  const markerOnly = bestEffortOmissionMarker(usageOmissionMarkerVariants(usages.length), maxChars)
+  const header = 'usages (import-resolved):'
+  if (header.length > maxChars) {
+    return markerOnly
+  }
+
+  const sections = [header]
+  for (let index = 0; index < usages.length; index += 1) {
+    const usage = usages[index]!
+    const fullLine = formatUsageLineForBudget(usage)
+    const omittedAfterLine = usages.length - index - 1
+    const marker = omittedAfterLine > 0
+      ? usageOmissionMarker(omittedAfterLine, remainingCharsForTrailingLine([...sections, fullLine], maxChars))
+      : ''
+    const fullCandidate = joinSections([...sections, fullLine, marker])
+    if (fullCandidate.length <= maxChars) {
+      sections.push(fullLine)
+      continue
+    }
+
+    if (omittedAfterLine > 0) {
+      for (const markerVariant of usageOmissionMarkerVariants(omittedAfterLine)) {
+        const lineBudget = maxChars
+          - joinSections(sections).length
+          - 1
+          - markerVariant.length
+          - 1
+        const truncatedLine = formatUsageLineForBudget(usage, lineBudget)
+        if (!truncatedLine) {
+          continue
+        }
+
+        const truncatedCandidate = joinSections([...sections, truncatedLine, markerVariant])
+        if (truncatedCandidate.length <= maxChars) {
+          return truncatedCandidate
+        }
+      }
+    } else {
+      const truncatedLine = formatUsageLineForBudget(usage, maxChars - joinSections(sections).length - 1)
+      if (truncatedLine) {
+        const truncatedCandidate = joinSections([...sections, truncatedLine])
+        if (truncatedCandidate.length <= maxChars) {
+          return truncatedCandidate
+        }
+      }
+    }
+
+    const omitted = usages.length - (sections.length - 1)
+    for (const fallbackMarker of usageOmissionMarkerVariants(omitted)) {
+      const fallback = joinSections([...sections, fallbackMarker])
+      if (fallback.length <= maxChars) {
+        return fallback
+      }
+    }
+
+    return markerOnly
+  }
+
+  return joinSections(sections)
+}
+
+function formatUsageLineRaw(usage: SymbolUsage): string {
+  return `- ${usage.file}:${usage.line} | ${usage.snippet}`
+}
+
+function formatUsageLineForBudget(usage: SymbolUsage, maxChars?: number): string {
+  const prefix = `- ${usage.file}:${usage.line} | `
+  const snippet = usage.snippet.replace(/\n+/g, ' ').trimEnd()
+  if (maxChars === undefined || prefix.length + snippet.length <= maxChars) {
+    return `${prefix}${snippet}`
+  }
+  if (prefix.length > maxChars) {
+    return ''
+  }
+
+  return `${prefix}${truncateWithEllipsis(snippet, maxChars - prefix.length)}`
 }
 
 function formatHitSymbol(hit: SearchHit): string {
@@ -882,6 +1255,14 @@ function joinedLength(rendered: string[], marker: string): number {
   return rendered.join('\n').length + 1 + marker.length
 }
 
+function searchHitOmissionMarker(omitted: number, maxChars?: number): string {
+  return firstMarkerThatFits(searchHitOmissionMarkerVariants(omitted), maxChars)
+}
+
+function usageOmissionMarker(omitted: number, maxChars?: number): string {
+  return firstMarkerThatFits(usageOmissionMarkerVariants(omitted), maxChars)
+}
+
 function grepOmissionMarker(omitted: number, maxChars?: number): string {
   const full = `matches_omitted=${omitted}; refine path_glob/max_matches or raise max_tokens.`
   if (maxChars === undefined || full.length <= maxChars) {
@@ -899,6 +1280,91 @@ function grepOmissionMarker(omitted: number, maxChars?: number): string {
 
 function withGrepOmissionMarker(rendered: string[], marker: string): string {
   return `${rendered.join('\n')}\n${marker}`
+}
+
+function searchHitOmissionMarkerVariants(omitted: number): string[] {
+  return [
+    `hits_omitted=${omitted}; refine query/path_glob/k or raise max_tokens.`,
+    `hits_omitted=${omitted}; raise max_tokens`,
+    `hits_omitted=${omitted}`
+  ]
+}
+
+function usageOmissionMarkerVariants(omitted: number): string[] {
+  return [
+    `usages_omitted=${omitted}; raise max_tokens`,
+    `usages_omitted=${omitted}`
+  ]
+}
+
+function firstMarkerThatFits(markers: string[], maxChars?: number): string {
+  if (maxChars === undefined) {
+    return markers[0] ?? ''
+  }
+
+  for (const marker of markers) {
+    if (marker.length <= maxChars) {
+      return marker
+    }
+  }
+
+  return ''
+}
+
+function joinSections(sections: Array<string | undefined>): string {
+  return sections.filter((section): section is string => Boolean(section)).join('\n')
+}
+
+function remainingCharsForTrailingLine(sections: string[], maxChars: number): number {
+  const output = joinSections(sections)
+  return Math.max(0, maxChars - output.length - 1)
+}
+
+function appendSearchTokensLineIfFits(output: string, tokensLine: string, maxChars: number): string {
+  if (!output) {
+    return tokensLine.length <= maxChars ? tokensLine : truncateWithEllipsis(tokensLine, maxChars)
+  }
+
+  const withTokens = `${output}\n${tokensLine}`
+  return withTokens.length <= maxChars ? withTokens : output
+}
+
+function truncateSearchBlock(block: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return ''
+  }
+  if (block.length <= maxChars) {
+    return block
+  }
+
+  const lines = block.split('\n')
+  const kept: string[] = []
+  let used = 0
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!
+    const separator = kept.length === 0 ? 0 : 1
+    if (used + separator + line.length <= maxChars) {
+      kept.push(line)
+      used += separator + line.length
+      continue
+    }
+
+    const lineBudget = maxChars - used - separator
+    if (lineBudget > 0) {
+      const truncatedLine = truncateWithEllipsis(line, lineBudget)
+      if (truncatedLine) {
+        kept.push(truncatedLine)
+      }
+    }
+    break
+  }
+
+  if (kept.length === 0) {
+    return truncateWithEllipsis(block, maxChars)
+  }
+
+  return kept.join('\n').replace(/\n+$/g, '')
 }
 
 function truncateWithEllipsis(text: string, maxChars: number): string {
