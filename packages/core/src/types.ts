@@ -62,6 +62,13 @@ export interface SearchHit {
   kind?: SymbolKind
   generated?: boolean
   stale?: boolean
+  /**
+   * Set on the TOP hit only when an identifier-shaped query collides across this many
+   * distinct definitions. single_best deliberately does NOT collapse such a lookup to
+   * one result; instead it returns a small candidate set and flags the collision so
+   * the caller disambiguates in the same call rather than trusting a silent winner.
+   */
+  ambiguousDefCount?: number
 }
 
 export interface GrepHit {

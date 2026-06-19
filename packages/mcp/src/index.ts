@@ -523,6 +523,12 @@ export function formatMcpSearchHits(hits: SearchHit[]): string {
     return 'no_hits'
   }
 
+  // An identifier that collides across multiple definitions is returned as a candidate
+  // set, not a single confident answer — lead with the collision count so the caller
+  // disambiguates instead of trusting the first row.
+  const ambiguousDefCount = hits[0]?.ambiguousDefCount
+  const ambiguityHint = ambiguousDefCount && ambiguousDefCount >= 2 ? `ambiguous: ${ambiguousDefCount} defs\n` : ''
+
   const tokensReturned = hits.reduce((sum, hit) => sum + hit.tokensReturned, 0)
   const body = hits
     .map((hit) => {
@@ -542,7 +548,7 @@ export function formatMcpSearchHits(hits: SearchHit[]): string {
     })
     .join('\n')
 
-  return `${body}\ntokensReturned=${tokensReturned}`
+  return `${ambiguityHint}${body}\ntokensReturned=${tokensReturned}`
 }
 
 function formatBodyBlock(body: string, startLine: number): string {

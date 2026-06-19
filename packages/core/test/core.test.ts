@@ -1083,3 +1083,79 @@ Parse the cookie header into values.
     expect(hits.some((hit) => hit.file === 'README.md')).toBe(true)
   })
 })
+
+describe('@codesift/core confidence-gated single_best', () => {
+  async function buildLoadConfigCollision(fileCount: number): Promise<Awaited<ReturnType<typeof openRepo>>> {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-collide-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    const areas = ['db', 'http', 'cache', 'auth', 'queue']
+    for (let index = 0; index < fileCount; index += 1) {
+      const area = areas[index]!
+      await writeFile(
+        join(repoRoot, 'src', `${area}.ts`),
+        `export function loadConfig(): Record<string, string> {
+  return { area: ${JSON.stringify(area)} }
+}
+`,
+        'utf8'
+      )
+    }
+
+    // A uniquely-named definition for the single-definition (collapsing) case.
+    await writeFile(
+      join(repoRoot, 'src', 'widget.ts'),
+      `export function uniqueWidgetRenderer(): string {
+  return 'widget'
+}
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+    return repo
+  }
+
+  it('does NOT collapse a colliding identifier; caps the set and flags the collision', async () => {
+    const repo = await buildLoadConfigCollision(4)
+
+    // Four same-named defs: instead of silently collapsing to one, return a capped
+    // candidate set (AMBIGUOUS_IDENTIFIER_MAX_K = 3) with the collision count on top.
+    const hits = await repo.search('loadConfig', { k: 10 })
+    expect(hits).toHaveLength(3)
+    expect(hits.every((hit) => hit.symbol === 'loadConfig')).toBe(true)
+    expect(hits[0]?.ambiguousDefCount).toBe(4)
+    // Distinct definitions, not three chunks of one file.
+    expect(new Set(hits.map((hit) => hit.file)).size).toBe(3)
+  })
+
+  it('still collapses an identifier that resolves to a single definition', async () => {
+    const repo = await buildLoadConfigCollision(1)
+
+    const hits = await repo.search('loadConfig', { k: 10 })
+    expect(hits).toHaveLength(1)
+    expect(hits[0]?.symbol).toBe('loadConfig')
+    expect(hits[0]?.ambiguousDefCount).toBeUndefined()
+
+    // A uniquely-named identifier collapses too.
+    const unique = await repo.search('uniqueWidgetRenderer', { k: 10 })
+    expect(unique).toHaveLength(1)
+    expect(unique[0]?.ambiguousDefCount).toBeUndefined()
+  })
+
+  it('honors an explicit single_best override even on a collision', async () => {
+    const repo = await buildLoadConfigCollision(4)
+
+    // The caller forced single_best, so collapse to one and do not flag ambiguity.
+    const forced = await repo.search('loadConfig', { k: 10, singleBest: true })
+    expect(forced).toHaveLength(1)
+    expect(forced[0]?.ambiguousDefCount).toBeUndefined()
+
+    // Explicit single_best:false returns the full set, also without the auto hint.
+    const expanded = await repo.search('loadConfig', { k: 10, singleBest: false })
+    expect(expanded.length).toBeGreaterThan(3)
+    expect(expanded[0]?.ambiguousDefCount).toBeUndefined()
+  })
+})

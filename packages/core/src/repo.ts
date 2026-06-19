@@ -155,6 +155,11 @@ const MIN_RELAXATION_ROWS = 3
 // Above this many exact rows the identifier collides across the repo, so picking
 // one body to inline would be misleading — keep every row compact instead.
 const FIND_SYMBOL_INLINE_MAX_EXACT_ROWS = 3
+// When an identifier-shaped query collides across ≥2 definitions, single_best does
+// NOT collapse to one (that would hide the collision and silently pick a winner);
+// instead it returns up to this many candidates with an "ambiguous: N defs" hint so
+// the caller can disambiguate in the same call. Capped low to stay terse.
+const AMBIGUOUS_IDENTIFIER_MAX_K = 3
 const RERANK_CANDIDATE_LIMIT = 25
 const RERANK_SNIPPET_CHAR_LIMIT = 1000
 const VECTOR_SEARCH_UNAVAILABLE_MESSAGE = 'vector search unavailable (native dep), lexical/symbol still works'
@@ -517,7 +522,21 @@ export class SqliteRepo implements Repo {
     const fusedRows = fuseRankedRows(query, exactRows, vectorRows, lexicalRows)
     const dedupedRows = dedupeContainedRows(fusedRows)
     const distinctRows = await this.applyRerankStage(query, dedupedRows, options)
-    const effectiveK = (options?.singleBest ?? (exactRows.length > 0 && isSingleBestIdentifierQuery(query))) ? 1 : requestedK
+
+    // Confidence-gated single_best (#7): an identifier-shaped lookup collapses to the
+    // one best answer ONLY when it resolves to a single definition. When the identifier
+    // collides across ≥2 definitions, collapsing would silently pick a winner and hide
+    // the ambiguity, so return a capped candidate set plus an "ambiguous: N defs" hint
+    // instead. An explicit options.singleBest always wins (a caller can force k=1).
+    const singleTokenIdentifier = isSingleBestIdentifierQuery(query)
+    const exactDefCount = singleTokenIdentifier ? distinctExactSymbolDefinitions(exactRows, query) : 0
+    const ambiguousIdentifier = options?.singleBest === undefined && singleTokenIdentifier && exactDefCount >= 2
+    const autoSingleBest = exactRows.length > 0 && singleTokenIdentifier && !ambiguousIdentifier
+    const effectiveK = (options?.singleBest ?? autoSingleBest)
+      ? 1
+      : ambiguousIdentifier
+        ? Math.min(requestedK, AMBIGUOUS_IDENTIFIER_MAX_K)
+        : requestedK
 
       const budgetedHits = await buildBudgetedSearchHits(
         query,
@@ -528,6 +547,11 @@ export class SqliteRepo implements Repo {
         (file, startLine, endLine) => this.readRange(file, startLine, endLine)
       )
       const staleHits = markStaleHits(budgetedHits, freshness)
+      // Surface the collision count on the top hit so the caller knows the set is
+      // "one of N same-named definitions", not a single confident answer.
+      if (ambiguousIdentifier && staleHits.length > 0) {
+        staleHits[0]!.ambiguousDefCount = exactDefCount
+      }
       if (options?.withUsages) {
         await attachUsagesToTopDefinitionHit(db, this.root, staleHits, options)
       }
@@ -3114,6 +3138,20 @@ function scoreBoostForRow(row: ChunkRow, query: string): number {
   }
 
   return boost
+}
+
+// Number of DISTINCT definitions an identifier query resolves to in the exact arm.
+// Keyed by (file, symbol, parent) so multiple chunks of one symbol count once, while
+// same-named symbols in different files (or under different parents) count separately
+// — the collision signal the confidence gate keys on.
+function distinctExactSymbolDefinitions(exactRows: ChunkRow[], query: string): number {
+  const seen = new Set<string>()
+  for (const row of exactRows) {
+    if (isExactSymbolMatch(row, query)) {
+      seen.add(`${row.file_path} ${(row.symbol ?? '').toLowerCase()} ${(row.parent ?? '').toLowerCase()}`)
+    }
+  }
+  return seen.size
 }
 
 function isExactSymbolMatch(row: ChunkRow, query: string): boolean {
