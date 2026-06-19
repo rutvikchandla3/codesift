@@ -20,6 +20,11 @@ jobs:
         node:
           - 20
           - 22
+        exclude:
+          # better-sqlite3 lacks a Node 20 Windows prebuild; source builds are slow
+          # and the perf-sensitive bench gate is not reproducible from macOS.
+          - os: windows-2022
+            node: 20
 
     steps:
       - name: Checkout
@@ -62,8 +67,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # better-sqlite3 lacks Node 20 musl prebuilds; this repo's Alpine gate is
+        # about install/runtime portability without native source-build fallback.
         node:
-          - 20
           - 22
 
     steps:
@@ -120,8 +126,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Node 20 musl falls back to source build for better-sqlite3, which is
+        # exactly what this smoke test rejects and cannot be validated from macOS.
         node:
-          - 20
           - 22
 
     steps:
