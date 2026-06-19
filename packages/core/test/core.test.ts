@@ -609,8 +609,11 @@ describe('@codesift/core search body inlining', () => {
     const hits = await repo.search('huge retry backoff handler', { k: 1 })
 
     expect(hits[0]?.body).toBeDefined()
-    const body = hits[0]!.body!
-    expect(body).toContain('… (truncated — read_chunk <id> for full)')
+    const hit = hits[0]!
+    const body = hit.body!
+    const locator = `${hit.file}:${hit.range.startLine}-${hit.range.endLine}`
+    expect(body).toContain(`… (truncated — read_chunk ${locator} for full)`)
+    await expect(repo.readChunk(locator)).resolves.toContain('const huge79 = computeHugeRetryBackoff(79)')
     // Cap is whichever of ~50 lines / ~400 tokens is smaller; the body must be
     // shorter than the full 80+ line source on disk.
     expect(body.split('\n').length).toBeLessThanOrEqual(51)
@@ -712,6 +715,28 @@ describe('@codesift/core find_symbol body inlining', () => {
     // Runs of 2+ blank lines collapse to one (three newlines never remain).
     expect(body).not.toMatch(/\n[ \t]*\n[ \t]*\n/)
     expect(body).toContain('return base + 2')
+  })
+
+  it('truncates oversized bodies with an actionable read_chunk marker', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-findsymbol-truncate-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    const longBody = Array.from({ length: 80 }, (_, index) => `  const huge${index} = computeHugeRetryBackoff(${index})`).join('\n')
+    await writeFile(
+      join(repoRoot, 'src', 'huge.ts'),
+      `export function hugeRetryBackoffHandler(): number {\n${longBody}\n  return 0\n}\n`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const [def] = await repo.findSymbol('hugeRetryBackoffHandler')
+    expect(def?.body).toBeDefined()
+    const locator = `${def!.file}:${def!.range.startLine}-${def!.range.endLine}`
+    expect(def!.body!).toContain(`… (truncated — read_chunk ${locator} for full)`)
+    await expect(repo.readChunk(locator)).resolves.toContain('const huge79 = computeHugeRetryBackoff(79)')
   })
 })
 

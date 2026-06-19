@@ -145,7 +145,7 @@ const PREFIX_TOKEN_COST = 2
 // The MCP compact (no-body) snippet renderer caps at this many lines; the token
 // estimate mirrors it so prefix cost is not over-counted for compact hits.
 const COMPACT_SNIPPET_MAX_LINES = 4
-const INLINE_BODY_TRUNCATION_MARKER = '… (truncated — read_chunk <id> for full)'
+const INLINE_BODY_TRUNCATION_MARKER = (locator: string) => `… (truncated — read_chunk ${locator} for full)`
 const INLINE_RANK2_SCORE_MARGIN = 0.6
 // Below this lexical-row count, an over-constrained FTS query is progressively
 // relaxed (drop-rarest term, then full OR) so a concept phrased with a word the
@@ -694,7 +694,7 @@ export class SqliteRepo implements Repo {
       const top = exactRows[0]!
       try {
         const source = await this.readRange(top.file_path, top.start_line, top.end_line)
-        const { body } = capInlineBody(source)
+        const { body } = capInlineBody(source, chunkLocator(top.file_path, top.start_line, top.end_line))
         if (body) {
           topBody = body
         }
@@ -1984,7 +1984,7 @@ async function tryInlineBody(
     return false
   }
 
-  const { body, tokens } = capInlineBody(source)
+  const { body, tokens } = capInlineBody(source, chunkLocator(hit.file, hit.range.startLine, hit.range.endLine))
   if (!body) {
     return false
   }
@@ -2017,7 +2017,7 @@ async function tryInlineBody(
  * stays recoverable from the line number, and that prefix cost is folded into
  * the returned token count.
  */
-function capInlineBody(source: string): { body: string; tokens: number } {
+function capInlineBody(source: string, locator: string): { body: string; tokens: number } {
   if (!source) {
     return { body: '', tokens: 0 }
   }
@@ -2041,8 +2041,12 @@ function capInlineBody(source: string): { body: string; tokens: number } {
     truncated = true
   }
 
-  const body = truncated ? `${kept.join('\n')}\n${INLINE_BODY_TRUNCATION_MARKER}` : kept.join('\n')
+  const body = truncated ? `${kept.join('\n')}\n${INLINE_BODY_TRUNCATION_MARKER(locator)}` : kept.join('\n')
   return { body, tokens: renderedBodyTokens(body) }
+}
+
+function chunkLocator(file: string, startLine: number, endLine: number): string {
+  return `${file}:${startLine}-${endLine}`
 }
 
 /** Token count of a body INCLUDING the per-line `NN | ` render prefix. */
@@ -3158,7 +3162,7 @@ function distinctExactSymbolDefinitions(exactRows: ChunkRow[], query: string): n
   const seen = new Set<string>()
   for (const row of exactRows) {
     if (isExactSymbolMatch(row, query)) {
-      seen.add(`${row.file_path} ${(row.symbol ?? '').toLowerCase()} ${(row.parent ?? '').toLowerCase()}`)
+      seen.add(`${row.file_path}\u0000${(row.symbol ?? '').toLowerCase()}\u0000${(row.parent ?? '').toLowerCase()}`)
     }
   }
   return seen.size
