@@ -37,6 +37,11 @@
       "id": "m3-rust",
       "language": "rust",
       "repoPath": "./m3-rust"
+    },
+    {
+      "id": "collision-ts",
+      "language": "typescript",
+      "repoPath": "./collision-ts"
     }
   ],
   "queries": [
@@ -438,6 +443,39 @@
         "startLine": 14,
         "endLine": 14
       }
+    },
+    {
+      "id": "collision-validate-symbol",
+      "repoId": "collision-ts",
+      "queryType": "symbol-def",
+      "query": "validate",
+      "grepPattern": "validate",
+      "expected": [
+        {
+          "file": "src/auth/token.ts",
+          "symbol": "validate",
+          "lineRange": {
+            "startLine": 3,
+            "endLine": 10
+          }
+        },
+        {
+          "file": "src/schema/validator.ts",
+          "symbol": "validate",
+          "lineRange": {
+            "startLine": 1,
+            "endLine": 13
+          }
+        },
+        {
+          "file": "src/forms/checkout.ts",
+          "symbol": "validate",
+          "lineRange": {
+            "startLine": 6,
+            "endLine": 15
+          }
+        }
+      ]
     }
   ]
 }

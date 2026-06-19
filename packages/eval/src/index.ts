@@ -23,7 +23,7 @@ export const DEFAULT_LOSSES_PATH = resolve(moduleDir, '../losses.json')
 
 export type GoldenQueryType = (typeof QUERY_TYPE_ORDER)[number]
 export type EvalTool = 'codesift' | 'ripgrep'
-export type LossAxis = 'success' | 'tokens' | 'latency.cold' | 'latency.warm'
+export type LossAxis = 'success' | 'tokens' | 'latency.cold' | 'latency.warm' | 'precision'
 
 export interface BenchmarkRepo {
   id: string
@@ -36,6 +36,13 @@ export interface BenchmarkRepo {
 export interface ExpectedTarget {
   file: string
   symbol?: string
+  /**
+   * Per-target line range for a MULTI-TARGET golden (one entry per co-relevant
+   * definition). When present it scopes the match to this specific target's lines,
+   * so distinct same-named definitions in different files are scored independently.
+   * Single-target goldens keep using the query-level {@link GoldenQuery.expectedLineRange}.
+   */
+  lineRange?: Range
 }
 
 export interface GoldenQuery {
@@ -211,7 +218,6 @@ export async function evaluateManifest(manifest: EvalManifest, options: Evaluate
   const inspectionLimit = normalizePositiveInteger(options.inspectionLimit, DEFAULT_INSPECTION_LIMIT)
   const latencyToleranceMs = normalizeLatencyTolerance(options.latencyToleranceMs)
 
-  const repoById = new Map(manifest.repos.map((repo) => [repo.id, repo]))
   const runs: EvalRun[] = []
 
   for (const repo of manifest.repos) {
@@ -280,6 +286,7 @@ export function formatSummary(summary: EvalSummary): string {
   const lines = [
     'codesift eval summary',
     '(cold latency = prebuilt-index, MCP-spawn only — does NOT measure first-run indexing)',
+    '(recall = set-recall: fraction of co-relevant targets in top-k; mrr@1 = rank-1 precision)',
     ''
   ]
 
@@ -548,17 +555,19 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
 
       const definitions = (await repo.findSymbol(query.query, options)).slice(0, resultLimit)
       const candidates = definitions.map(candidateFromSymbol)
-      const matchingRank = firstMatchingRank(candidates, query)
-      const taskSuccess = matchingRank !== null && matchingRank <= inspectionLimit
+      const score = scoreCandidates(candidates, query, inspectionLimit)
+      const matchingRank = score.matchingRank
 
-      // Honest one-call accounting: find_symbol resolves in a single call only when
-      // the matching definition arrives with an inlined body that covers the
-      // expected lines. A body-less match (ambiguous lookup, withBody off, or a
-      // non-top match) still forces a follow-up read — count it as 2 calls.
+      // Honest one-call accounting: a SINGLE-target find_symbol resolves in one call
+      // only when the matching definition arrives with an inlined body covering the
+      // expected lines; a body-less match (ambiguous lookup, withBody off, or a
+      // non-top match) still forces a follow-up read — count it as 2 calls. A
+      // MULTI-target lookup ("where are all the Xs") is answered by the location set
+      // in a single call, so it is never charged a per-body follow-up.
       let tokensToResolution = estimateTokenCount(formatMcpSymbols(definitions))
       let callsToResolution = 1
 
-      if (matchingRank !== null) {
+      if (matchingRank !== null && query.expected.length === 1) {
         const matchingDef = definitions[matchingRank - 1]
         const bodyResolves =
           matchingDef?.body !== undefined &&
@@ -577,10 +586,10 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
       return {
         tokensToResolution,
         callsToResolution,
-        taskSuccess,
-        recallAt5: matchingRank !== null && matchingRank <= 5 ? 1 : 0,
-        recallAt10: matchingRank !== null && matchingRank <= 10 ? 1 : 0,
-        meanReciprocalRank: matchingRank === null ? 0 : 1 / matchingRank
+        taskSuccess: score.taskSuccess,
+        recallAt5: score.recallAt5,
+        recallAt10: score.recallAt10,
+        meanReciprocalRank: score.meanReciprocalRank
       }
     }
     case 'string-literal':
@@ -609,13 +618,13 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
 
       const hits = await repo.search(query.query, options)
       const candidates = hits.map(candidateFromSearch)
-      const matchingRank = firstMatchingRank(candidates, query)
-      const taskSuccess = matchingRank !== null && matchingRank <= inspectionLimit
+      const score = scoreCandidates(candidates, query, inspectionLimit)
+      const matchingRank = score.matchingRank
 
       let tokensToResolution = estimateTokenCount(formatMcpSearchHits(hits))
       let callsToResolution = 1
 
-      if (matchingRank !== null) {
+      if (matchingRank !== null && query.expected.length === 1) {
         const matchingHit = hits[matchingRank - 1]
         const bodyResolves =
           matchingHit?.body !== undefined &&
@@ -634,10 +643,10 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
       return {
         tokensToResolution,
         callsToResolution,
-        taskSuccess,
-        recallAt5: matchingRank !== null && matchingRank <= 5 ? 1 : 0,
-        recallAt10: matchingRank !== null && matchingRank <= 10 ? 1 : 0,
-        meanReciprocalRank: matchingRank === null ? 0 : 1 / matchingRank
+        taskSuccess: score.taskSuccess,
+        recallAt5: score.recallAt5,
+        recallAt10: score.recallAt10,
+        meanReciprocalRank: score.meanReciprocalRank
       }
     }
   }
@@ -764,15 +773,15 @@ function collectRipgrepContext(
 }
 
 function evaluateRankedCandidates(candidates: CandidateResult[], query: GoldenQuery, tokensToResolution: number, inspectionLimit: number): PolicyRun {
-  const matchingRank = firstMatchingRank(candidates, query)
+  const score = scoreCandidates(candidates, query, inspectionLimit)
 
   return {
     tokensToResolution,
     callsToResolution: 1,
-    taskSuccess: matchingRank !== null && matchingRank <= inspectionLimit,
-    recallAt5: matchingRank !== null && matchingRank <= 5 ? 1 : 0,
-    recallAt10: matchingRank !== null && matchingRank <= 10 ? 1 : 0,
-    meanReciprocalRank: matchingRank === null ? 0 : 1 / matchingRank
+    taskSuccess: score.taskSuccess,
+    recallAt5: score.recallAt5,
+    recallAt10: score.recallAt10,
+    meanReciprocalRank: score.meanReciprocalRank
   }
 }
 
@@ -782,21 +791,62 @@ function firstMatchingRank(candidates: CandidateResult[], query: GoldenQuery): n
 }
 
 export function candidateMatchesExpected(candidate: CandidateResult, query: GoldenQuery): boolean {
-  return query.expected.some((expected) => {
-    if (normalizePath(candidate.file) !== normalizePath(expected.file)) {
-      return false
-    }
+  return query.expected.some((target) => candidateMatchesTarget(candidate, target, query))
+}
 
-    if (expected.symbol && candidate.symbol && expected.symbol.toLowerCase() !== candidate.symbol.toLowerCase()) {
-      return false
-    }
+function candidateMatchesTarget(candidate: CandidateResult, target: ExpectedTarget, query: GoldenQuery): boolean {
+  if (normalizePath(candidate.file) !== normalizePath(target.file)) {
+    return false
+  }
 
-    if (query.expectedLineRange) {
-      return rangesOverlap(candidate.range, query.expectedLineRange)
-    }
+  if (target.symbol && candidate.symbol && target.symbol.toLowerCase() !== candidate.symbol.toLowerCase()) {
+    return false
+  }
 
-    return true
-  })
+  // A per-target lineRange scopes a multi-target match to that one definition;
+  // single-target goldens fall back to the query-level expectedLineRange. A target
+  // with neither matches on file (+ symbol) alone.
+  const lineRange = target.lineRange ?? (query.expected.length === 1 ? query.expectedLineRange : undefined)
+  if (lineRange) {
+    return rangesOverlap(candidate.range, lineRange)
+  }
+
+  return true
+}
+
+// Number of DISTINCT expected targets covered by some candidate within the top-k.
+// For single-target goldens this is 0 or 1, so set-recall reduces exactly to today's
+// binary recall; for multi-target goldens it is the count of co-relevant definitions
+// surfaced, so a ranking change that silently drops a co-relevant hit is now visible.
+function coveredTargetCount(candidates: CandidateResult[], query: GoldenQuery, k: number): number {
+  const top = candidates.slice(0, k)
+  let covered = 0
+  for (const target of query.expected) {
+    if (top.some((candidate) => candidateMatchesTarget(candidate, target, query))) {
+      covered += 1
+    }
+  }
+  return covered
+}
+
+// Shared ranking scorer. taskSuccess requires EVERY co-relevant target within the
+// inspection window (for single-target this is "first match within inspectionLimit");
+// recall is set-recall (fraction of targets in top-k); MRR remains first-relevant-rank.
+function scoreCandidates(
+  candidates: CandidateResult[],
+  query: GoldenQuery,
+  inspectionLimit: number
+): { matchingRank: number | null; taskSuccess: boolean; recallAt5: number; recallAt10: number; meanReciprocalRank: number } {
+  const matchingRank = firstMatchingRank(candidates, query)
+  const targetCount = Math.max(1, query.expected.length)
+
+  return {
+    matchingRank,
+    taskSuccess: coveredTargetCount(candidates, query, inspectionLimit) === query.expected.length,
+    recallAt5: coveredTargetCount(candidates, query, 5) / targetCount,
+    recallAt10: coveredTargetCount(candidates, query, 10) / targetCount,
+    meanReciprocalRank: matchingRank === null ? 0 : 1 / matchingRank
+  }
 }
 
 function candidateFromSearch(hit: SearchHit): CandidateResult {
@@ -902,6 +952,16 @@ function computeLosses(manifest: EvalManifest, runs: EvalRun[], latencyTolerance
 
     if (codesift.taskSuccess && ripgrep.taskSuccess && codesift.wallClockMs.warm > ripgrep.wallClockMs.warm + latencyToleranceMs) {
       axes.push('latency.warm')
+    }
+
+    // Precision regression guard (self-referential, independent of ripgrep): codesift
+    // resolves the answer but a false positive outranks the first relevant hit, so the
+    // most-trusted rank-1 result is wrong. mrr === 1 iff the first relevant target is at
+    // rank 1. Recorded in the baseline for queries where it already holds, so it gates
+    // only NEW rank-1 regressions — exactly the accuracy-for-recall trade a relaxation
+    // or re-ranking change can otherwise make invisibly.
+    if (codesift.taskSuccess && codesift.meanReciprocalRank !== 1) {
+      axes.push('precision')
     }
 
     if (axes.length > 0) {
