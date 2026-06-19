@@ -21,7 +21,7 @@ import {
   type EmbeddingProvider,
   type SyncProgressEvent
 } from '../src/index.js'
-import { buildFtsQuery, queryShouldUseVectorSearch } from '../src/repo.js'
+import { buildFtsQuery, nameTermCoverage, queryConceptTerms, queryShouldUseVectorSearch } from '../src/repo.js'
 
 const temporaryDirectories: string[] = []
 const originalEmbeddingProvider = process.env.CODESIFT_EMBEDDING_PROVIDER
@@ -974,5 +974,112 @@ export function decodeJwtToken(token: string): string {
     // from relaxation widening the query, not from "webauthn" matching anything.
     const absentOnly = await repo.search('webauthn', { k: 5 })
     expect(absentOnly).toHaveLength(0)
+  })
+})
+
+describe('@codesift/core query-aware ranking', () => {
+  it('extracts distinct concept terms, dropping stop words and 1-char tokens', () => {
+    const terms = queryConceptTerms('parse the Cookie header with keys and values')
+    // camelCase already lowercase here; stop words ("the", "with", "and") dropped.
+    expect(terms).toEqual(expect.arrayContaining(['parse', 'cookie', 'header', 'keys', 'values']))
+    expect(terms).not.toContain('the')
+    expect(terms).not.toContain('and')
+    expect(terms).not.toContain('with')
+  })
+
+  it('measures concept-term coverage over the name/parent/signature surface', () => {
+    const terms = queryConceptTerms('parse cookie header pairs')
+
+    // symbol "parseCookieHeader" covers parse+cookie+header (3/4).
+    const named = nameTermCoverage(
+      { symbol: 'parseCookieHeader', parent: null, signature: '(header: string): Record<string, string>' },
+      terms
+    )
+    expect(named).toBeCloseTo(3 / 4)
+
+    // Coverage reaches through the parent and signature surfaces, not just symbol.
+    const viaParentAndSig = nameTermCoverage(
+      { symbol: 'split', parent: 'CookieHeader', signature: '(input: string, pairs: number)' },
+      terms
+    )
+    expect(viaParentAndSig).toBeCloseTo(3 / 4) // cookie+header (parent) + pairs (sig)
+
+    // A name that shares none of the concept words covers nothing, even if its body
+    // would mention them — body text is not part of the name surface.
+    expect(nameTermCoverage({ symbol: 'unrelatedHelper', parent: null, signature: '(value: number)' }, terms)).toBe(0)
+
+    // No concept terms (or no name surface) => no coverage signal.
+    expect(nameTermCoverage({ symbol: 'parseCookieHeader', parent: null, signature: null }, [])).toBe(0)
+    expect(nameTermCoverage({ symbol: null, parent: null, signature: null }, terms)).toBe(0)
+  })
+
+  it('keeps a documentation heading from outranking the code it documents on a code query', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-docrank-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    // The real code definition the query is about.
+    await writeFile(
+      join(repoRoot, 'src', 'cookie.ts'),
+      `export function parseCookieValues(header: string): string[] {
+  return header.split(';').map((segment) => segment.trim())
+}
+`,
+      'utf8'
+    )
+
+    // A README whose H1 ("cookie") matches the identifier-shaped query token. Indexed
+    // as a "symbol", it would otherwise claim the high-weight exact arm and float the
+    // prose title above the function it documents.
+    await writeFile(
+      join(repoRoot, 'README.md'),
+      `# cookie
+
+Parse the cookie header into values. This documents how the cookie header parse
+and its values work for the cookie header.
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const hits = await repo.search('parse cookie header values', { k: 5 })
+    expect(hits.length).toBeGreaterThan(0)
+    // The code function, not the README heading, must lead a code-concept query.
+    expect(hits[0]?.file).toBe('src/cookie.ts')
+    expect(hits[0]?.symbol).toBe('parseCookieValues')
+    const readmeRank = hits.findIndex((hit) => hit.file === 'README.md')
+    expect(readmeRank === -1 || readmeRank > 0).toBe(true)
+  })
+
+  it('still surfaces a documentation heading when the query is documentation-focused', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-docfocus-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    await writeFile(
+      join(repoRoot, 'src', 'cookie.ts'),
+      `export function parseCookieValues(header: string): string[] {
+  return header.split(';').map((segment) => segment.trim())
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'README.md'),
+      `# cookie
+
+Parse the cookie header into values.
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    // A doc-focused query (mentions "readme") keeps doc headings eligible.
+    const hits = await repo.search('cookie readme overview', { k: 5 })
+    expect(hits.some((hit) => hit.file === 'README.md')).toBe(true)
   })
 })

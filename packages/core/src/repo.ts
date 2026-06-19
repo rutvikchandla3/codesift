@@ -27,6 +27,7 @@ interface ChunkRow {
   symbol: string | null
   kind: SymbolKind | null
   parent: string | null
+  signature: string | null
   generated: number | null
 }
 
@@ -501,6 +502,7 @@ export class SqliteRepo implements Repo {
                   symbol,
                   kind,
                   parent,
+                  signature,
                   generated
                 from chunks
                 ${whereSql}
@@ -2760,7 +2762,7 @@ function selectExactCandidateRows(
   const chunkRows = db
     .prepare<unknown[], ChunkRow>(
       `
-        select id, file_path, start_line, end_line, snippet, language, symbol, kind, parent, generated
+        select id, file_path, start_line, end_line, snippet, language, symbol, kind, parent, signature, generated
         from chunks
         ${whereSql ? `${whereSql} and` : 'where'} lower(symbol) in (${placeholders})
         order by file_path asc, start_line asc, end_line asc, id asc
@@ -2781,7 +2783,7 @@ function selectExactCandidateRows(
   const symbolRows = db
     .prepare<unknown[], ChunkRow>(
       `
-        select distinct c.id, c.file_path, c.start_line, c.end_line, c.snippet, c.language, c.symbol, c.kind, c.parent, c.generated
+        select distinct c.id, c.file_path, c.start_line, c.end_line, c.snippet, c.language, c.symbol, c.kind, c.parent, c.signature, c.generated
         from symbols s
         join chunks c on c.file_path = s.file_path and s.start_line between c.start_line and c.end_line
         ${whereSql ? `${whereSql.replace(/\bfile_path\b/g, 'c.file_path').replace(/\blanguage\b/g, 'c.language').replace(/\bkind\b/g, 'c.kind')} and` : 'where'} lower(s.name) in (${placeholders})
@@ -2795,7 +2797,20 @@ function selectExactCandidateRows(
     rowsById.set(row.id, row)
   }
 
-  return [...rowsById.values()]
+  const rows = [...rowsById.values()]
+
+  // A documentation heading (a markdown H1, etc.) gets indexed as a "symbol", so an
+  // identifier-shaped query token can match it exactly and float a prose title into
+  // the high-weight (×4) exact arm — where, ordered only by path, it can outrank the
+  // very function it documents (e.g. a README "cookie" heading over `parseCookie`).
+  // For a code-concept query, drop doc-language rows from the exact arm; they still
+  // surface via the lexical arm at their honest bm25 rank. A doc-focused query keeps
+  // them, since then the heading is a legitimate answer.
+  if (queryLooksDocumentationOrConfigFocused(query)) {
+    return rows
+  }
+
+  return rows.filter((row) => !(row.language && isDocumentationLanguage(row.language)))
 }
 
 function selectExactFtsCandidateRows(
@@ -2826,6 +2841,7 @@ function selectExactFtsCandidateRows(
             c.symbol,
             c.kind,
             c.parent,
+            c.signature,
             c.generated
           from chunks_fts
           join chunks c on c.id = chunks_fts.chunk_id
@@ -2905,6 +2921,8 @@ function fuseRankedRows(query: string, exactRows: ChunkRow[], vectorRows: ChunkR
   addReciprocalRanks(byId, vectorRows, '+')
   addReciprocalRanks(byId, lexicalRows, '~')
 
+  const terms = queryConceptTerms(query)
+
   return [...byId.values()].sort((left, right) => {
     const leftScore = left.score * scoreBoostForRow(left.row, query)
     const rightScore = right.score * scoreBoostForRow(right.row, query)
@@ -2912,6 +2930,20 @@ function fuseRankedRows(query: string, exactRows: ChunkRow[], vectorRows: ChunkR
 
     if (Math.abs(scoreDelta) > 1e-12) {
       return scoreDelta
+    }
+
+    // Meaningful tiebreak (#6): when fused scores tie, prefer the row whose
+    // name/signature covers more of the query, then a real definition over a
+    // file/container chunk, then the stable location key so order stays
+    // deterministic across runs.
+    const coverageDelta = nameTermCoverage(right.row, terms) - nameTermCoverage(left.row, terms)
+    if (Math.abs(coverageDelta) > 1e-9) {
+      return coverageDelta
+    }
+
+    const kindDelta = definitionKindRank(left.row) - definitionKindRank(right.row)
+    if (kindDelta !== 0) {
+      return kindDelta
     }
 
     return stableChunkSortKey(left.row).localeCompare(stableChunkSortKey(right.row))
@@ -2977,6 +3009,66 @@ function addReciprocalRanks(target: Map<string, RankedChunkRow>, rows: ChunkRow[
   })
 }
 
+// Query-aware ranking (#6) is intentionally a TIEBREAK, not a score multiplier. An
+// early prototype multiplied the fused score by ~(1 + 0.3·coverage); the eval's
+// precision axis caught it demoting a correct rank-1 (the "validate signed timestamp"
+// concept resolves to TimestampSigner.unsign, but a coverage lift floated the thin
+// `validate` wrapper above it) while resolving nothing — a pure accuracy-for-nothing
+// trade. So coverage now only orders rows whose primary fused score is already tied,
+// where the prior lexicographic file-path tiebreak was arbitrary. The signature is
+// loaded into ChunkRow so this signal (and find_symbol callers) can see it.
+
+// Distinct concept terms of a query (camelCase-split, stop-words and 1-char tokens
+// dropped) — the same token set buildFtsTermGroups searches, before OR-expansion.
+export function queryConceptTerms(query: string): string[] {
+  return [...new Set(buildNormalizedTerms(query).filter((term) => !DEFAULT_STOP_WORDS.has(term) && term.length > 1))]
+}
+
+// Fraction of the query's concept terms present in the row's declared NAME surface
+// (symbol + parent + signature), tokenized the same way. Returns 0 when the row has
+// no name surface or the query carries no concept terms.
+export function nameTermCoverage(
+  row: { symbol: string | null; parent: string | null; signature: string | null },
+  terms: string[]
+): number {
+  if (terms.length === 0) {
+    return 0
+  }
+
+  const nameTerms = new Set([
+    ...buildNormalizedTerms(row.symbol ?? undefined),
+    ...buildNormalizedTerms(row.parent ?? undefined),
+    ...buildNormalizedTerms(row.signature ?? undefined)
+  ])
+  if (nameTerms.size === 0) {
+    return 0
+  }
+
+  let covered = 0
+  for (const term of terms) {
+    if (nameTerms.has(term)) {
+      covered += 1
+    }
+  }
+
+  return covered / terms.length
+}
+
+// Tiebreak preference among rows with an equal fused score: a real definition
+// (function/method) over a container or other symbol, over a plain file chunk.
+// Lower rank sorts first.
+function definitionKindRank(row: ChunkRow): number {
+  switch (row.kind) {
+    case 'function':
+    case 'method':
+      return 0
+    case 'file':
+      return 2
+    default:
+      return 1
+  }
+}
+
 function scoreBoostForRow(row: ChunkRow, query: string): number {
   let boost = 1
 
@@ -2988,7 +3080,15 @@ function scoreBoostForRow(row: ChunkRow, query: string): number {
     boost *= 1.08
   }
 
-  if (row.kind && row.kind !== 'file') {
+  // A "how/where is X done" concept query describes behavior, so a pure type/interface
+  // declaration (a shape, not an operation) should not outrank the function/method or
+  // class that implements it. Demote interface/type mildly rather than boosting
+  // functions — boosting functions would lift a same-named method over a class chunk
+  // that legitimately answers the query, which the precision axis catches. Other
+  // symbols keep the flat boost; a bare file chunk gets none.
+  if (row.kind === 'interface' || row.kind === 'type') {
+    boost *= 0.92
+  } else if (row.kind && row.kind !== 'file') {
     boost *= 1.04
   }
 
@@ -2996,7 +3096,10 @@ function scoreBoostForRow(row: ChunkRow, query: string): number {
     boost *= 0.58
   }
 
-  if (isExactSymbolMatch(row, query)) {
+  // The 1.85× "this is THE definition" boost is for code symbols. A documentation
+  // heading that merely shares a word with a code-concept query is not a definition,
+  // so it does not earn the boost (it is also dropped from the exact arm upstream).
+  if (isExactSymbolMatch(row, query) && !(row.language && isDocumentationLanguage(row.language) && !queryLooksDocumentationOrConfigFocused(query))) {
     boost *= 1.85
   }
 
@@ -3105,6 +3208,7 @@ function selectRelaxedLexicalRows(
         c.symbol,
         c.kind,
         c.parent,
+        c.signature,
         c.generated
       from chunks_fts
       join chunks c on c.id = chunks_fts.chunk_id
