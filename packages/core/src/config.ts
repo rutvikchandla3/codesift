@@ -11,13 +11,15 @@ export interface CodesiftConfig {
   provider?: string
   /** Optional model override recorded for documentation; providers carry their own model id. */
   model?: string
+  /** Opt-in reranker id, e.g. `voyage-rerank-2.5`. Absent (the default) means no reranking. */
+  reranker?: string
   /** Extra ignore globs layered on top of `.gitignore` / `.codesiftignore`. */
   ignore?: string[]
   /** Permit cloud-embedding sends when secret-shaped content is detected (redacts rather than refuses). */
   allowSecrets?: boolean
 }
 
-export const CONFIG_KEYS = ['provider', 'model', 'ignore', 'allowSecrets'] as const
+export const CONFIG_KEYS = ['provider', 'model', 'reranker', 'ignore', 'allowSecrets'] as const
 export type CodesiftConfigKey = (typeof CONFIG_KEYS)[number]
 
 export function getConfigPath(root: string): string {
@@ -103,6 +105,9 @@ function sanitizeConfig(raw: Record<string, unknown>): CodesiftConfig {
   }
   if (typeof raw.model === 'string' && raw.model.trim()) {
     config.model = raw.model.trim()
+  }
+  if (typeof raw.reranker === 'string' && raw.reranker.trim()) {
+    config.reranker = raw.reranker.trim()
   }
   if (Array.isArray(raw.ignore)) {
     const globs = raw.ignore.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)

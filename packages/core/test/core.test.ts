@@ -7,20 +7,25 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   DEFAULT_EMBEDDING_PROVIDER_ID,
+  FIXTURE_RERANKER_ID,
   LOCAL_HASH_EMBEDDING_PROVIDER_ID,
   getDefaultEmbeddingProvider,
   getEmbeddingProvider,
   listEmbeddingProviders,
   openRepo,
   registerEmbeddingProvider,
+  registerFixtureReranker,
+  registerReranker,
   setVectorExtensionLoaderForTests,
   type EmbeddingBatchOptions,
   type EmbeddingProvider,
   type SyncProgressEvent
 } from '../src/index.js'
+import { buildFtsQuery, queryShouldUseVectorSearch } from '../src/repo.js'
 
 const temporaryDirectories: string[] = []
 const originalEmbeddingProvider = process.env.CODESIFT_EMBEDDING_PROVIDER
+const originalReranker = process.env.CODESIFT_RERANKER
 
 afterEach(async () => {
   setVectorExtensionLoaderForTests()
@@ -29,6 +34,12 @@ afterEach(async () => {
     delete process.env.CODESIFT_EMBEDDING_PROVIDER
   } else {
     process.env.CODESIFT_EMBEDDING_PROVIDER = originalEmbeddingProvider
+  }
+
+  if (originalReranker === undefined) {
+    delete process.env.CODESIFT_RERANKER
+  } else {
+    process.env.CODESIFT_RERANKER = originalReranker
   }
 
   await Promise.all(
@@ -197,6 +208,16 @@ describe('@codesift/core', () => {
     expect(chunkSource).toContain('export function verifyJwtToken')
     expect(rangeSource).toContain('// Validate JWT tokens')
     expect(rangeSource).toContain('export function verifyJwtToken')
+
+    // Body inlining (AUTO): the rank-1 hit carries the verbatim, disk-fresh
+    // enclosing source, and its tokensReturned accounts for the body.
+    const topJwt = jwtHits[0]!
+    const topBody = await repo.readRange(topJwt.file, topJwt.range.startLine, topJwt.range.endLine)
+    expect(topJwt.body).toBe(topBody)
+    expect(topJwt.body).toContain('export function verifyJwtToken')
+    expect(topJwt.snippet.length).toBeGreaterThan(0)
+    // tokensReturned reflects the inlined body, not just the compact snippet.
+    expect(topJwt.tokensReturned).toBeGreaterThanOrEqual(Math.ceil(topJwt.body!.length / 4))
 
     const db = new Database(join(repoRoot, '.codesift', 'index.db'))
     const fileRow = db
@@ -543,5 +564,283 @@ export function mintFreshToken(subject: string): string {
   it('keeps the hash provider as a non-default fixture', () => {
     expect(getEmbeddingProvider(LOCAL_HASH_EMBEDDING_PROVIDER_ID)?.id).toBe(LOCAL_HASH_EMBEDDING_PROVIDER_ID)
     expect(listEmbeddingProviders().some((provider) => provider.id === LOCAL_HASH_EMBEDDING_PROVIDER_ID)).toBe(true)
+  })
+})
+
+describe('@codesift/core search body inlining', () => {
+  it('never inlines when context is "sig" and inlines wherever the budget allows when "body"', async () => {
+    const repoRoot = await createDemoRepository('codesift-inline-policy-')
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const sigHits = await repo.search('validate jwt tokens before requests', { k: 5, context: 'sig' })
+    expect(sigHits.length).toBeGreaterThan(0)
+    expect(sigHits.every((hit) => hit.body === undefined)).toBe(true)
+    expect(sigHits[0]?.snippet.length).toBeGreaterThan(0)
+
+    const bodyHits = await repo.search('validate jwt tokens before requests', { k: 5, context: 'body' })
+    expect(bodyHits.length).toBeGreaterThan(1)
+    // "body" inlines more than just rank-1 (AUTO would stop after the margin).
+    expect(bodyHits.filter((hit) => hit.body !== undefined).length).toBeGreaterThan(1)
+    for (const hit of bodyHits) {
+      if (hit.body !== undefined) {
+        const fresh = await repo.readRange(hit.file, hit.range.startLine, hit.range.endLine)
+        expect(hit.body).toBe(fresh)
+      }
+    }
+  })
+
+  it('truncates an oversized body to the cap and appends the read_chunk marker', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-inline-truncate-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    const longBody = Array.from({ length: 80 }, (_, index) => `  const huge${index} = computeHugeRetryBackoff(${index})`).join('\n')
+    await writeFile(
+      join(repoRoot, 'src', 'huge.ts'),
+      `export function hugeRetryBackoffHandler(): number {\n${longBody}\n  return 0\n}\n`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+    const hits = await repo.search('huge retry backoff handler', { k: 1 })
+
+    expect(hits[0]?.body).toBeDefined()
+    const body = hits[0]!.body!
+    expect(body).toContain('… (truncated — read_chunk <id> for full)')
+    // Cap is whichever of ~50 lines / ~400 tokens is smaller; the body must be
+    // shorter than the full 80+ line source on disk.
+    expect(body.split('\n').length).toBeLessThanOrEqual(51)
+    expect(body).toContain('export function hugeRetryBackoffHandler')
+  })
+
+  it('falls back to a compact snippet (no body) when the file is gone at search time', async () => {
+    const repoRoot = await createDemoRepository('codesift-inline-fallback-')
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    await unlink(join(repoRoot, 'src', 'auth', 'jwt.ts'))
+    const hits = await repo.search('verifyJwtToken', { k: 1 })
+
+    expect(hits.length).toBe(1)
+    expect(hits[0]?.body).toBeUndefined()
+    expect(hits[0]?.snippet.length).toBeGreaterThan(0)
+  })
+
+  it('keeps room for a tail hit instead of letting hit-1 body consume the whole budget', async () => {
+    const repoRoot = await createDemoRepository('codesift-inline-budget-')
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const hits = await repo.search('validate jwt tokens before requests', { k: 5, maxTokens: 120 })
+    expect(hits.length).toBeGreaterThan(1)
+  })
+})
+
+describe('@codesift/core import-resolved usages', () => {
+  it('bundles TS/JS import-resolved and same-file usages for the top definition hit', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-usages-ts-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src', 'auth'), { recursive: true })
+
+    await writeFile(
+      join(repoRoot, 'src', 'auth', 'jwt.ts'),
+      `export function verifyJwtToken(token: string): boolean {
+  return token.startsWith('eyJ')
+}
+
+export class TokenVerifier {
+  verify(token: string): boolean {
+    return verifyJwtToken(token)
+  }
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'server.ts'),
+      `import { verifyJwtToken as checkToken } from './auth/jwt'
+
+export function handle(token: string): boolean {
+  return checkToken(token)
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'feature.ts'),
+      `import * as auth from './auth/jwt'
+
+export const ok = auth.verifyJwtToken('eyJ-demo')
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+    const hits = await repo.search('verifyJwtToken', { k: 1, withUsages: true })
+
+    expect(hits[0]?.symbol).toBe('verifyJwtToken')
+    expect(hits[0]?.usages).toBeDefined()
+    expect(hits[0]?.usages?.map((usage) => `${usage.file}:${usage.line}`)).toEqual(
+      expect.arrayContaining(['src/auth/jwt.ts:7', 'src/server.ts:4', 'src/feature.ts:3'])
+    )
+    expect(hits[0]?.usages?.every((usage) => usage.resolution === 'import-resolved')).toBe(true)
+  })
+
+  it('bundles Python import-resolved usages for the top definition hit', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-usages-py-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'pkg'), { recursive: true })
+
+    await writeFile(join(repoRoot, 'pkg', '__init__.py'), '', 'utf8')
+    await writeFile(
+      join(repoRoot, 'pkg', 'token.py'),
+      `def verify_token(token: str) -> bool:
+    return token.startswith('eyJ')
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'pkg', 'consumer.py'),
+      `from .token import verify_token as check_token
+
+
+def handle(token: str) -> bool:
+    return check_token(token)
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+    const hits = await repo.search('verify_token', { k: 1, withUsages: true, pathGlob: 'pkg/**' })
+
+    expect(hits[0]?.symbol).toBe('verify_token')
+    expect(hits[0]?.usages?.map((usage) => `${usage.file}:${usage.line}`)).toEqual(['pkg/consumer.py:5'])
+  })
+})
+
+describe('buildFtsQuery synonym OR-expansion', () => {
+  it('expands a synonym-group term into a quoted OR-group joined by AND', () => {
+    const fts = buildFtsQuery('validate jwt signature')
+    expect(fts).not.toBeNull()
+    // "validate" and "jwt" belong to synonym groups; "signature" does not.
+    expect(fts).toContain('("validate" OR')
+    expect(fts).toContain('"verify"')
+    expect(fts).toContain('("jwt" OR')
+    expect(fts).toContain('"token"')
+    expect(fts).toContain('"signature"')
+    expect(fts).toContain(' AND ')
+  })
+
+  it('dedupes a term already covered by an earlier group and caps at twelve groups', () => {
+    // "verify" is a member of the "validate" group, so a query containing both
+    // must not produce two groups for the same expansion.
+    const fts = buildFtsQuery('validate verify token')!
+    const groupCount = fts.split(' AND ').length
+    expect(groupCount).toBe(2)
+
+    const many = Array.from({ length: 20 }, (_, index) => `zzz${index}`).join(' ')
+    const cappedGroups = buildFtsQuery(many)!.split(' AND ').length
+    expect(cappedGroups).toBe(12)
+  })
+})
+
+describe('queryShouldUseVectorSearch suppression', () => {
+  it('stays vector-eligible for a short query with a single acronym token', () => {
+    expect(queryShouldUseVectorSearch('validate JWT signature')).toBe(true)
+  })
+
+  it('suppresses vectors only when a short query is majority identifier-like', () => {
+    expect(queryShouldUseVectorSearch('TokenVerifier')).toBe(false)
+    // Two identifier tokens, four normalized terms: still short AND majority symbol.
+    expect(queryShouldUseVectorSearch('TokenVerifier JwtAuth')).toBe(false)
+    // One identifier token amid natural-language words: not majority -> eligible.
+    expect(queryShouldUseVectorSearch('reset the TokenVerifier state')).toBe(true)
+    expect(queryShouldUseVectorSearch('refresh the api token before retrying requests')).toBe(true)
+  })
+})
+
+describe('@codesift/core opt-in reranker', () => {
+  const RERANK_QUERY = 'validate token signature credential check'
+
+  // A thin code stub (over-ranked by the code/symbol fusion boost) plus a guide
+  // chunk that actually restates the concept (heavier query-term overlap). Plain
+  // fusion ranks the stub first; the overlap reranker should lift the guide.
+  async function createRerankRepository(prefix: string): Promise<string> {
+    const repoRoot = await mkdtemp(join(tmpdir(), prefix))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    await writeFile(
+      join(repoRoot, 'src', 'auth.ts'),
+      `export function validateToken() {
+  // validate token signature credential check
+  return true
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'GUIDE.md'),
+      `# guide
+validate token signature credential check validate token signature credential check
+validate token signature credential check validate token signature credential check
+`,
+      'utf8'
+    )
+
+    return repoRoot
+  }
+
+  it('lifts the concept-rich hit above its fused rank for an NL-concept query', async () => {
+    registerFixtureReranker()
+    const repo = await openRepo(await createRerankRepository('codesift-rerank-lift-'))
+    await repo.sync()
+
+    const fused = await repo.search(RERANK_QUERY, { k: 5, context: 'sig' })
+    const guideFusedRank = fused.findIndex((hit) => hit.file === 'GUIDE.md')
+    expect(guideFusedRank).toBeGreaterThan(0)
+
+    process.env.CODESIFT_RERANKER = FIXTURE_RERANKER_ID
+    const reranked = await repo.search(RERANK_QUERY, { k: 5, context: 'sig', rerank: true })
+    expect(reranked[0]?.file).toBe('GUIDE.md')
+    const guideRerankedRank = reranked.findIndex((hit) => hit.file === 'GUIDE.md')
+    expect(guideRerankedRank).toBeLessThan(guideFusedRank)
+  })
+
+  it('leaves the order untouched without rerank:true (opt-in, never default-on)', async () => {
+    registerFixtureReranker()
+    process.env.CODESIFT_RERANKER = FIXTURE_RERANKER_ID
+    const repo = await openRepo(await createRerankRepository('codesift-rerank-optin-'))
+    await repo.sync()
+
+    // The fused baseline: no rerank flag, so even a configured reranker is inert.
+    const baseline = await repo.search(RERANK_QUERY, { k: 5, context: 'sig' })
+    const withFlagOff = await repo.search(RERANK_QUERY, { k: 5, context: 'sig', rerank: false })
+
+    expect(withFlagOff.map((hit) => hit.file)).toEqual(baseline.map((hit) => hit.file))
+    expect(baseline[0]?.file).toBe('src/auth.ts')
+  })
+
+  it('falls back to the fused order when the reranker throws', async () => {
+    const throwingId = `throwing-rerank-${Date.now()}`
+    registerReranker({
+      id: throwingId,
+      async rerank() {
+        throw new Error('reranker exploded')
+      }
+    })
+    const repo = await openRepo(await createRerankRepository('codesift-rerank-throw-'))
+    await repo.sync()
+
+    const fused = await repo.search(RERANK_QUERY, { k: 5, context: 'sig' })
+
+    process.env.CODESIFT_RERANKER = throwingId
+    const reranked = await repo.search(RERANK_QUERY, { k: 5, context: 'sig', rerank: true })
+
+    expect(reranked.map((hit) => hit.file)).toEqual(fused.map((hit) => hit.file))
   })
 })

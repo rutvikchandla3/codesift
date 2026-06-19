@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import ts from 'typescript'
 import { existsSync, watch as watchFs, type FSWatcher } from 'node:fs'
 import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
@@ -9,11 +10,12 @@ import * as sqliteVec from 'sqlite-vec'
 
 import { buildChunks, type ChunkRecord } from './chunking.js'
 import { readConfig } from './config.js'
-import { DEFAULT_EMBEDDING_PROVIDER_ID, getEmbeddingProvider, isCloudEmbeddingProvider, isLearnedEmbeddingProvider } from './embedding.js'
-import { isCodeLanguage, isDocumentationLanguage } from './languages.js'
+import { DEFAULT_EMBEDDING_PROVIDER_ID, expandTermToOrGroup, getEmbeddingProvider, isCloudEmbeddingProvider, isLearnedEmbeddingProvider } from './embedding.js'
+import { isCodeLanguage, isDocumentationLanguage, isPythonLike, isTypeScriptLike } from './languages.js'
+import { resolveReranker } from './reranker.js'
 import { scanRepository, scanRepositoryManifest, type ScannedFile } from './scan.js'
 import { prepareForCloud } from './secret-scan.js'
-import { DEFAULT_SEARCH_K, type EmbeddingProvider, type FindSymbolOptions, type GrepHit, type GrepOptions, type IndexCompatibilitySnapshot, type IndexCompatibilityStatus, type ReadChunkOptions, type ReadRangeOptions, type Repo, type RepoOptions, type RepoStaleReason, type RepoStatus, type RepoSyncStatus, type SearchHit, type SearchOptions, type SearchReasonTag, type StopWatching, type SymbolDefinition, type SymbolKind, type SyncOptions, type SyncResult, type VectorSearchStatus, type WatchOptions } from './types.js'
+import { DEFAULT_SEARCH_K, type EmbeddingProvider, type FindSymbolOptions, type GrepHit, type GrepOptions, type IndexCompatibilitySnapshot, type IndexCompatibilityStatus, type ReadChunkOptions, type ReadRangeOptions, type RerankResult, type Repo, type RepoOptions, type RepoStaleReason, type RepoStatus, type RepoSyncStatus, type SearchHit, type SearchOptions, type SearchReasonTag, type StopWatching, type SymbolDefinition, type SymbolKind, type SymbolUsage, type SyncOptions, type SyncResult, type VectorSearchStatus, type WatchOptions } from './types.js'
 
 interface ChunkRow {
   id: string
@@ -133,6 +135,12 @@ const DEFAULT_SNIPPET_TOKEN_BUDGET = 48
 const DEFAULT_SNIPPET_CONTEXT_LINES = 0
 const DEFAULT_SNIPPET_LINE_CHAR_LIMIT = 40
 const SEARCH_HIT_TOKEN_OVERHEAD = 12
+const INLINE_BODY_MAX_TOKENS = 400
+const INLINE_BODY_MAX_LINES = 50
+const INLINE_BODY_TRUNCATION_MARKER = '… (truncated — read_chunk <id> for full)'
+const INLINE_RANK2_SCORE_MARGIN = 0.6
+const RERANK_CANDIDATE_LIMIT = 25
+const RERANK_SNIPPET_CHAR_LIMIT = 1000
 const VECTOR_SEARCH_UNAVAILABLE_MESSAGE = 'vector search unavailable (native dep), lexical/symbol still works'
 const MTIME_TOLERANCE_MS = 2
 const DEFAULT_WATCH_DEBOUNCE_MS = 500
@@ -220,6 +228,41 @@ export class SqliteRepo implements Repo {
     }
 
     return provider
+  }
+
+  /**
+   * OPT-IN rerank stage. Re-scores the top ~25 fused candidates with a configured
+   * reranker and reorders them, leaving the tail order intact. Runs only when
+   * `options.rerank === true`, a reranker resolves, and the query is NL-concept
+   * shaped (same gate as vector search). RRF stays the candidate generator — this
+   * only reorders the head. Fail-safe: any reranker error (missing key, network,
+   * bad shape) falls back to the fused order and never throws out of `search()`.
+   */
+  private async applyRerankStage(
+    query: string,
+    rows: RankedChunkRow[],
+    options: SearchOptions | undefined
+  ): Promise<RankedChunkRow[]> {
+    if (options?.rerank !== true || rows.length < 2 || !queryShouldUseVectorSearch(query)) {
+      return rows
+    }
+
+    const reranker = resolveReranker(this.root)
+    if (!reranker) {
+      return rows
+    }
+
+    const head = rows.slice(0, RERANK_CANDIDATE_LIMIT)
+    const tail = rows.slice(RERANK_CANDIDATE_LIMIT)
+    const documents = head.map((ranked) => rerankDocumentForRow(ranked.row))
+
+    try {
+      const results = await reranker.rerank(query, documents, { topK: head.length })
+      const reordered = reorderByRerankResults(head, results)
+      return [...reordered, ...tail]
+    } catch {
+      return rows
+    }
   }
 
   async initialize(): Promise<void> {
@@ -477,10 +520,23 @@ export class SqliteRepo implements Repo {
     }
 
     const fusedRows = fuseRankedRows(query, exactRows, vectorRows, lexicalRows)
-    const distinctRows = dedupeContainedRows(fusedRows)
+    const dedupedRows = dedupeContainedRows(fusedRows)
+    const distinctRows = await this.applyRerankStage(query, dedupedRows, options)
     const effectiveK = (options?.singleBest ?? (exactRows.length > 0 && isSingleBestIdentifierQuery(query))) ? 1 : requestedK
 
-      return markStaleHits(buildBudgetedSearchHits(query, distinctRows, effectiveK, options?.maxTokens), freshness)
+      const budgetedHits = await buildBudgetedSearchHits(
+        query,
+        distinctRows,
+        effectiveK,
+        options?.maxTokens,
+        options?.context,
+        (file, startLine, endLine) => this.readRange(file, startLine, endLine)
+      )
+      const staleHits = markStaleHits(budgetedHits, freshness)
+      if (options?.withUsages) {
+        await attachUsagesToTopDefinitionHit(db, this.root, staleHits, options)
+      }
+      return staleHits
     } finally {
       releaseDatabase()
     }
@@ -1749,21 +1805,27 @@ function normalizeKinds(kind: SearchOptions['kind'] | FindSymbolOptions['kind'] 
   return Array.isArray(kind) ? kind : [kind]
 }
 
-function buildBudgetedSearchHits(
+type RangeReader = (file: string, startLine: number, endLine: number) => Promise<string>
+
+async function buildBudgetedSearchHits(
   query: string,
   rows: RankedChunkRow[],
   requestedK: number,
-  maxTokens: number | undefined
-): SearchHit[] {
+  maxTokens: number | undefined,
+  context: SearchOptions['context'],
+  readRange: RangeReader
+): Promise<SearchHit[]> {
   const tokenBudget = normalizeSearchTokenBudget(maxTokens)
   const hits: SearchHit[] = []
   let tokensUsed = 0
+  const topScore = rows[0] ? rows[0].score * scoreBoostForRow(rows[0].row, query) : 0
 
-  for (const ranked of rows) {
+  for (let index = 0; index < rows.length; index += 1) {
     if (hits.length >= requestedK) {
       break
     }
 
+    const ranked = rows[index]!
     const remainingTokens = tokenBudget === undefined ? undefined : tokenBudget - tokensUsed
     if (remainingTokens !== undefined && remainingTokens <= SEARCH_HIT_TOKEN_OVERHEAD) {
       break
@@ -1773,6 +1835,20 @@ function buildBudgetedSearchHits(
       ? DEFAULT_SNIPPET_TOKEN_BUDGET
       : Math.max(8, Math.min(DEFAULT_SNIPPET_TOKEN_BUDGET, remainingTokens - SEARCH_HIT_TOKEN_OVERHEAD))
     const hit = buildSearchHit(ranked, query, snippetTokenBudget)
+
+    if (
+      shouldInlineHit(context, index, hit.score, topScore) &&
+      (await tryInlineBody(hit, ranked, readRange, {
+        tokenBudget,
+        tokensUsed,
+        isFirstHit: hits.length === 0,
+        hasMoreRows: index + 1 < rows.length && hits.length + 1 < requestedK
+      }))
+    ) {
+      hits.push(hit)
+      tokensUsed += hit.tokensReturned
+      continue
+    }
 
     if (tokenBudget !== undefined && tokensUsed + hit.tokensReturned > tokenBudget) {
       if (hits.length > 0) {
@@ -1790,6 +1866,107 @@ function buildBudgetedSearchHits(
   }
 
   return hits
+}
+
+function shouldInlineHit(
+  context: SearchOptions['context'],
+  index: number,
+  hitScore: number,
+  topScore: number
+): boolean {
+  if (context === 'sig') {
+    return false
+  }
+
+  if (context === 'body') {
+    return true
+  }
+
+  if (index === 0) {
+    return true
+  }
+
+  if (index === 1) {
+    return topScore > 0 && hitScore >= INLINE_RANK2_SCORE_MARGIN * topScore
+  }
+
+  return false
+}
+
+/**
+ * Attach a verbatim, disk-fresh enclosing-symbol body to {@link hit} when the
+ * token budget allows, returning true on success. Mutates `hit.body` and
+ * `hit.tokensReturned`. Never throws: a disk failure, an out-of-range read, or
+ * a budget overflow leaves the compact hit untouched and returns false so the
+ * caller keeps the existing query-centered snippet.
+ */
+async function tryInlineBody(
+  hit: SearchHit,
+  ranked: RankedChunkRow,
+  readRange: RangeReader,
+  budget: {
+    tokenBudget: number | undefined
+    tokensUsed: number
+    isFirstHit: boolean
+    hasMoreRows: boolean
+  }
+): Promise<boolean> {
+  let source: string
+  try {
+    source = await readRange(hit.file, hit.range.startLine, hit.range.endLine)
+  } catch {
+    return false
+  }
+
+  const { body, tokens } = capInlineBody(source)
+  if (!body) {
+    return false
+  }
+
+  const header = `${hit.file}:${hit.range.startLine}-${hit.range.endLine} ${ranked.row.symbol ?? ''} ${ranked.row.kind ?? ''}`
+  const bodyTokensReturned = SEARCH_HIT_TOKEN_OVERHEAD + estimateTokenCount(header) + tokens
+
+  if (budget.tokenBudget !== undefined) {
+    const projected = budget.tokensUsed + bodyTokensReturned
+    // Hit-1's body alone must never consume the whole budget when more hits
+    // could otherwise appear; reserve room for at least one compact tail hit.
+    const reserve = budget.isFirstHit && budget.hasMoreRows ? SEARCH_HIT_TOKEN_OVERHEAD + 8 : 0
+    if (projected + reserve > budget.tokenBudget) {
+      return false
+    }
+  }
+
+  hit.body = body
+  hit.tokensReturned = bodyTokensReturned
+  return true
+}
+
+/**
+ * Cap an inlined body to ~{@link INLINE_BODY_MAX_TOKENS} tokens OR
+ * ~{@link INLINE_BODY_MAX_LINES} lines, whichever is smaller, appending a
+ * truncation marker when the source overflows. Indentation is preserved.
+ */
+function capInlineBody(source: string): { body: string; tokens: number } {
+  if (!source) {
+    return { body: '', tokens: 0 }
+  }
+
+  const lines = source.split('\n')
+  let truncated = false
+  let kept = lines
+
+  if (kept.length > INLINE_BODY_MAX_LINES) {
+    kept = kept.slice(0, INLINE_BODY_MAX_LINES)
+    truncated = true
+  }
+
+  while (estimateTokenCount(kept.join('\n')) > INLINE_BODY_MAX_TOKENS && kept.length > 1) {
+    kept = kept.slice(0, -1)
+    truncated = true
+  }
+
+  const body = truncated ? `${kept.join('\n')}\n${INLINE_BODY_TRUNCATION_MARKER}` : kept.join('\n')
+  return { body, tokens: estimateTokenCount(body) }
 }
 
 function buildSearchHit(ranked: RankedChunkRow, query: string, snippetTokenBudget: number): SearchHit {
@@ -2027,6 +2204,448 @@ function buildChunkSearchFilters(options?: SearchOptions): { whereSql: string; p
   }
 }
 
+async function attachUsagesToTopDefinitionHit(
+  db: Database.Database,
+  root: string,
+  hits: SearchHit[],
+  options?: SearchOptions
+): Promise<void> {
+  const topDefinitionHit = hits.find((hit) => hit.symbol && hit.kind && hit.kind !== 'file' && hit.language)
+  if (!topDefinitionHit?.symbol || !topDefinitionHit.kind || !topDefinitionHit.language) {
+    return
+  }
+
+  const usages = await findImportResolvedUsages(db, root, topDefinitionHit, options)
+  if (usages.length > 0) {
+    topDefinitionHit.usages = usages
+    topDefinitionHit.tokensReturned += usages.reduce((sum, usage) => sum + estimateTokenCount(`${usage.file}:${usage.line} ${usage.snippet}`), 0)
+  }
+}
+
+async function findImportResolvedUsages(
+  db: Database.Database,
+  root: string,
+  definition: SearchHit,
+  options?: SearchOptions
+): Promise<SymbolUsage[]> {
+  if (!definition.symbol || !definition.language) {
+    return []
+  }
+
+  const candidateFiles = selectUsageCandidateFiles(db, definition.language, options?.pathGlob)
+  if (candidateFiles.length === 0) {
+    return []
+  }
+
+  if (isTypeScriptLike(definition.language)) {
+    return findTypeScriptUsages(root, definition, candidateFiles)
+  }
+
+  if (isPythonLike(definition.language)) {
+    return findPythonUsages(root, definition, candidateFiles)
+  }
+
+  return []
+}
+
+function selectUsageCandidateFiles(db: Database.Database, language: string, pathGlob?: string): Array<{ path: string; language: string }> {
+  const family = isTypeScriptLike(language)
+    ? ['typescript', 'tsx', 'javascript', 'jsx']
+    : isPythonLike(language)
+      ? ['python']
+      : [language]
+
+  const whereClauses = [`language in (${family.map(() => '?').join(', ')})`]
+  const params: string[] = [...family]
+
+  if (pathGlob) {
+    whereClauses.push('codesift_minimatch(path, ?) = 1')
+    params.push(pathGlob)
+  }
+
+  return db
+    .prepare<unknown[], { path: string; language: string }>(
+      `
+        select path, language
+        from files
+        where ${whereClauses.join(' and ')}
+        order by path asc
+      `
+    )
+    .all(...params)
+}
+
+async function findTypeScriptUsages(
+  root: string,
+  definition: SearchHit,
+  candidateFiles: Array<{ path: string; language: string }>
+): Promise<SymbolUsage[]> {
+  const usages: SymbolUsage[] = []
+  const seen = new Set<string>()
+
+  for (const candidate of candidateFiles) {
+    if (usages.length >= 5) {
+      break
+    }
+
+    const absolutePath = resolve(root, candidate.path)
+    let content: string
+    try {
+      content = await readFile(absolutePath, 'utf8')
+    } catch {
+      continue
+    }
+
+    const sourceFile = ts.createSourceFile(candidate.path, content, ts.ScriptTarget.Latest, true, scriptKindFromPath(candidate.path))
+    const directNames = new Set<string>()
+    const namespaceNames = new Set<string>()
+
+    if (candidate.path === definition.file) {
+      directNames.add(definition.symbol!)
+    }
+
+    for (const statement of sourceFile.statements) {
+      if (!ts.isImportDeclaration(statement)) {
+        continue
+      }
+
+      const moduleSpecifier = ts.isStringLiteral(statement.moduleSpecifier) ? statement.moduleSpecifier.text : null
+      if (!moduleSpecifier || !moduleSpecifierCouldResolveToFile(candidate.path, moduleSpecifier, definition.file)) {
+        continue
+      }
+
+      const clause = statement.importClause
+      if (!clause) {
+        continue
+      }
+
+      if (clause.name && definition.symbol === 'default') {
+        directNames.add(clause.name.text)
+      }
+
+      const namedBindings = clause.namedBindings
+      if (!namedBindings) {
+        continue
+      }
+
+      if (ts.isNamedImports(namedBindings)) {
+        for (const element of namedBindings.elements) {
+          const importedName = (element.propertyName ?? element.name).text
+          if (importedName === definition.symbol) {
+            directNames.add(element.name.text)
+          }
+        }
+      } else if (ts.isNamespaceImport(namedBindings)) {
+        namespaceNames.add(namedBindings.name.text)
+      }
+    }
+
+    if (directNames.size === 0 && namespaceNames.size === 0) {
+      continue
+    }
+
+    const lines = splitLines(content)
+    const lineStarts = buildLineStarts(content)
+    const recordUsage = (offset: number, lineNumberOverride?: number) => {
+      const lineNumber = lineNumberOverride ?? lineNumberForOffset(lineStarts, offset)
+      if (candidate.path === definition.file && lineNumber >= definition.range.startLine && lineNumber <= definition.range.endLine) {
+        return
+      }
+
+      const key = `${candidate.path}:${lineNumber}`
+      if (seen.has(key)) {
+        return
+      }
+      seen.add(key)
+
+      usages.push({
+        file: candidate.path,
+        range: { startLine: lineNumber, endLine: lineNumber },
+        line: lineNumber,
+        snippet: (lines[lineNumber - 1] ?? '').trimEnd(),
+        language: candidate.language,
+        resolution: 'import-resolved'
+      })
+    }
+
+    const visit = (node: ts.Node): void => {
+      if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) && namespaceNames.has(node.expression.text) && node.name.text === definition.symbol) {
+        recordUsage(node.name.getStart(sourceFile))
+      }
+
+      if (ts.isIdentifier(node) && directNames.has(node.text) && isUsageIdentifier(node)) {
+        recordUsage(node.getStart(sourceFile))
+      }
+
+      ts.forEachChild(node, visit)
+    }
+
+    visit(sourceFile)
+  }
+
+  return usages.slice(0, 5)
+}
+
+function isUsageIdentifier(node: ts.Identifier): boolean {
+  const parent = node.parent
+  if (!parent) {
+    return true
+  }
+
+  if (ts.isImportClause(parent) || ts.isImportSpecifier(parent) || ts.isNamespaceImport(parent) || ts.isImportEqualsDeclaration(parent)) {
+    return false
+  }
+
+  if ((ts.isFunctionDeclaration(parent) || ts.isClassDeclaration(parent) || ts.isInterfaceDeclaration(parent) || ts.isTypeAliasDeclaration(parent) || ts.isEnumDeclaration(parent)) && parent.name === node) {
+    return false
+  }
+
+  if ((ts.isMethodDeclaration(parent) || ts.isPropertyDeclaration(parent) || ts.isPropertySignature(parent) || ts.isParameter(parent) || ts.isVariableDeclaration(parent) || ts.isBindingElement(parent)) && parent.name === node) {
+    return false
+  }
+
+  if (ts.isPropertyAccessExpression(parent) && parent.name === node) {
+    return false
+  }
+
+  if (ts.isPropertyAssignment(parent) && parent.name === node) {
+    return false
+  }
+
+  if (ts.isShorthandPropertyAssignment(parent) && parent.name === node) {
+    return false
+  }
+
+  return true
+}
+
+async function findPythonUsages(
+  root: string,
+  definition: SearchHit,
+  candidateFiles: Array<{ path: string; language: string }>
+): Promise<SymbolUsage[]> {
+  const usages: SymbolUsage[] = []
+  const seen = new Set<string>()
+
+  for (const candidate of candidateFiles) {
+    if (usages.length >= 5) {
+      break
+    }
+
+    const absolutePath = resolve(root, candidate.path)
+    let content: string
+    try {
+      content = await readFile(absolutePath, 'utf8')
+    } catch {
+      continue
+    }
+
+    const lines = splitLines(content)
+    const maskedLines = maskPythonLines(lines)
+    const directNames = new Set<string>()
+    const moduleAliases = new Set<string>()
+
+    if (candidate.path === definition.file) {
+      directNames.add(definition.symbol!)
+    }
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const rawLine = lines[index] ?? ''
+      const trimmed = rawLine.trim()
+      if (!trimmed) {
+        continue
+      }
+
+      const fromImport = trimmed.match(/^from\s+([.A-Za-z0-9_]+)\s+import\s+(.+)$/)
+      if (fromImport && pythonModuleCouldResolveToFile(candidate.path, fromImport[1]!, definition.file)) {
+        for (const part of fromImport[2]!.split(',')) {
+          const match = part.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?$/)
+          const importedName = match?.[1]
+          if (importedName && importedName === definition.symbol) {
+            directNames.add(match?.[2] ?? importedName)
+          }
+        }
+      }
+
+      const importAlias = trimmed.match(/^import\s+([.A-Za-z0-9_]+)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)$/)
+      if (importAlias && pythonModuleCouldResolveToFile(candidate.path, importAlias[1]!, definition.file)) {
+        moduleAliases.add(importAlias[2]!)
+      }
+    }
+
+    if (directNames.size === 0 && moduleAliases.size === 0) {
+      continue
+    }
+
+    for (let index = 0; index < maskedLines.length; index += 1) {
+      const lineNumber = index + 1
+      if (candidate.path === definition.file && lineNumber >= definition.range.startLine && lineNumber <= definition.range.endLine) {
+        continue
+      }
+
+      const rawLine = lines[index]?.trim() ?? ''
+      if (/^(from\s+.+\s+import\s+.+|import\s+.+)$/.test(rawLine)) {
+        continue
+      }
+
+      const masked = maskedLines[index] ?? ''
+      const directMatch = [...directNames].some((name) => new RegExp(`\\b${escapeRegExp(name)}\\b`).test(masked))
+      const moduleMatch = [...moduleAliases].some((alias) => new RegExp(`\\b${escapeRegExp(alias)}\\.${escapeRegExp(definition.symbol!)}\\b`).test(masked))
+      if (!directMatch && !moduleMatch) {
+        continue
+      }
+
+      const key = `${candidate.path}:${lineNumber}`
+      if (seen.has(key)) {
+        continue
+      }
+      seen.add(key)
+
+      usages.push({
+        file: candidate.path,
+        range: { startLine: lineNumber, endLine: lineNumber },
+        line: lineNumber,
+        snippet: (lines[index] ?? '').trimEnd(),
+        language: candidate.language,
+        resolution: 'import-resolved'
+      })
+
+      if (usages.length >= 5) {
+        break
+      }
+    }
+  }
+
+  return usages.slice(0, 5)
+}
+
+function moduleSpecifierCouldResolveToFile(importerFile: string, moduleSpecifier: string, targetFile: string): boolean {
+  if (!moduleSpecifier.startsWith('.')) {
+    return false
+  }
+
+  const importerDirectory = dirname(importerFile)
+  const base = normalizeRepoPath(resolve('/', importerDirectory, moduleSpecifier))
+  const target = normalizeRepoPath(resolve('/', targetFile))
+  const candidates = new Set([
+    base,
+    `${base}.ts`,
+    `${base}.tsx`,
+    `${base}.js`,
+    `${base}.jsx`,
+    `${base}.mts`,
+    `${base}.cts`,
+    `${base}/index.ts`,
+    `${base}/index.tsx`,
+    `${base}/index.js`,
+    `${base}/index.jsx`,
+    `${base}/index.mts`,
+    `${base}/index.cts`
+  ])
+
+  return candidates.has(target)
+}
+
+function pythonModuleCouldResolveToFile(importerFile: string, moduleSpecifier: string, targetFile: string): boolean {
+  const importerDirectory = dirname(importerFile)
+  const target = normalizeRepoPath(resolve('/', targetFile))
+  const relativeMatch = moduleSpecifier.match(/^(\.+)(.*)$/)
+
+  let base: string
+  if (relativeMatch) {
+    const dots = relativeMatch[1]!.length
+    const rest = relativeMatch[2] ?? ''
+    const parentDirectory = dots > 1 ? resolve('/', importerDirectory, ...Array.from({ length: dots - 1 }, () => '..')) : resolve('/', importerDirectory)
+    base = normalizeRepoPath(resolve(parentDirectory, rest.replace(/\./g, '/')))
+  } else {
+    base = normalizeRepoPath(resolve('/', moduleSpecifier.replace(/\./g, '/')))
+  }
+
+  const candidates = new Set([base, `${base}.py`, `${base}/__init__.py`])
+  return candidates.has(target)
+}
+
+function normalizeRepoPath(value: string): string {
+  return value.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/$/, '')
+}
+
+function scriptKindFromPath(filePath: string): ts.ScriptKind {
+  if (filePath.endsWith('.ts')) {
+    return ts.ScriptKind.TS
+  }
+
+  if (filePath.endsWith('.tsx')) {
+    return ts.ScriptKind.TSX
+  }
+
+  if (filePath.endsWith('.jsx')) {
+    return ts.ScriptKind.JSX
+  }
+
+  return ts.ScriptKind.JS
+}
+
+function maskPythonLines(lines: string[]): string[] {
+  const maskedLines: string[] = []
+  let tripleQuote: "'''" | '"""' | null = null
+
+  for (const line of lines) {
+    let masked = ''
+    let quote: '"' | "'" | null = null
+    let escaped = false
+
+    for (let index = 0; index < line.length; index += 1) {
+      const char = line[index] ?? ''
+      const nextThree = line.slice(index, index + 3)
+
+      if (tripleQuote) {
+        if (nextThree === tripleQuote) {
+          masked += '   '
+          index += 2
+          tripleQuote = null
+        } else {
+          masked += ' '
+        }
+        continue
+      }
+
+      if (quote) {
+        masked += ' '
+        if (!escaped && char === quote) {
+          quote = null
+        }
+        escaped = !escaped && char === '\\'
+        continue
+      }
+
+      if (nextThree === "'''" || nextThree === '"""') {
+        masked += '   '
+        index += 2
+        tripleQuote = nextThree as "'''" | '"""'
+        continue
+      }
+
+      if (char === '#') {
+        masked += ' '.repeat(line.length - index)
+        break
+      }
+
+      if (char === '"' || char === "'") {
+        masked += ' '
+        quote = char
+        escaped = false
+        continue
+      }
+
+      masked += char
+    }
+
+    maskedLines.push(masked)
+  }
+
+  return maskedLines
+}
+
 function selectExactCandidateRows(
   db: Database.Database,
   query: string,
@@ -2203,6 +2822,46 @@ function fuseRankedRows(query: string, exactRows: ChunkRow[], vectorRows: ChunkR
   })
 }
 
+/**
+ * Build the document text handed to the reranker for a candidate row: the
+ * stored snippet, optionally prefixed with the symbol, capped to keep payloads
+ * small. The reranker only re-scores; the verbatim body is still read from disk
+ * later in {@link buildBudgetedSearchHits}.
+ */
+function rerankDocumentForRow(row: ChunkRow): string {
+  const prefix = row.symbol ? `${row.symbol}\n` : ''
+  return `${prefix}${row.snippet}`.slice(0, RERANK_SNIPPET_CHAR_LIMIT)
+}
+
+/**
+ * Reorder `head` by the reranker's scores (descending), appending any candidate
+ * the reranker omitted in its original relative order. Stable on ties so a
+ * no-signal rerank preserves the fused order.
+ */
+function reorderByRerankResults(head: RankedChunkRow[], results: RerankResult[]): RankedChunkRow[] {
+  const ordered = [...results]
+    .filter((result) => result.index >= 0 && result.index < head.length)
+    .sort((left, right) => right.score - left.score)
+
+  const seen = new Set<number>()
+  const reordered: RankedChunkRow[] = []
+  for (const result of ordered) {
+    if (seen.has(result.index)) {
+      continue
+    }
+    seen.add(result.index)
+    reordered.push(head[result.index]!)
+  }
+
+  head.forEach((ranked, index) => {
+    if (!seen.has(index)) {
+      reordered.push(ranked)
+    }
+  })
+
+  return reordered
+}
+
 function addReciprocalRanks(target: Map<string, RankedChunkRow>, rows: ChunkRow[], reason: SearchReasonTag, weight = 1): void {
   rows.forEach((row, index) => {
     const score = weight / (DEFAULT_RRF_K + index + 1)
@@ -2277,6 +2936,17 @@ function isExactSymbolMatch(row: ChunkRow, query: string): boolean {
   return candidates.some((candidate) => candidate === lowerSymbol || qualifiedNames.has(candidate))
 }
 
+function isIdentifierLikeToken(candidate: string): boolean {
+  return (
+    candidate.includes('.') ||
+    candidate.includes('_') ||
+    candidate.includes('::') ||
+    candidate.includes('#') ||
+    /[a-z0-9][A-Z]/.test(candidate) ||
+    /^[A-Z][A-Za-z0-9_]+$/.test(candidate)
+  )
+}
+
 function extractSymbolCandidates(query: string): string[] {
   const matches = new Set<string>()
   const rawMatches = query.match(/`([^`]+)`|[A-Za-z_][A-Za-z0-9_.:#]*/g) ?? []
@@ -2287,15 +2957,7 @@ function extractSymbolCandidates(query: string): string[] {
       continue
     }
 
-    const identifierLike =
-      candidate.includes('.') ||
-      candidate.includes('_') ||
-      candidate.includes('::') ||
-      candidate.includes('#') ||
-      /[a-z0-9][A-Z]/.test(candidate) ||
-      /^[A-Z][A-Za-z0-9_]+$/.test(candidate)
-
-    if (!identifierLike) {
+    if (!isIdentifierLikeToken(candidate)) {
       continue
     }
 
@@ -2310,13 +2972,33 @@ function extractSymbolCandidates(query: string): string[] {
   return [...matches]
 }
 
-function buildFtsQuery(query: string): string | null {
+export function buildFtsQuery(query: string): string | null {
   const terms = [...new Set(buildNormalizedTerms(query).filter((term) => !DEFAULT_STOP_WORDS.has(term) && term.length > 1))]
   if (terms.length === 0) {
     return null
   }
 
-  return terms.slice(0, 12).map(quoteFtsTerm).join(' AND ')
+  const groups: string[] = []
+  const covered = new Set<string>()
+
+  for (const term of terms) {
+    if (groups.length >= 12) {
+      break
+    }
+
+    if (covered.has(term)) {
+      continue
+    }
+
+    const members = expandTermToOrGroup(term)
+    for (const member of members) {
+      covered.add(member)
+    }
+
+    groups.push(members.length > 1 ? `(${members.map(quoteFtsTerm).join(' OR ')})` : quoteFtsTerm(term))
+  }
+
+  return groups.join(' AND ')
 }
 
 function quoteFtsTerm(term: string): string {
@@ -2413,7 +3095,7 @@ function buildNormalizedTerms(value: string | undefined): string[] {
   return normalized.match(/[a-z0-9]+/g) ?? []
 }
 
-function queryShouldUseVectorSearch(query: string): boolean {
+export function queryShouldUseVectorSearch(query: string): boolean {
   const trimmedQuery = query.trim()
   if (!trimmedQuery) {
     return false
@@ -2428,11 +3110,34 @@ function queryShouldUseVectorSearch(query: string): boolean {
   }
 
   const normalizedTerms = buildNormalizedTerms(trimmedQuery)
-  if (normalizedTerms.length <= 4 && extractSymbolCandidates(trimmedQuery).length > 0) {
+  if (normalizedTerms.length <= 4 && isSymbolDominatedQuery(trimmedQuery)) {
     return false
   }
 
   return true
+}
+
+/**
+ * A short query is symbol-dominated only when a MAJORITY of its word tokens are
+ * identifier-like (dotted/underscored/qualified/PascalCase/acronym). A single
+ * PascalCase or acronym token inside a natural-language query (e.g.
+ * "validate JWT signature") does not dominate, so the query stays vector-eligible.
+ */
+function isSymbolDominatedQuery(query: string): boolean {
+  const tokens = query.match(/`([^`]+)`|[A-Za-z_][A-Za-z0-9_.:#]*/g) ?? []
+  if (tokens.length === 0) {
+    return false
+  }
+
+  let identifierLike = 0
+  for (const token of tokens) {
+    const candidate = token.startsWith('`') && token.endsWith('`') ? token.slice(1, -1) : token
+    if (candidate && isIdentifierLikeToken(candidate)) {
+      identifierLike += 1
+    }
+  }
+
+  return identifierLike * 2 > tokens.length
 }
 
 function looksLikePathQuery(query: string): boolean {

@@ -22,6 +22,18 @@ export interface Range {
 
 export type SearchReasonTag = '=' | '~' | '+'
 
+export interface SymbolUsage {
+  file: string
+  range: Range
+  line: number
+  snippet: string
+  language?: string
+  /**
+   * Honest provenance marker: usages are import-resolved/local, not type-resolved.
+   */
+  resolution: 'import-resolved'
+}
+
 export interface SearchHit {
   id: string
   file: string
@@ -31,6 +43,16 @@ export interface SearchHit {
   snippet: string
   snippetRange: Range
   tokensReturned: number
+  /**
+   * Full, VERBATIM enclosing-symbol source for an INLINED hit. Original
+   * indentation preserved; not trimmed, not flattened. Absent on compact hits.
+   */
+  body?: string
+  /**
+   * Optional top-N usage sites for a DEFINITION hit. Supported only for
+   * TS/JS + Python and resolved via imports/local bindings, not a type checker.
+   */
+  usages?: SymbolUsage[]
   language?: string
   symbol?: string
   parent?: string
@@ -67,6 +89,25 @@ export interface SearchOptions {
   kind?: SymbolKind | SymbolKind[]
   maxTokens?: number
   singleBest?: boolean
+  /**
+   * Body-inlining policy. `'body'` inlines bodies wherever the budget allows;
+   * `'sig'` never inlines (compact only); `undefined` is AUTO — inline rank-1
+   * always, rank-2 only if within the score margin of rank-1.
+   */
+  context?: 'sig' | 'body'
+  /**
+   * Bundle top-N usage sites for the top DEFINITION hit when supported. Honest
+   * scope: import-resolved/local only, currently TS/JS + Python.
+   */
+  withUsages?: boolean
+  /**
+   * OPT-IN reranker re-scoring of the fused candidates. Off by default; gated to
+   * NL-concept-shaped queries and only active when a reranker is configured (via
+   * `CODESIFT_RERANKER` env or `.codesift/config.json` `reranker`). RRF remains the
+   * candidate generator — rerank only reorders the head. Fail-safe: any rerank
+   * error falls back to the fused order. The default local path never enables it.
+   */
+  rerank?: boolean
 }
 
 export interface GrepOptions {
@@ -232,4 +273,33 @@ export interface EmbeddingProvider {
   modelVersion?: string
   isLearned?: boolean
   embedBatch(texts: string[], options: EmbeddingBatchOptions, signal?: AbortSignal): Promise<Float32Array[]>
+}
+
+export interface RerankResult {
+  /** Index into the `documents` array passed to {@link Reranker.rerank}. */
+  index: number
+  /** Relevance score; higher is more relevant. Magnitude is provider-specific. */
+  score: number
+}
+
+export interface RerankOptions {
+  /** Keep only the top-K results (by score). Undefined returns all scored documents. */
+  topK?: number
+  signal?: AbortSignal
+}
+
+/**
+ * A relevance reranker, symmetric with {@link EmbeddingProvider}. Always opt-in
+ * (never the default), selected explicitly via `CODESIFT_RERANKER` or
+ * `.codesift/config.json` `reranker`. Cloud providers perform network I/O only
+ * inside `rerank`, never at import/registration.
+ */
+export interface Reranker {
+  id: string
+  model?: string
+  /**
+   * Score `documents` against `query`, returning `{ index, score }` for the
+   * matched documents (higher score = more relevant). Order is not guaranteed.
+   */
+  rerank(query: string, documents: string[], options?: RerankOptions): Promise<RerankResult[]>
 }

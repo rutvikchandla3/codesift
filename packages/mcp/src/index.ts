@@ -14,7 +14,8 @@ import {
   type SearchHit,
   type SearchOptions,
   type SymbolDefinition,
-  type SymbolKind
+  type SymbolKind,
+  type SymbolUsage
 } from '@codesift/core'
 
 import { createHttpServerHandle } from './http.js'
@@ -55,6 +56,8 @@ export interface SearchCodeArgs {
   kind?: SearchOptions['kind'] | undefined
   max_tokens?: number | undefined
   single_best?: boolean | undefined
+  context?: SearchOptions['context'] | undefined
+  with_usages?: boolean | undefined
 }
 
 export interface FindSymbolArgs {
@@ -128,7 +131,8 @@ export type McpJsonRpcResponse =
 export const MCP_SERVER_INSTRUCTIONS = [
   'codesift is the repo search tool. Prefer it before host grep/read-file flows because results are compact and include stable ids for follow-up reads.',
   'Routing policy: use find_symbol for exact identifiers/definitions; use grep_code for literal strings, env vars, error messages, operators, or regex; use search_code for concepts/behaviors/natural language.',
-  'For search_code, start with k=5-8, set max_tokens when context is tight, and read_chunk only for the best id. For grep_code, keep context_lines small unless the user asks for surrounding code.',
+  'search_code returns the complete top result inline (the full enclosing symbol body); no follow-up read is normally needed. Use read_chunk only to expand an ADDITIONAL hit beyond the top result or to widen context.',
+  'For search_code, start with k=5-8 and set max_tokens when context is tight. For grep_code, keep context_lines small unless the user asks for surrounding code.',
   'If index_status reports no index, stale data, or a running/failed/aborted sync, suggest running codesift index before relying on results.'
 ].join('\n')
 
@@ -142,7 +146,9 @@ const searchCodeInputSchema = {
   path_glob: z.string().min(1).optional().describe('Repo-relative glob, e.g. "src/**".'),
   kind: kindFilterSchema.optional().describe('Symbol kind filter for matching chunks.'),
   max_tokens: z.number().int().positive().max(4000).optional().describe('Maximum approximate tokens to return across compact hits. Default 700.'),
-  single_best: z.boolean().optional().describe('Return only the highest-confidence answer, useful for identifier-exact lookups.')
+  single_best: z.boolean().optional().describe('Return only the highest-confidence answer, useful for identifier-exact lookups.'),
+  context: z.enum(['sig', 'body']).optional().describe('Inline policy: sig=compact signatures/snippets only, body=inline full bodies wherever the budget allows.'),
+  with_usages: z.boolean().optional().describe('Bundle top-N import-resolved/local usage sites for the top definition hit (TS/JS + Python only).')
 }
 
 const findSymbolInputSchema = {
@@ -209,8 +215,8 @@ class StdioMcpServerHandle implements McpServerHandle {
 export function getToolDefinitions(): readonly McpToolDefinition[] {
   const provider = getDefaultEmbeddingProvider()
   const searchDescription = isLearnedEmbeddingProvider(provider)
-    ? 'Concept/behavior search over the current repo using hybrid lexical + semantic retrieval. Use for natural-language questions; prefer grep_code for exact literals/regex and find_symbol for definitions.'
-    : 'Concept/behavior search over the current repo using lexical retrieval. Use for natural-language questions; prefer grep_code for exact literals/regex and find_symbol for definitions.'
+    ? 'Concept/behavior search over the current repo using hybrid lexical + semantic retrieval. Returns the complete top result inline (full enclosing symbol body); no follow-up read is normally needed. Use for natural-language questions; prefer grep_code for exact literals/regex and find_symbol for definitions.'
+    : 'Concept/behavior search over the current repo using lexical retrieval. Returns the complete top result inline (full enclosing symbol body); no follow-up read is normally needed. Use for natural-language questions; prefer grep_code for exact literals/regex and find_symbol for definitions.'
 
   return [
     {
@@ -223,7 +229,9 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
         path_glob: { type: 'string' },
         kind: kindJsonSchema(),
         max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: 700 },
-        single_best: { type: 'boolean' }
+        single_best: { type: 'boolean' },
+        context: { type: 'string', enum: ['sig', 'body'] },
+        with_usages: { type: 'boolean' }
       })
     },
     {
@@ -254,7 +262,7 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
     },
     {
       name: 'read_chunk',
-      description: 'Expand a search_code hit id into the source chunk with optional context. Use after search_code/find_symbol, not as first step.',
+      description: 'Expand an ADDITIONAL search_code hit id into its source chunk, or widen context around one. The top search_code result is already returned inline, so this is rarely needed for the best hit; use it for secondary hits or extra surrounding lines, not as a first step.',
       inputSchema: jsonSchema(['id'], {
         id: { type: 'string' },
         context_lines: { type: 'integer', minimum: 0, maximum: 50 }
@@ -290,6 +298,12 @@ export function createRouter(repo: Repo): McpRouter {
       options.maxTokens = args.max_tokens ?? 700
       if (args.single_best !== undefined) {
         options.singleBest = args.single_best
+      }
+      if (args.context !== undefined) {
+        options.context = args.context
+      }
+      if (args.with_usages !== undefined) {
+        options.withUsages = args.with_usages
       }
 
       return repo.search(args.query, options)
@@ -497,7 +511,7 @@ function toolDescription(name: McpToolName): string {
   return tool?.description ?? name
 }
 
-function formatMcpSearchHits(hits: SearchHit[]): string {
+export function formatMcpSearchHits(hits: SearchHit[]): string {
   if (hits.length === 0) {
     return 'no_hits'
   }
@@ -508,12 +522,33 @@ function formatMcpSearchHits(hits: SearchHit[]): string {
       const symbol = formatHitSymbol(hit)
       const generated = hit.generated ? ' [generated]' : ''
       const stale = hit.stale ? ' [stale]' : ''
-      const snippet = compactSnippet(hit.snippet, 4)
-      return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${generated}${stale}${snippet ? ` | ${snippet}` : ''}`
+      const header = `${hit.reason} ${formatChunkId(hit.id)}${symbol}${generated}${stale}`
+
+      if (hit.body !== undefined) {
+        const block = `${header}\n${formatBodyBlock(hit.body, hit.range.startLine ?? hit.snippetRange.startLine)}`
+        return hit.usages?.length ? `${block}\n${formatUsageBlock(hit.usages)}` : block
+      }
+
+      const snippet = compactHitSnippet(hit.snippet, hit.range.startLine ?? hit.snippetRange.startLine, 4)
+      const block = snippet ? `${header}\n${snippet}` : header
+      return hit.usages?.length ? `${block}\n${formatUsageBlock(hit.usages)}` : block
     })
     .join('\n')
 
   return `${body}\ntokensReturned=${tokensReturned}`
+}
+
+function formatBodyBlock(body: string, startLine: number): string {
+  const lines = body.replace(/\n$/, '').split('\n')
+  return lines.map((line, index) => `${startLine + index} | ${line}`).join('\n')
+}
+
+function formatUsageBlock(usages: SymbolUsage[]): string {
+  const lines = ['usages (import-resolved):']
+  for (const usage of usages) {
+    lines.push(`- ${usage.file}:${usage.line} | ${usage.snippet}`)
+  }
+  return lines.join('\n')
 }
 
 function formatHitSymbol(hit: SearchHit): string {
@@ -534,7 +569,7 @@ function formatMcpSymbols(definitions: SymbolDefinition[]): string {
     .join('\n')
 }
 
-function formatMcpGrepHits(hits: GrepHit[]): string {
+export function formatMcpGrepHits(hits: GrepHit[]): string {
   if (hits.length === 0) {
     return 'no_matches'
   }
@@ -542,7 +577,7 @@ function formatMcpGrepHits(hits: GrepHit[]): string {
   return hits
     .map((hit) => {
       const range = formatRange(hit.range.startLine, hit.range.endLine)
-      const snippet = compactSnippet(hit.snippet, 5)
+      const snippet = compactSnippet(hit.snippet, 5).split('\n').join(' ↩ ')
       return `${hit.file}:${range}:${hit.column} | ${snippet}`
     })
     .join('\n')
@@ -558,7 +593,18 @@ function compactSnippet(snippet: string, maxLines: number): string {
     .map((line) => line.trim())
     .filter(Boolean)
     .slice(0, maxLines)
-    .join(' ↩ ')
+    .join('\n')
+}
+
+// Structure-preserving renderer for compact (no-body) search hits: keeps
+// original indentation and emits `NN | code` line-number prefixes, matching the
+// inlined-body block. Only trailing whitespace and a trailing newline are dropped.
+function compactHitSnippet(snippet: string, startLine: number, maxLines: number): string {
+  const lines = snippet.replace(/\n$/, '').split('\n').slice(0, maxLines)
+  if (lines.length === 0) {
+    return ''
+  }
+  return lines.map((line, index) => `${startLine + index} | ${line.replace(/\s+$/, '')}`).join('\n')
 }
 
 function formatRange(startLine: number, endLine: number): string {

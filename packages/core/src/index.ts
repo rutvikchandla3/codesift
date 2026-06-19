@@ -10,6 +10,9 @@ export type {
   Range,
   ReadChunkOptions,
   ReadRangeOptions,
+  RerankOptions,
+  RerankResult,
+  Reranker,
   Repo,
   RepoOptions,
   RepoStaleReason,
@@ -24,6 +27,7 @@ export type {
   StopWatching,
   SymbolDefinition,
   SymbolKind,
+  SymbolUsage,
   SyncOptions,
   SyncProgressEvent,
   SyncResult,
@@ -47,8 +51,19 @@ export {
   registerEmbeddingProvider
 } from './embedding.js'
 
+export {
+  FIXTURE_RERANKER_ID,
+  getReranker,
+  listRerankers,
+  registerCloudRerankers,
+  registerFixtureReranker,
+  registerReranker,
+  resolveReranker
+} from './reranker.js'
+
 export { OpenAIEmbeddingProvider, OPENAI_EMBEDDING_PROVIDER_ID } from './providers/openai.js'
 export { VoyageEmbeddingProvider, VOYAGE_EMBEDDING_PROVIDER_ID } from './providers/voyage.js'
+export { VoyageReranker, VOYAGE_RERANK_PROVIDER_ID } from './providers/voyage-rerank.js'
 
 export {
   prepareForCloud,

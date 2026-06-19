@@ -2,6 +2,15 @@
   "losses": [
     {
       "repoId": "cookie",
+      "queryId": "cookie-parse-concept",
+      "queryType": "nl-concept",
+      "axes": [
+        "latency.cold",
+        "tokens"
+      ]
+    },
+    {
+      "repoId": "cookie",
       "queryId": "cookie-parse-identifier",
       "queryType": "exact-identifier",
       "axes": [
@@ -21,7 +30,8 @@
       "queryId": "escape-regexp-concept",
       "queryType": "nl-concept",
       "axes": [
-        "latency.cold"
+        "latency.cold",
+        "tokens"
       ]
     },
     {
@@ -61,7 +71,8 @@
       "queryId": "itsdangerous-unsign-concept",
       "queryType": "nl-concept",
       "axes": [
-        "latency.cold"
+        "latency.cold",
+        "tokens"
       ]
     },
     {

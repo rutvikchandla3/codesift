@@ -54,6 +54,7 @@ export interface EvalRun {
   queryId: string
   queryType: GoldenQueryType
   tokensToResolution: number
+  callsToResolution: number
   wallClockMs: {
     cold: number
     warm: number
@@ -82,6 +83,7 @@ export interface QueryTypeSummary {
   ripgrep: AggregatedMetrics
   delta: {
     tokensToResolution: number
+    callsToResolution: number
     coldLatencyMs: number
     warmLatencyMs: number
     successRate: number
@@ -90,12 +92,14 @@ export interface QueryTypeSummary {
 
 export interface AggregatedMetrics {
   tokensToResolutionMedian: number
+  callsToResolutionMedian: number
   coldLatencyMedianMs: number
   warmLatencyMedianMs: number
   successRate: number
   recallAt5: number
   recallAt10: number
   meanReciprocalRank: number
+  mrrAt1: number
 }
 
 export interface RoutingProof {
@@ -125,7 +129,7 @@ export interface EvaluateManifestOptions {
   latencyToleranceMs?: number
 }
 
-interface CandidateResult {
+export interface CandidateResult {
   file: string
   range: Range
   symbol?: string
@@ -134,6 +138,7 @@ interface CandidateResult {
 
 interface PolicyRun {
   tokensToResolution: number
+  callsToResolution: number
   taskSuccess: boolean
   recallAt5: number
   recallAt10: number
@@ -145,12 +150,13 @@ interface ManifestFileShape {
   queries?: GoldenQuery[]
 }
 
-interface RipgrepHit {
+export interface RipgrepHit {
   file: string
   range: Range
   column: number
   match: string
   snippet: string
+  context: Array<{ line: number; text: string }>
 }
 
 export function createEmptyManifest(): EvalManifest {
@@ -276,10 +282,12 @@ export function formatSummary(summary: EvalSummary): string {
     lines.push(
       `${row.queryType} (${row.queryCount} queries)`,
       `  tokens median    codesift=${formatNumber(row.codesift.tokensToResolutionMedian)} rg=${formatNumber(row.ripgrep.tokensToResolutionMedian)} Δ=${formatSignedNumber(row.delta.tokensToResolution)}`,
+      `  calls median     codesift=${formatNumber(row.codesift.callsToResolutionMedian)} rg=${formatNumber(row.ripgrep.callsToResolutionMedian)} Δ=${formatSignedNumber(row.delta.callsToResolution)}`,
       `  cold latency ms  codesift=${formatNumber(row.codesift.coldLatencyMedianMs)} rg=${formatNumber(row.ripgrep.coldLatencyMedianMs)} Δ=${formatSignedNumber(row.delta.coldLatencyMs)}`,
       `  warm latency ms  codesift=${formatNumber(row.codesift.warmLatencyMedianMs)} rg=${formatNumber(row.ripgrep.warmLatencyMedianMs)} Δ=${formatSignedNumber(row.delta.warmLatencyMs)}`,
       `  success rate     codesift=${formatRatio(row.codesift.successRate)} rg=${formatRatio(row.ripgrep.successRate)} Δ=${formatSignedNumber(row.delta.successRate)}`,
       `  recall@5 / mrr   codesift=${formatRatio(row.codesift.recallAt5)} / ${formatRatio(row.codesift.meanReciprocalRank)} rg=${formatRatio(row.ripgrep.recallAt5)} / ${formatRatio(row.ripgrep.meanReciprocalRank)}`,
+      `  mrr@1            codesift=${formatRatio(row.codesift.mrrAt1)} rg=${formatRatio(row.ripgrep.mrrAt1)}`,
       ''
     )
   }
@@ -375,6 +383,7 @@ async function measureCodesiftRun(repoRoot: string, query: GoldenQuery, resultLi
     queryId: query.id,
     queryType: query.queryType,
     tokensToResolution: coldMeasurement.value.tokensToResolution,
+    callsToResolution: coldMeasurement.value.callsToResolution,
     wallClockMs: {
       cold: coldMeasurement.ms,
       warm: warmMeasurement.ms
@@ -396,6 +405,7 @@ async function measureRipgrepRun(repoRoot: string, query: GoldenQuery, resultLim
     queryId: query.id,
     queryType: query.queryType,
     tokensToResolution: coldMeasurement.value.tokensToResolution,
+    callsToResolution: coldMeasurement.value.callsToResolution,
     wallClockMs: {
       cold: coldMeasurement.ms,
       warm: warmMeasurement.ms
@@ -562,12 +572,31 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
 
       const hits = await repo.search(query.query, options)
       const candidates = hits.map(candidateFromSearch)
-      const tokensToResolution = estimateTokenCount(formatSearchHits(hits))
       const matchingRank = firstMatchingRank(candidates, query)
       const taskSuccess = matchingRank !== null && matchingRank <= inspectionLimit
 
+      let tokensToResolution = hits.reduce((sum, hit) => sum + hit.tokensReturned, 0)
+      let callsToResolution = 1
+
+      if (matchingRank !== null) {
+        const matchingHit = hits[matchingRank - 1]
+        const bodyResolves =
+          matchingHit?.body !== undefined &&
+          query.expectedLineRange !== undefined &&
+          bodyOverlapsExpected(matchingHit, query.expectedLineRange)
+
+        if (!bodyResolves && matchingHit?.id) {
+          const followUp = await readChunkSafely(repo, matchingHit.id)
+          if (followUp !== null) {
+            tokensToResolution += estimateTokenCount(followUp)
+            callsToResolution = 2
+          }
+        }
+      }
+
       return {
         tokensToResolution,
+        callsToResolution,
         taskSuccess,
         recallAt5: matchingRank !== null && matchingRank <= 5 ? 1 : 0,
         recallAt10: matchingRank !== null && matchingRank <= 10 ? 1 : 0,
@@ -584,9 +613,11 @@ async function runRipgrepPolicy(repoRoot: string, query: GoldenQuery, resultLimi
   return evaluateRankedCandidates(candidates, query, tokens, inspectionLimit)
 }
 
-async function runRipgrep(repoRoot: string, query: GoldenQuery, resultLimit: number): Promise<RipgrepHit[]> {
+const RIPGREP_CONTEXT_LINES = 5
+
+export async function runRipgrep(repoRoot: string, query: GoldenQuery, resultLimit: number): Promise<RipgrepHit[]> {
   const pattern = query.grepPattern ?? query.query
-  const args = ['--json', '--line-number', '--color', 'never', '--max-count', String(resultLimit)]
+  const args = ['--json', '--line-number', '--color', 'never', '--context', String(RIPGREP_CONTEXT_LINES), '--max-count', String(resultLimit)]
 
   if (query.queryType === 'exact-identifier' || query.queryType === 'symbol-def') {
     args.push('--fixed-strings', '--word-regexp')
@@ -612,7 +643,13 @@ async function runRipgrep(repoRoot: string, query: GoldenQuery, resultLimit: num
     }
   }
 
-  const hits: RipgrepHit[] = []
+  // Parse in two passes. ripgrep emits after-context line events AFTER the match
+  // event they belong to, so a single pass only sees before-context when building a
+  // hit's window. The first pass populates contextByFile from ALL context events and
+  // records match events in stream order; the second pass builds hits against the now
+  // complete contextByFile so collectRipgrepContext sees the full ±5 window.
+  const contextByFile = new Map<string, Array<{ line: number; text: string }>>()
+  const matchEvents: RipgrepMatchEvent[] = []
 
   for (const line of stdout.split('\n').filter(Boolean)) {
     let event: unknown
@@ -622,14 +659,28 @@ async function runRipgrep(repoRoot: string, query: GoldenQuery, resultLimit: num
       continue
     }
 
-    if (!isRipgrepMatchEvent(event)) {
+    if (isRipgrepContextEvent(event)) {
+      const relativePath = relative(repoRoot, resolve(repoRoot, event.data.path.text)).replace(/\\/g, '/')
+      const lines = contextByFile.get(relativePath) ?? []
+      lines.push({ line: event.data.line_number, text: event.data.lines.text.replace(/\n$/, '') })
+      contextByFile.set(relativePath, lines)
       continue
     }
 
+    if (isRipgrepMatchEvent(event)) {
+      matchEvents.push(event)
+    }
+  }
+
+  const hits: RipgrepHit[] = []
+
+  for (const event of matchEvents) {
     const pathText = event.data.path.text
     const relativePath = relative(repoRoot, resolve(repoRoot, pathText)).replace(/\\/g, '/')
     const lineNumber = event.data.line_number
     const snippet = event.data.lines.text.replace(/\n$/, '')
+    const surrounding = contextByFile.get(relativePath) ?? []
+    const context = collectRipgrepContext(surrounding, lineNumber, snippet)
 
     for (const submatch of event.data.submatches) {
       hits.push({
@@ -637,7 +688,8 @@ async function runRipgrep(repoRoot: string, query: GoldenQuery, resultLimit: num
         range: { startLine: lineNumber, endLine: lineNumber },
         column: submatch.start + 1,
         match: submatch.match.text,
-        snippet
+        snippet,
+        context
       })
     }
   }
@@ -645,11 +697,41 @@ async function runRipgrep(repoRoot: string, query: GoldenQuery, resultLimit: num
   return hits.slice(0, resultLimit)
 }
 
+// Validated match-event shape, kept in lockstep with isRipgrepMatchEvent's type guard.
+interface RipgrepMatchEvent {
+  type: 'match'
+  data: {
+    path: { text: string }
+    lines: { text: string }
+    line_number: number
+    submatches: Array<{ match: { text: string }; start: number }>
+  }
+}
+
+function collectRipgrepContext(
+  surrounding: Array<{ line: number; text: string }>,
+  matchLine: number,
+  matchText: string
+): Array<{ line: number; text: string }> {
+  const window = new Map<number, string>()
+  for (const entry of surrounding) {
+    if (Math.abs(entry.line - matchLine) <= RIPGREP_CONTEXT_LINES) {
+      window.set(entry.line, entry.text)
+    }
+  }
+  window.set(matchLine, matchText)
+
+  return [...window.entries()]
+    .sort((left, right) => left[0] - right[0])
+    .map(([line, text]) => ({ line, text }))
+}
+
 function evaluateRankedCandidates(candidates: CandidateResult[], query: GoldenQuery, tokensToResolution: number, inspectionLimit: number): PolicyRun {
   const matchingRank = firstMatchingRank(candidates, query)
 
   return {
     tokensToResolution,
+    callsToResolution: 1,
     taskSuccess: matchingRank !== null && matchingRank <= inspectionLimit,
     recallAt5: matchingRank !== null && matchingRank <= 5 ? 1 : 0,
     recallAt10: matchingRank !== null && matchingRank <= 10 ? 1 : 0,
@@ -662,7 +744,7 @@ function firstMatchingRank(candidates: CandidateResult[], query: GoldenQuery): n
   return index === -1 ? null : index + 1
 }
 
-function candidateMatchesExpected(candidate: CandidateResult, query: GoldenQuery): boolean {
+export function candidateMatchesExpected(candidate: CandidateResult, query: GoldenQuery): boolean {
   return query.expected.some((expected) => {
     if (normalizePath(candidate.file) !== normalizePath(expected.file)) {
       return false
@@ -705,10 +787,26 @@ function candidateFromGrep(hit: GrepHit): CandidateResult {
   }
 }
 
-function candidateFromRipgrep(hit: RipgrepHit): CandidateResult {
+export function candidateFromRipgrep(hit: RipgrepHit): CandidateResult {
+  // ripgrep is invoked with -C5, so a hit truthfully resolves anything within its
+  // collected ±5 window, not just the match line. Span the candidate's range over
+  // the window so an expectedLineRange inside the context is scored as a hit. Fall
+  // back to the match range when no context was collected. hit.range is left intact
+  // because formatRipgrepHits relies on it for the header line.
+  if (hit.context.length === 0) {
+    return {
+      file: hit.file,
+      range: hit.range
+    }
+  }
+
+  const lineNumbers = hit.context.map((entry) => entry.line)
   return {
     file: hit.file,
-    range: hit.range
+    range: {
+      startLine: Math.min(...lineNumbers),
+      endLine: Math.max(...lineNumbers)
+    }
   }
 }
 
@@ -802,6 +900,7 @@ function summarizeByQueryType(runs: EvalRun[], manifest: EvalManifest): QueryTyp
       ripgrep,
       delta: {
         tokensToResolution: codesift.tokensToResolutionMedian - ripgrep.tokensToResolutionMedian,
+        callsToResolution: codesift.callsToResolutionMedian - ripgrep.callsToResolutionMedian,
         coldLatencyMs: codesift.coldLatencyMedianMs - ripgrep.coldLatencyMedianMs,
         warmLatencyMs: codesift.warmLatencyMedianMs - ripgrep.warmLatencyMedianMs,
         successRate: codesift.successRate - ripgrep.successRate
@@ -814,23 +913,27 @@ function aggregateRuns(runs: EvalRun[]): AggregatedMetrics {
   if (runs.length === 0) {
     return {
       tokensToResolutionMedian: 0,
+      callsToResolutionMedian: 0,
       coldLatencyMedianMs: 0,
       warmLatencyMedianMs: 0,
       successRate: 0,
       recallAt5: 0,
       recallAt10: 0,
-      meanReciprocalRank: 0
+      meanReciprocalRank: 0,
+      mrrAt1: 0
     }
   }
 
   return {
     tokensToResolutionMedian: median(runs.map((run) => run.tokensToResolution)),
+    callsToResolutionMedian: median(runs.map((run) => run.callsToResolution)),
     coldLatencyMedianMs: median(runs.map((run) => run.wallClockMs.cold)),
     warmLatencyMedianMs: median(runs.map((run) => run.wallClockMs.warm)),
     successRate: average(runs.map((run) => (run.taskSuccess ? 1 : 0))),
     recallAt5: average(runs.map((run) => run.recallAt5)),
     recallAt10: average(runs.map((run) => run.recallAt10)),
-    meanReciprocalRank: average(runs.map((run) => run.meanReciprocalRank))
+    meanReciprocalRank: average(runs.map((run) => run.meanReciprocalRank)),
+    mrrAt1: average(runs.map((run) => (run.meanReciprocalRank === 1 ? 1 : 0)))
   }
 }
 
@@ -874,21 +977,21 @@ function rangesOverlap(left: Range, right: Range): boolean {
   return left.startLine <= right.endLine && right.startLine <= left.endLine
 }
 
-function normalizePath(value: string): string {
-  return value.replace(/\\/g, '/')
+function bodyOverlapsExpected(hit: SearchHit, expected: Range): boolean {
+  const bodyRange = hit.range ?? hit.snippetRange
+  return rangesOverlap(bodyRange, expected)
 }
 
-function formatSearchHits(hits: SearchHit[]): string {
-  if (hits.length === 0) {
-    return 'no_hits'
+async function readChunkSafely(repo: Awaited<ReturnType<typeof openRepo>>, id: string): Promise<string | null> {
+  try {
+    return await repo.readChunk(id)
+  } catch {
+    return null
   }
+}
 
-  return hits
-    .map((hit) => {
-      const snippet = compactSnippet(hit.snippet, 3)
-      return `${hit.reason} ${formatChunkId(hit.id)}${hit.symbol ? ` ${hit.symbol}` : ''}${snippet ? ` | ${snippet}` : ''}`
-    })
-    .join('\n')
+function normalizePath(value: string): string {
+  return value.replace(/\\/g, '/')
 }
 
 function formatSymbols(definitions: SymbolDefinition[]): string {
@@ -912,11 +1015,13 @@ function formatRipgrepHits(hits: RipgrepHit[]): string {
     return 'no_matches'
   }
 
-  return hits.map((hit) => `${hit.file}:${hit.range.startLine}:${hit.column} | ${hit.snippet.trim()}`).join('\n')
-}
-
-function formatChunkId(id: string): string {
-  return id.replace(/@[a-f0-9]{8,64}$/i, '')
+  return hits
+    .map((hit) => {
+      const header = `${hit.file}:${hit.range.startLine}:${hit.column}`
+      const body = hit.context.map((entry) => `${entry.line} | ${entry.text}`).join('\n')
+      return `${header}\n${body}`
+    })
+    .join('\n')
 }
 
 function compactSnippet(snippet: string, lines: number): string {
@@ -968,15 +1073,7 @@ function normalizeLatencyTolerance(value: number | undefined): number {
   return value
 }
 
-function isRipgrepMatchEvent(value: unknown): value is {
-  type: 'match'
-  data: {
-    path: { text: string }
-    lines: { text: string }
-    line_number: number
-    submatches: Array<{ match: { text: string }; start: number }>
-  }
-} {
+function isRipgrepMatchEvent(value: unknown): value is RipgrepMatchEvent {
   if (!value || typeof value !== 'object') {
     return false
   }
@@ -988,4 +1085,29 @@ function isRipgrepMatchEvent(value: unknown): value is {
 
   const data = matchEvent.data as { path?: unknown; lines?: unknown; line_number?: unknown; submatches?: unknown }
   return typeof data.line_number === 'number' && Array.isArray(data.submatches)
+}
+
+function isRipgrepContextEvent(value: unknown): value is {
+  type: 'context'
+  data: {
+    path: { text: string }
+    lines: { text: string }
+    line_number: number
+  }
+} {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+
+  const contextEvent = value as { type?: unknown; data?: unknown }
+  if (contextEvent.type !== 'context' || !contextEvent.data || typeof contextEvent.data !== 'object') {
+    return false
+  }
+
+  const data = contextEvent.data as { path?: unknown; lines?: unknown; line_number?: unknown }
+  if (typeof data.line_number !== 'number' || !data.path || typeof data.path !== 'object' || !data.lines || typeof data.lines !== 'object') {
+    return false
+  }
+
+  return typeof (data.path as { text?: unknown }).text === 'string' && typeof (data.lines as { text?: unknown }).text === 'string'
 }

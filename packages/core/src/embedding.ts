@@ -18,7 +18,7 @@ export const CLOUD_EMBEDDING_PROVIDER_IDS: readonly string[] = [
 const DEFAULT_LEXICAL_DIMS = 8
 const DEFAULT_HASH_DIMS = 384
 
-const SYNONYM_GROUPS = [
+export const SYNONYM_GROUPS = [
   ['auth', 'authenticate', 'authentication', 'authorize', 'authorization', 'login', 'signin'],
   ['validate', 'validation', 'verify', 'verification', 'check', 'assert'],
   ['retry', 'retries', 'backoff', 'reconnect', 'attempt'],
@@ -39,6 +39,15 @@ for (const group of SYNONYM_GROUPS) {
       group.filter((candidate) => candidate !== token)
     )
   }
+}
+
+/**
+ * Expand a term to its synonym OR-group: the term followed by its synonyms, with
+ * the term itself first. Returns just `[term]` when the term has no synonym group.
+ */
+export function expandTermToOrGroup(term: string): string[] {
+  const synonyms = SYNONYM_MAP.get(term)
+  return synonyms ? [term, ...synonyms] : [term]
 }
 
 const embeddingProviders = new Map<string, EmbeddingProvider>()

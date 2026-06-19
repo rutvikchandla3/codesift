@@ -5,7 +5,7 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { openRepo, registerEmbeddingProvider } from '@codesift/core'
+import { openRepo, registerEmbeddingProvider, type GrepHit, type SearchHit } from '@codesift/core'
 
 import {
   DEFAULT_SEARCH_K,
@@ -13,6 +13,8 @@ import {
   createHttpServer,
   createRouter,
   createStdioServer,
+  formatMcpGrepHits,
+  formatMcpSearchHits,
   getToolDefinitions
 } from '../src/index.js'
 
@@ -43,7 +45,29 @@ describe('@codesift/mcp server', () => {
       'index_status'
     ])
     expect(getToolDefinitions().find((tool) => tool.name === 'grep_code')?.inputSchema.required).toEqual(['pattern'])
+    expect(getToolDefinitions().find((tool) => tool.name === 'search_code')?.inputSchema.properties).toMatchObject({
+      context: { type: 'string', enum: ['sig', 'body'] },
+      with_usages: { type: 'boolean' }
+    })
     expect(MCP_SERVER_INSTRUCTIONS).toContain('use grep_code for literal strings')
+  })
+
+  it('asserts single-call sufficiency in instructions and tool descriptions', () => {
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('search_code returns the complete top result inline')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('no follow-up read is normally needed')
+    expect(MCP_SERVER_INSTRUCTIONS.toLowerCase()).toContain('read_chunk only to expand an additional hit')
+
+    const tools = getToolDefinitions()
+    const searchDescription = tools.find((tool) => tool.name === 'search_code')?.description ?? ''
+    expect(searchDescription).toContain('complete top result inline')
+    expect(searchDescription.toLowerCase()).toContain('no follow-up read is normally needed')
+
+    const readDescription = tools.find((tool) => tool.name === 'read_chunk')?.description ?? ''
+    expect(readDescription).toContain('ADDITIONAL')
+    expect(readDescription.toLowerCase()).toContain('already returned inline')
+
+    // The routing guidance for find_symbol/grep_code is preserved.
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('use find_symbol for exact identifiers/definitions')
   })
 
   it('uses honest lexical wording by default and semantic wording with a learned provider', () => {
@@ -81,11 +105,12 @@ describe('@codesift/mcp server', () => {
     const repo = await openRepo(repoRoot)
     await repo.sync()
     const router = createRouter(repo)
-    const hits = await router.searchCode({ query: 'demoValue', k: 1 })
+    const hits = await router.searchCode({ query: 'demoValue', k: 1, context: 'body', with_usages: true })
 
     const grepHits = await router.grepCode({ pattern: "return 'demo'", path_glob: 'src/**' })
 
     expect(hits[0]?.file).toBe('src/demo.ts')
+    expect(hits[0]?.body).toContain("return 'demo'")
     expect(await router.findSymbol({ name: 'demoValue' })).toHaveLength(1)
     expect(grepHits[0]?.file).toBe('src/demo.ts')
     expect(await router.readChunk({ id: hits[0]!.id })).toContain("return 'demo'")
@@ -197,6 +222,128 @@ describe('@codesift/mcp server', () => {
       child.kill()
     }
   }, 10_000)
+})
+
+function makeHit(overrides: Partial<SearchHit>): SearchHit {
+  return {
+    id: 'src/auth.ts:10-14@abcdef01',
+    file: 'src/auth.ts',
+    range: { startLine: 10, endLine: 14 },
+    score: 0.9,
+    reason: '~',
+    snippet: 'function verify() {\n  return true\n}',
+    snippetRange: { startLine: 10, endLine: 14 },
+    tokensReturned: 42,
+    symbol: 'verify',
+    ...overrides
+  }
+}
+
+describe('formatMcpSearchHits structure-preserving output', () => {
+  it('renders an inlined body as a line-numbered block starting at range.startLine with original indentation', () => {
+    const body = 'function verify(token: string): boolean {\n  if (!token) {\n    return false\n  }\n  return true\n}'
+    const output = formatMcpSearchHits([makeHit({ body, range: { startLine: 10, endLine: 15 } })])
+
+    const lines = output.split('\n')
+    // Header carries reason + id (hash stripped) + symbol path.
+    expect(lines[0]).toBe('~ src/auth.ts:10-14 verify')
+    // Body block is line-numbered from startLine, preserving indentation, no ' ↩ ' flattening.
+    expect(lines[1]).toBe('10 | function verify(token: string): boolean {')
+    expect(lines[2]).toBe('11 |   if (!token) {')
+    expect(lines[3]).toBe('12 |     return false')
+    expect(lines[4]).toBe('13 |   }')
+    expect(lines[5]).toBe('14 |   return true')
+    expect(lines[6]).toBe('15 | }')
+    expect(output).not.toContain(' ↩ ')
+    expect(output).toContain('tokensReturned=42')
+  })
+
+  it('renders import-resolved usages under the primary hit', () => {
+    const output = formatMcpSearchHits([
+      makeHit({
+        body: 'export function verify() {\n  return true\n}',
+        usages: [
+          { file: 'src/server.ts', range: { startLine: 4, endLine: 4 }, line: 4, snippet: '  return verify(token)', resolution: 'import-resolved' }
+        ]
+      })
+    ])
+
+    expect(output).toContain('usages (import-resolved):')
+    expect(output).toContain('- src/server.ts:4 |   return verify(token)')
+  })
+
+  it('carries [generated] and [stale] flags on the body-block header', () => {
+    const output = formatMcpSearchHits([
+      makeHit({ body: 'const x = 1', range: { startLine: 5, endLine: 5 }, generated: true, stale: true })
+    ])
+    const header = output.split('\n')[0]
+    expect(header).toContain('[generated]')
+    expect(header).toContain('[stale]')
+    expect(output).toContain('5 | const x = 1')
+  })
+
+  it('passes the truncation marker through verbatim as a numbered line', () => {
+    const body = 'function big() {\n  doThing()\n… (truncated — read_chunk src/auth.ts:10-14 for full)'
+    const output = formatMcpSearchHits([makeHit({ body, range: { startLine: 1, endLine: 3 } })])
+    expect(output).toContain('3 | … (truncated — read_chunk src/auth.ts:10-14 for full)')
+  })
+
+  it('renders a compact (no body) hit with real newlines, preserved indentation, and NN | line-number prefixes', () => {
+    const output = formatMcpSearchHits([
+      makeHit({ snippet: 'function verify() {\n  return true\n}' })
+    ])
+    expect(output).not.toContain(' ↩ ')
+    const lines = output.split('\n')
+    expect(lines[0]).toBe('~ src/auth.ts:10-14 verify')
+    // Compact snippet is line-numbered from range.startLine and keeps original indentation.
+    expect(lines[1]).toBe('10 | function verify() {')
+    expect(lines[2]).toBe('11 |   return true')
+    expect(lines[3]).toBe('12 | }')
+    expect(output).toContain('tokensReturned=42')
+  })
+
+  it('preserves deep leading indentation on a compact snippet rather than trimming it', () => {
+    const output = formatMcpSearchHits([
+      makeHit({
+        snippet: 'class Auth {\n  verify() {\n    return this.token != null\n  }\n}',
+        range: { startLine: 20, endLine: 24 }
+      })
+    ])
+    const lines = output.split('\n')
+    expect(lines[1]).toBe('20 | class Auth {')
+    expect(lines[2]).toBe('21 |   verify() {')
+    expect(lines[3]).toBe('22 |     return this.token != null')
+  })
+
+  it('sums tokensReturned across mixed inlined and compact hits', () => {
+    const output = formatMcpSearchHits([
+      makeHit({ id: 'a:1-2@aaaaaaaa', body: 'const a = 1', range: { startLine: 1, endLine: 1 }, tokensReturned: 100 }),
+      makeHit({ id: 'b:3-4@bbbbbbbb', snippet: 'const b = 2', tokensReturned: 23 })
+    ])
+    expect(output).toContain('tokensReturned=123')
+  })
+
+  it('returns no_hits for an empty result set', () => {
+    expect(formatMcpSearchHits([])).toBe('no_hits')
+  })
+})
+
+describe('formatMcpGrepHits keeps its single-line ↩-joined format', () => {
+  it('flattens the snippet with the ↩ arrow and trims each line (unchanged from search-hit rendering)', () => {
+    const hit: GrepHit = {
+      file: 'src/auth.ts',
+      range: { startLine: 10, endLine: 12 },
+      line: 10,
+      column: 3,
+      match: 'verify',
+      snippet: 'function verify() {\n  return true\n}'
+    }
+    expect(formatMcpGrepHits([hit])).toBe('src/auth.ts:10-12:3 | function verify() { ↩ return true ↩ }')
+  })
+
+  it('returns no_matches for an empty result set', () => {
+    expect(formatMcpGrepHits([])).toBe('no_matches')
+  })
 })
 
 function sendJsonRpc(child: ChildProcessWithoutNullStreams, message: unknown): void {

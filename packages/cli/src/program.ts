@@ -72,7 +72,13 @@ export function formatHits(hits: SearchHit[]): string {
       const symbol = formatHitSymbol(hit)
       const generated = hit.generated ? ' · generated' : ''
       const stale = hit.stale ? ' · stale' : ''
-      return `${hit.file}:${range}${symbol}${generated}${stale} · ${hit.reason} score=${hit.score.toFixed(4)}\n${hit.snippet}`
+      const primary = `${hit.file}:${range}${symbol}${generated}${stale} · ${hit.reason} score=${hit.score.toFixed(4)}\n${hit.body ?? hit.snippet}`
+      if (!hit.usages?.length) {
+        return primary
+      }
+
+      const usages = ['usages (import-resolved):', ...hit.usages.map((usage) => `- ${usage.file}:${usage.line} | ${usage.snippet}`)].join('\n')
+      return `${primary}\n${usages}`
     })
     .join('\n\n')
 }
@@ -87,14 +93,15 @@ export function formatCompactHits(hits: SearchHit[]): string {
       const symbol = formatHitSymbol(hit)
       const generated = hit.generated ? ' [generated]' : ''
       const stale = hit.stale ? ' [stale]' : ''
-      const snippet = hit.snippet
+      const snippet = (hit.body ?? hit.snippet)
         .split('\n')
         .map((line) => line.trim())
         .filter(Boolean)
         .slice(0, 3)
         .join(' ↩ ')
+      const usages = hit.usages?.length ? ` | usages=${hit.usages.map((usage) => `${usage.file}:${usage.line}`).join(', ')}` : ''
 
-      return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${generated}${stale}${snippet ? ` | ${snippet}` : ''}`
+      return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${generated}${stale}${snippet ? ` | ${snippet}` : ''}${usages}`
     })
     .join('\n')
 }
@@ -271,12 +278,15 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
     .option('--path <glob>', 'path glob filter, e.g. src/**')
     .option('--kind <kind>', 'symbol kind filter for matching chunks')
     .option('--max-tokens <tokens>', 'token budget for compact snippets')
+    .option('--context <mode>', 'inline policy: sig or body')
+    .option('--with-usages', 'bundle top-N import-resolved/local usage sites for the top definition hit')
+    .option('--rerank', 'opt-in reranker re-scoring for NL-concept queries (requires a configured reranker)')
     .option('--json', 'print JSON results')
     .option('--compact', 'print token-efficient compact results')
     .action(
       async (
         query: string,
-        options: { k: string; repo: string; lang?: string; path?: string; kind?: string; maxTokens?: string; json?: boolean; compact?: boolean }
+        options: { k: string; repo: string; lang?: string; path?: string; kind?: string; maxTokens?: string; context?: 'sig' | 'body'; withUsages?: boolean; rerank?: boolean; json?: boolean; compact?: boolean }
       ) => {
         await withCompatibilityHandling(io, async () => {
           const repo = await openRepo(options.repo)
@@ -287,6 +297,9 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
             pathGlob?: string
             kind?: SymbolKind
             maxTokens?: number
+            context?: 'sig' | 'body'
+            withUsages?: boolean
+            rerank?: boolean
           } = {
             k: Number(options.k)
           }
@@ -305,6 +318,15 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
 
           if (options.maxTokens !== undefined) {
             searchOptions.maxTokens = Number(options.maxTokens)
+          }
+          if (options.context !== undefined) {
+            searchOptions.context = options.context
+          }
+          if (options.withUsages) {
+            searchOptions.withUsages = true
+          }
+          if (options.rerank) {
+            searchOptions.rerank = true
           }
 
           const hits = await repo.search(query, searchOptions)

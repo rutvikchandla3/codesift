@@ -4,11 +4,15 @@ import {
   OPENAI_EMBEDDING_PROVIDER_ID,
   OpenAIEmbeddingProvider,
   VOYAGE_EMBEDDING_PROVIDER_ID,
+  VOYAGE_RERANK_PROVIDER_ID,
   VoyageEmbeddingProvider,
+  VoyageReranker,
   getEmbeddingProvider,
+  getReranker,
   isCloudEmbeddingProvider,
   isLearnedEmbeddingProvider,
   listEmbeddingProviders,
+  listRerankers,
   prepareForCloud,
   redactSecrets,
   scanSecrets,
@@ -188,6 +192,100 @@ describe('cloud embedding providers', () => {
     const vectors = await new OpenAIEmbeddingProvider().embedBatch([], { role: 'document' })
 
     expect(vectors).toEqual([])
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('cloud reranker', () => {
+  it('registers Voyage rerank as a resolvable, non-default cloud reranker', () => {
+    const voyage = getReranker(VOYAGE_RERANK_PROVIDER_ID)
+    expect(voyage?.id).toBe(VOYAGE_RERANK_PROVIDER_ID)
+    expect(voyage?.model).toBe('rerank-2.5')
+
+    const ids = listRerankers().map((reranker) => reranker.id)
+    expect(ids).toContain(VOYAGE_RERANK_PROVIDER_ID)
+  })
+
+  it('rerank posts the correct URL, auth, model, body and parses scored results', async () => {
+    process.env.VOYAGE_API_KEY = 'voyage-test-key'
+    const reranker = new VoyageReranker()
+
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({
+        results: [
+          { index: 1, relevance_score: 0.9 },
+          { index: 0, relevance_score: 0.2 }
+        ]
+      })
+    )
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch
+
+    const results = await reranker.rerank('find auth helper', ['alpha', 'beta'], { topK: 2 })
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe('https://api.voyageai.com/v1/rerank')
+    expect(init.method).toBe('POST')
+    const headers = init.headers as Record<string, string>
+    expect(headers.authorization).toBe('Bearer voyage-test-key')
+    const body = JSON.parse(init.body as string) as { query: string; documents: string[]; model: string; top_k: number }
+    expect(body.model).toBe('rerank-2.5')
+    expect(body.query).toBe('find auth helper')
+    expect(body.documents).toEqual(['alpha', 'beta'])
+    expect(body.top_k).toBe(2)
+
+    expect(results).toEqual([
+      { index: 1, score: 0.9 },
+      { index: 0, score: 0.2 }
+    ])
+  })
+
+  it('forwards the AbortSignal to fetch', async () => {
+    process.env.VOYAGE_API_KEY = 'voyage-test-key'
+    const fetchMock = vi.fn(async () => jsonResponse({ results: [{ index: 0, relevance_score: 1 }] }))
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch
+
+    const controller = new AbortController()
+    await new VoyageReranker().rerank('q', ['x'], { signal: controller.signal })
+
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(init.signal).toBe(controller.signal)
+  })
+
+  it('throws an actionable error when the API key is missing and never calls fetch', async () => {
+    delete process.env.VOYAGE_API_KEY
+
+    const fetchMock = vi.fn(async () => jsonResponse({}))
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch
+
+    await expect(new VoyageReranker().rerank('q', ['x'])).rejects.toThrow(/VOYAGE_API_KEY/)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('throws on a non-200 response', async () => {
+    process.env.VOYAGE_API_KEY = 'voyage-test-key'
+    const fetchMock = vi.fn(async () => jsonResponse({ error: 'nope' }, 401))
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch
+
+    await expect(new VoyageReranker().rerank('q', ['x'])).rejects.toThrow(/HTTP 401/)
+  })
+
+  it('throws on a malformed result shape', async () => {
+    process.env.VOYAGE_API_KEY = 'voyage-test-key'
+    const fetchMock = vi.fn(async () => jsonResponse({ results: [{ index: 9, relevance_score: 0.5 }] }))
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch
+
+    await expect(new VoyageReranker().rerank('q', ['x'])).rejects.toThrow(/shape mismatch/)
+  })
+
+  it('returns an empty array without calling fetch for an empty document set', async () => {
+    process.env.VOYAGE_API_KEY = 'voyage-test-key'
+    const fetchMock = vi.fn(async () => jsonResponse({}))
+    globalThis.fetch = fetchMock as unknown as typeof globalThis.fetch
+
+    const results = await new VoyageReranker().rerank('q', [])
+
+    expect(results).toEqual([])
     expect(fetchMock).not.toHaveBeenCalled()
   })
 })
