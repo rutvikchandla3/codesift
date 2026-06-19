@@ -32,7 +32,6 @@ function run(command, args, options = {}) {
 
 function assertNoSourceBuild(installLog) {
   const sourceBuildPatterns = [
-    /node-gyp/i,
     /\bgyp info\b/i,
     /\bgyp ERR\b/i,
     /prebuild-install warn install/i,

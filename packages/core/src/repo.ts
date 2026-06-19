@@ -420,13 +420,15 @@ export class SqliteRepo implements Repo {
         })
       }
 
-      return {
+      const result = {
         indexedFiles: diff.changedFiles.length,
         skippedFiles,
         skippedSymlinks,
         removedFiles: diff.removedPaths.length,
         durationMs: Date.now() - startedAt
       }
+      this.closeIdleDatabaseOnWindows()
+      return result
     } catch (error) {
       const state = isAbortError(error) ? 'aborted' : 'failed'
       try {
@@ -440,6 +442,7 @@ export class SqliteRepo implements Repo {
         // Best-effort crash/partial-state metadata only; preserve the original sync error.
       }
 
+      this.closeIdleDatabaseOnWindows()
       throw error
     }
   }
@@ -958,8 +961,20 @@ export class SqliteRepo implements Repo {
         for (const resolveIdle of this.databaseIdleResolvers.splice(0)) {
           resolveIdle()
         }
+        this.closeIdleDatabaseOnWindows()
       }
     }
+  }
+
+  private closeIdleDatabaseOnWindows(): void {
+    if (process.platform !== 'win32' || this.activeDatabaseUsers !== 0 || !this.db) {
+      return
+    }
+
+    this.db.close()
+    this.db = undefined
+    this.vectorExtensionLoaded = false
+    this.vectorSearchFailure = null
   }
 
   private async runExclusiveDatabaseChange<T>(action: () => Promise<T>): Promise<T> {
