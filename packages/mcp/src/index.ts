@@ -23,6 +23,7 @@ import { createHttpServerHandle } from './http.js'
 export { HttpMcpServerHandle, createHttpServerHandle } from './http.js'
 
 export const DEFAULT_SEARCH_K = CORE_DEFAULT_SEARCH_K
+export const DEFAULT_MCP_GREP_MAX_TOKENS = 700
 
 const SYMBOL_KINDS = [
   'class',
@@ -79,6 +80,11 @@ export interface GrepCodeArgs {
   before_context_lines?: number | undefined
   after_context_lines?: number | undefined
   max_matches?: number | undefined
+  max_tokens?: number | undefined
+}
+
+export interface FormatMcpGrepHitsOptions {
+  maxTokens?: number | undefined
 }
 
 export interface ReadChunkArgs {
@@ -170,7 +176,8 @@ const grepCodeInputSchema = {
   context_lines: z.number().int().min(0).max(20).optional().describe('Symmetric context lines, like rg -C.'),
   before_context_lines: z.number().int().min(0).max(20).optional().describe('Lines before each match, like rg -B.'),
   after_context_lines: z.number().int().min(0).max(20).optional().describe('Lines after each match, like rg -A.'),
-  max_matches: z.number().int().positive().max(1000).optional().describe('Maximum matches to return. Default 1000.')
+  max_matches: z.number().int().positive().max(1000).optional().describe('Maximum matches to return. Default 1000.'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Maximum approximate tokens to return across compact matches. Default 700.')
 }
 
 const readChunkInputSchema = {
@@ -260,7 +267,8 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
         context_lines: { type: 'integer', minimum: 0, maximum: 20 },
         before_context_lines: { type: 'integer', minimum: 0, maximum: 20 },
         after_context_lines: { type: 'integer', minimum: 0, maximum: 20 },
-        max_matches: { type: 'integer', minimum: 1, maximum: 1000 }
+        max_matches: { type: 'integer', minimum: 1, maximum: 1000 },
+        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: 700 }
       })
     },
     {
@@ -390,7 +398,10 @@ export async function callMcpTool(repo: Repo, name: McpToolName, args: unknown):
     case 'find_symbol':
       return formatMcpSymbols(await router.findSymbol(findSymbolArgsSchema.parse(args)))
     case 'grep_code':
-      return formatMcpGrepHits(await router.grepCode(grepCodeArgsSchema.parse(args)))
+      {
+        const parsed = grepCodeArgsSchema.parse(args)
+        return formatMcpGrepHits(await router.grepCode(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_GREP_MAX_TOKENS })
+      }
     case 'read_chunk':
       return router.readChunk(readChunkArgsSchema.parse(args))
     case 'index_status':
@@ -466,7 +477,7 @@ export function createSdkServer(repo: Repo): McpServer {
     textResult(formatMcpSymbols(await router.findSymbol(args)))
   )
   server.registerTool('grep_code', { description: toolDescription('grep_code'), inputSchema: grepCodeInputSchema }, async (args) =>
-    textResult(formatMcpGrepHits(await router.grepCode(args)))
+    textResult(formatMcpGrepHits(await router.grepCode(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_GREP_MAX_TOKENS }))
   )
   server.registerTool('read_chunk', { description: toolDescription('read_chunk'), inputSchema: readChunkInputSchema }, async (args) =>
     textResult(await router.readChunk(args))
@@ -590,18 +601,146 @@ export function formatMcpSymbols(definitions: SymbolDefinition[]): string {
     .join('\n')
 }
 
-export function formatMcpGrepHits(hits: GrepHit[]): string {
+export function formatMcpGrepHits(hits: GrepHit[], options: FormatMcpGrepHitsOptions = {}): string {
   if (hits.length === 0) {
     return 'no_matches'
   }
 
-  return hits
-    .map((hit) => {
-      const range = formatRange(hit.range.startLine, hit.range.endLine)
-      const snippet = compactSnippet(hit.snippet, 5).split('\n').join(' ↩ ')
-      return `${hit.file}:${range}:${hit.column} | ${snippet}`
-    })
-    .join('\n')
+  const maxTokens = options.maxTokens
+  if (maxTokens === undefined) {
+    return hits.map((hit) => formatMcpGrepHit(hit)).join('\n')
+  }
+
+  const maxChars = maxTokens * 4
+  const rendered: string[] = []
+  let usedChars = 0
+
+  for (let index = 0; index < hits.length; index += 1) {
+    const hit = hits[index]!
+    const line = formatMcpGrepHit(hit)
+    const separatorChars = rendered.length === 0 ? 0 : 1
+    if (usedChars + separatorChars + line.length <= maxChars) {
+      rendered.push(line)
+      usedChars += separatorChars + line.length
+      continue
+    }
+
+    if (rendered.length === 0) {
+      const omitted = hits.length - 1
+      const marker = omitted > 0 ? grepOmissionMarker(omitted, Math.max(0, maxChars - 2)) : undefined
+      const firstHit = formatMcpGrepHit(hit, maxCharsForFirstHit(maxChars, marker))
+      return marker ? withGrepOmissionMarker([firstHit], marker) : firstHit
+    }
+
+    return fitGrepOutputWithMarker(rendered, hits.length - index, maxChars)
+  }
+
+  return rendered.join('\n')
+}
+
+function formatMcpGrepHit(hit: GrepHit, maxChars?: number): string {
+  const range = formatRange(hit.range.startLine, hit.range.endLine)
+  const suffix = `:${range}:${hit.column} | `
+  const prefix = maxChars === undefined ? `${hit.file}${suffix}` : formatGrepPrefix(hit.file, suffix, maxChars)
+  const snippet = compactSnippet(hit.snippet, 5).split('\n').join(' ↩ ')
+
+  if (maxChars === undefined || prefix.length + snippet.length <= maxChars) {
+    return `${prefix}${snippet}`
+  }
+
+  return `${prefix}${truncateWithEllipsis(snippet, maxChars - prefix.length)}`
+}
+
+function formatGrepPrefix(file: string, suffix: string, maxChars: number): string {
+  const prefix = `${file}${suffix}`
+  if (prefix.length <= maxChars) {
+    return prefix
+  }
+
+  const fileChars = Math.max(0, maxChars - suffix.length - 1)
+  if (fileChars > 0) {
+    return `…${file.slice(-fileChars)}${suffix}`
+  }
+
+  return suffix.length <= maxChars ? suffix : suffix.slice(-maxChars)
+}
+
+function fitGrepOutputWithMarker(rendered: string[], omitted: number, maxChars: number): string {
+  const kept = [...rendered]
+  let omittedCount = omitted
+  let marker = grepOmissionMarker(omittedCount, Math.max(0, maxChars - 2))
+
+  while (kept.length > 1 && joinedLength(kept, marker) > maxChars) {
+    kept.pop()
+    omittedCount += 1
+    marker = grepOmissionMarker(omittedCount, Math.max(0, maxChars - 2))
+  }
+
+  if (!marker) {
+    return formatMcpGrepLineForBudget(kept[0]!, maxChars)
+  }
+
+  if (joinedLength(kept, marker) <= maxChars) {
+    return withGrepOmissionMarker(kept, marker)
+  }
+
+  const line = formatMcpGrepLineForBudget(kept[0]!, maxCharsForFirstHit(maxChars, marker))
+  return marker ? withGrepOmissionMarker([line], marker) : line
+}
+
+function formatMcpGrepLineForBudget(line: string, maxChars: number): string {
+  const separator = ' | '
+  const separatorIndex = line.indexOf(separator)
+  if (separatorIndex < 0 || line.length <= maxChars) {
+    return line
+  }
+
+  let prefix = line.slice(0, separatorIndex + separator.length)
+  const snippet = line.slice(separatorIndex + separator.length)
+  if (prefix.length > maxChars) {
+    prefix = `…${prefix.slice(-(Math.max(0, maxChars - 1)))}`
+  }
+  return `${prefix}${truncateWithEllipsis(snippet, maxChars - prefix.length)}`
+}
+
+function maxCharsForFirstHit(maxChars: number, marker: string | undefined): number {
+  return marker === undefined ? maxChars : Math.max(0, maxChars - marker.length - 1)
+}
+
+function joinedLength(rendered: string[], marker: string): number {
+  return rendered.join('\n').length + 1 + marker.length
+}
+
+function grepOmissionMarker(omitted: number, maxChars?: number): string {
+  const full = `matches_omitted=${omitted}; refine path_glob/max_matches or raise max_tokens.`
+  if (maxChars === undefined || full.length <= maxChars) {
+    return full
+  }
+
+  const compact = `matches_omitted=${omitted}; raise max_tokens`
+  if (compact.length <= maxChars) {
+    return compact
+  }
+
+  const bare = `matches_omitted=${omitted}`
+  return bare.length <= maxChars ? bare : ''
+}
+
+function withGrepOmissionMarker(rendered: string[], marker: string): string {
+  return `${rendered.join('\n')}\n${marker}`
+}
+
+function truncateWithEllipsis(text: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return ''
+  }
+  if (text.length <= maxChars) {
+    return text
+  }
+  if (maxChars === 1) {
+    return '…'
+  }
+  return `${text.slice(0, maxChars - 1).trimEnd()}…`
 }
 
 function formatChunkId(id: string): string {

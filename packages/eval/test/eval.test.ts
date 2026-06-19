@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -103,6 +103,38 @@ describe('@codesift/eval', () => {
       expect(tokenCeiling).toBeDefined()
       expect(run.tokensToResolution).toBeLessThanOrEqual(tokenCeiling!)
     }
+  }, 30_000)
+
+  it('accounts string-literal grep results with the MCP default token budget', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-eval-grep-budget-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    await writeFile(
+      join(repoRoot, 'src', 'noisy.ts'),
+      Array.from({ length: 160 }, (_, index) => `export const noisy${index} = 'LOUD_LITERAL_${index}_${'x'.repeat(80)}'`).join('\n'),
+      'utf8'
+    )
+
+    const summary = await evaluateManifest({
+      repos: [{ id: 'noisy-grep', language: 'typescript', repoPath: repoRoot }],
+      queries: [
+        {
+          id: 'noisy-literal',
+          repoId: 'noisy-grep',
+          queryType: 'string-literal',
+          query: 'LOUD_LITERAL',
+          grepPattern: 'LOUD_LITERAL',
+          expected: [{ file: 'src/noisy.ts' }],
+          expectedLineRange: { startLine: 1, endLine: 1 }
+        }
+      ]
+    }, { resultLimit: 160, inspectionLimit: 5, latencyToleranceMs: Number.POSITIVE_INFINITY })
+
+    const codesiftRun = summary.runs.find((run) => run.tool === 'codesift')
+    expect(codesiftRun?.taskSuccess).toBe(true)
+    expect(codesiftRun?.meanReciprocalRank).toBe(1)
+    expect(codesiftRun?.tokensToResolution).toBeLessThanOrEqual(730)
   }, 30_000)
 
   it('measures end-to-end calls-to-resolution truthfully across both tools', async () => {

@@ -13,6 +13,7 @@ import {
   createHttpServer,
   createRouter,
   createStdioServer,
+  callMcpTool,
   formatMcpGrepHits,
   formatMcpSearchHits,
   formatMcpSymbols,
@@ -46,6 +47,9 @@ describe('@codesift/mcp server', () => {
       'index_status'
     ])
     expect(getToolDefinitions().find((tool) => tool.name === 'grep_code')?.inputSchema.required).toEqual(['pattern'])
+    expect(getToolDefinitions().find((tool) => tool.name === 'grep_code')?.inputSchema.properties).toMatchObject({
+      max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: 700 }
+    })
     expect(getToolDefinitions().find((tool) => tool.name === 'search_code')?.inputSchema.properties).toMatchObject({
       context: { type: 'string', enum: ['sig', 'body'] },
       with_usages: { type: 'boolean' }
@@ -371,21 +375,108 @@ describe('formatMcpSearchHits structure-preserving output', () => {
 
 describe('formatMcpGrepHits keeps its single-line ↩-joined format', () => {
   it('flattens the snippet with the ↩ arrow and trims each line (unchanged from search-hit rendering)', () => {
-    const hit: GrepHit = {
-      file: 'src/auth.ts',
-      range: { startLine: 10, endLine: 12 },
-      line: 10,
-      column: 3,
-      match: 'verify',
-      snippet: 'function verify() {\n  return true\n}'
-    }
+    const hit = makeGrepHit({ snippet: 'function verify() {\n  return true\n}' })
     expect(formatMcpGrepHits([hit])).toBe('src/auth.ts:10-12:3 | function verify() { ↩ return true ↩ }')
   })
 
   it('returns no_matches for an empty result set', () => {
     expect(formatMcpGrepHits([])).toBe('no_matches')
   })
+
+  it('leaves grep formatting unchanged when the rendered hits fit under the token budget', () => {
+    const output = formatMcpGrepHits([
+      makeGrepHit({ snippet: 'function verify() {\n  return true\n}' })
+    ], { maxTokens: 80 })
+
+    expect(output).toBe('src/auth.ts:10-12:3 | function verify() { ↩ return true ↩ }')
+  })
+
+  it('preserves first hits and appends a compact omission marker when maxTokens truncates matches', () => {
+    const hits = Array.from({ length: 6 }, (_, index) =>
+      makeGrepHit({
+        file: `src/file-${index}.ts`,
+        range: { startLine: index + 1, endLine: index + 1 },
+        line: index + 1,
+        snippet: `const repeated${index} = 'needle-${index}'`
+      })
+    )
+    const output = formatMcpGrepHits(hits, { maxTokens: 32 })
+
+    expect(output).toContain("src/file-0.ts:1:3 | const repeated0 = 'needle-0'")
+    expect(output).not.toContain('src/file-5.ts')
+    expect(output).toContain('matches_omitted=')
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(32)
+  })
+
+  it('truncates only snippet text when the first grep hit alone exceeds the budget', () => {
+    const output = formatMcpGrepHits([
+      makeGrepHit({
+        file: 'src/verbose.ts',
+        range: { startLine: 7, endLine: 7 },
+        line: 7,
+        column: 11,
+        snippet: `const message = '${'x'.repeat(400)}'`
+      }),
+      makeGrepHit({ file: 'src/tail.ts' })
+    ], { maxTokens: 25 })
+
+    expect(output.startsWith('src/verbose.ts:7:11 | ')).toBe(true)
+    expect(output).toContain('…')
+    expect(output).toContain('matches_omitted=1; refine path_glob/max_matches or raise max_tokens.')
+    expect(output).not.toContain('src/tail.ts')
+  })
+
+  it('keeps long-prefix tiny-budget output within the approximate budget', () => {
+    const output = formatMcpGrepHits([
+      makeGrepHit({
+        file: `src/${'very-long-directory/'.repeat(8)}verbose.ts`,
+        range: { startLine: 1, endLine: 1 },
+        line: 1,
+        column: 1,
+        snippet: 'const value = "needle"'
+      }),
+      makeGrepHit({ file: 'src/tail.ts' })
+    ], { maxTokens: 8 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(8)
+    expect(output).toContain('matches_omitted=1')
+    expect(output).not.toContain('src/tail.ts')
+  })
 })
+
+describe('grep_code MCP output budgeting', () => {
+  it('budgets noisy literal output through callMcpTool while preserving the first match', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-mcp-grep-budget-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    await writeFile(
+      join(repoRoot, 'src', 'noisy.ts'),
+      Array.from({ length: 20 }, (_, index) => `export const value${index} = 'NEEDLE_${index}'`).join('\n'),
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const output = await callMcpTool(repo, 'grep_code', { pattern: 'NEEDLE', path_glob: 'src/**', max_tokens: 40 })
+    expect(output).toContain("src/noisy.ts:1:24 | export const value0 = 'NEEDLE_0'")
+    expect(output).toContain('matches_omitted=')
+    expect(output).not.toContain('NEEDLE_19')
+  })
+})
+
+function makeGrepHit(overrides: Partial<GrepHit> = {}): GrepHit {
+  return {
+    file: 'src/auth.ts',
+    range: { startLine: 10, endLine: 12 },
+    line: 10,
+    column: 3,
+    match: 'verify',
+    snippet: 'function verify() {\n  return true\n}',
+    ...overrides
+  }
+}
 
 function sendJsonRpc(child: ChildProcessWithoutNullStreams, message: unknown): void {
   child.stdin.write(`${JSON.stringify(message)}\n`)

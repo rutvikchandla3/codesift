@@ -7,7 +7,7 @@ import { execFile as execFileCallback, spawn, type ChildProcessWithoutNullStream
 import { promisify } from 'node:util'
 
 import { VOYAGE_RERANK_PROVIDER_ID, openRepo, type FindSymbolOptions, type GrepHit, type GrepOptions, type Range, type SearchHit, type SearchOptions, type SymbolDefinition } from '@codesift/core'
-import { formatMcpGrepHits, formatMcpSearchHits, formatMcpSymbols } from '@codesift/mcp'
+import { DEFAULT_MCP_GREP_MAX_TOKENS, formatMcpGrepHits, formatMcpSearchHits, formatMcpSymbols } from '@codesift/mcp'
 
 const execFile = promisify(execFileCallback)
 
@@ -686,7 +686,7 @@ function buildCodesiftToolCall(query: GoldenQuery, resultLimit: number): { name:
     case 'error-trace':
       return {
         name: 'grep_code',
-        arguments: { pattern: query.grepPattern ?? query.query, max_matches: resultLimit, ...pathGlob }
+        arguments: { pattern: query.grepPattern ?? query.query, max_matches: resultLimit, max_tokens: DEFAULT_MCP_GREP_MAX_TOKENS, ...pathGlob }
       }
     case 'nl-concept':
       return {
@@ -869,7 +869,7 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
       const pattern = query.grepPattern ?? query.query
       const hits = await repo.grep(pattern, grepOptions)
       const candidates = hits.map(candidateFromGrep)
-      const tokens = estimateTokenCount(formatMcpGrepHits(hits))
+      const tokens = estimateTokenCount(formatMcpGrepHits(hits, { maxTokens: DEFAULT_MCP_GREP_MAX_TOKENS }))
       return evaluateRankedCandidates(candidates, query, tokens, inspectionLimit)
     }
     case 'nl-concept': {
