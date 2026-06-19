@@ -4,6 +4,12 @@
 
 Status: proposal (2026-06). The original `MOAT_PLAN.md` workstreams **0a–4 have shipped** on `main` (body-inline for the top `search_code` hit, structure-preserving output, synonym OR-expansion, `with_usages`, opt-in Voyage reranker, rebaselined per-type eval). This doc is what comes *next*, derived from a 31-agent map → ideate → adversarially-verify → synthesize pass. All file:line claims below were verified against the code.
 
+> **Implementation progress** (branch `moat-next-wave-2`, paused 2026-06-19):
+> - **Wave 1** shipped on local `main` (`71eedc3`): #1 one-call `find_symbol` body-inline, #2 self-fresh daemon (`Repo.watch()`), #3 honest token count + 4 quick wins.
+> - **Wave 2 measurement gate** (`a6f2789`): precision/false-positive loss axis (rank-1 correctness, self-referential regression guard), multi-target **set-recall** (recall@k = fraction of co-relevant targets; per-target `ExpectedTarget.lineRange`), and the ambiguous-identifier **collision fixture** (`packages/eval/fixtures/collision-ts/`, authored via pi). Re-baselined losses.json (+3 honest entries).
+> - **Wave 2 #4** (`0df655c`): progressive FTS relaxation ladder (full AND → drop-rarest by IDF → full OR), gated to fire only on `< MIN_RELAXATION_ROWS` underflow and OFF for symbol-dominated queries. Zero eval regression; mechanism proven by a dedicated core test.
+> - **Remaining (not started):** #6 query-aware ranking → #7 confidence-gated `single_best` (sequential, single-owner in `repo.ts`'s search path — the file-conflict hotspot below); plus the **report-only** measurement: #5 `with_usages`/reranker A/B and paraphrase goldens. The collision fixture already doubles as the #7 ambiguity tuning fixture. Build env: Node 22 (`~/.nvm/versions/node/v22.22.2/bin`), gate = `pnpm run ci`.
+
 ---
 
 ## Honest moat assessment
