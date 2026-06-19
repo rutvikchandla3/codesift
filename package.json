@@ -9,12 +9,12 @@
     "node": "^20.0.0 || ^22.0.0"
   },
   "scripts": {
-    "build": "pnpm -r --filter './packages/**' build",
-    "clean": "pnpm -r --filter './packages/**' clean && rimraf node_modules coverage",
+    "build": "pnpm -r --filter=./packages/** build",
+    "clean": "pnpm -r --filter=./packages/** clean && rimraf node_modules coverage",
     "test": "vitest run",
     "test:offline": "node --require ./scripts/block-network.cjs ./scripts/offline-check.mjs",
     "test:smoke-install": "node scripts/smoke-pack-install.mjs",
-    "typecheck": "pnpm -r --filter './packages/**' typecheck",
+    "typecheck": "pnpm -r --filter=./packages/** typecheck",
     "bench": "pnpm --filter @codesift/eval run bench",
     "docs": "typedoc",
     "ci": "pnpm build && pnpm typecheck && pnpm test && pnpm run test:offline && pnpm bench"

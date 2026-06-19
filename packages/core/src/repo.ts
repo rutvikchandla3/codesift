@@ -974,7 +974,6 @@ export class SqliteRepo implements Repo {
     this.db.close()
     this.db = undefined
     this.vectorExtensionLoaded = false
-    this.vectorSearchFailure = null
   }
 
   private async runExclusiveDatabaseChange<T>(action: () => Promise<T>): Promise<T> {
