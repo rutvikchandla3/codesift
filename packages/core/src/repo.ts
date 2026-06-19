@@ -146,6 +146,10 @@ const PREFIX_TOKEN_COST = 2
 const COMPACT_SNIPPET_MAX_LINES = 4
 const INLINE_BODY_TRUNCATION_MARKER = '… (truncated — read_chunk <id> for full)'
 const INLINE_RANK2_SCORE_MARGIN = 0.6
+// Below this lexical-row count, an over-constrained FTS query is progressively
+// relaxed (drop-rarest term, then full OR) so a concept phrased with a word the
+// target lacks still recalls it. ~3 keeps a handful of candidates for fusion.
+const MIN_RELAXATION_ROWS = 3
 // find_symbol inlines the top match's body only when the lookup is unambiguous.
 // Above this many exact rows the identifier collides across the repo, so picking
 // one body to inline would be misleading — keep every row compact instead.
@@ -474,32 +478,7 @@ export class SqliteRepo implements Repo {
     const { whereSql, params } = buildChunkSearchFilters(options)
     const exactRows = selectExactCandidateRows(db, query, options, Math.max(requestedK * 10, DEFAULT_PATH_FILTERED_LIMIT))
 
-    const ftsQuery = buildFtsQuery(query)
-    const lexicalRows = ftsQuery
-      ? db
-          .prepare<unknown[], ChunkRow>(
-            `
-              select
-                c.id,
-                c.file_path,
-                c.start_line,
-                c.end_line,
-                c.snippet,
-                c.language,
-                c.symbol,
-                c.kind,
-                c.parent,
-                c.generated
-              from chunks_fts
-              join chunks c on c.id = chunks_fts.chunk_id
-              where chunks_fts match ?
-              ${whereSql ? `and ${whereSql.replace(/^where\s+/i, '')}` : ''}
-              order by bm25(chunks_fts, 1.0, 6.0, 2.5, 2.0) asc, c.file_path asc, c.start_line asc, c.id asc
-              limit ${limit}
-            `
-          )
-          .all(ftsQuery, ...params)
-      : []
+    const lexicalRows = selectRelaxedLexicalRows(db, query, whereSql, params, limit)
 
     const provider = this.resolveProvider()
     const shouldUseVectorSearch = isLearnedEmbeddingProvider(provider) && queryShouldUseVectorSearch(query)
@@ -3089,10 +3068,112 @@ function extractSymbolCandidates(query: string): string[] {
   return [...matches]
 }
 
-export function buildFtsQuery(query: string): string | null {
+// Progressive FTS relaxation ladder. Each tier is a strict SUPERSET of the one
+// before, so relaxing never drops a stricter-tier match — it only widens recall:
+//   1. full AND     — every concept word present (the common case)
+//   2. drop-rarest   — drop the single highest-IDF group (fewest docs = the most
+//                      likely AND-killer), so a query word the target happens to
+//                      lack no longer excludes it
+//   3. full OR       — any concept word, the recall backstop
+// Tiers 2–3 fire ONLY when the prior tier under-recalls (< MIN_RELAXATION_ROWS),
+// so a query that already matches stays byte-for-byte unchanged and pays no IDF
+// cost. Widening is guarded by the eval precision axis (a relaxed tier that pushes
+// a false positive to rank-1 shows up as a precision regression). bm25 still orders
+// within the chosen tier, so the densest match stays on top.
+function selectRelaxedLexicalRows(
+  db: Database.Database,
+  query: string,
+  whereSql: string,
+  params: unknown[],
+  limit: number
+): ChunkRow[] {
+  const groups = buildFtsTermGroups(query)
+  if (groups.length === 0) {
+    return []
+  }
+
+  const andClause = whereSql ? `and ${whereSql.replace(/^where\s+/i, '')}` : ''
+  const statement = db.prepare<unknown[], ChunkRow>(
+    `
+      select
+        c.id,
+        c.file_path,
+        c.start_line,
+        c.end_line,
+        c.snippet,
+        c.language,
+        c.symbol,
+        c.kind,
+        c.parent,
+        c.generated
+      from chunks_fts
+      join chunks c on c.id = chunks_fts.chunk_id
+      where chunks_fts match ?
+      ${andClause}
+      order by bm25(chunks_fts, 1.0, 6.0, 2.5, 2.0) asc, c.file_path asc, c.start_line asc, c.id asc
+      limit ${limit}
+    `
+  )
+  const run = (ftsQuery: string): ChunkRow[] => statement.all(ftsQuery, ...params)
+
+  const tierOne = run(groups.join(' AND '))
+  // Relaxation is a CONCEPT-recall safety net. A symbol-dominated query ("fooBarToken")
+  // wants that identifier, not a lexically-adjacent one — widening it (even drop-rarest)
+  // would surface a different symbol that merely shares a sub-word. Keep those strict.
+  if (tierOne.length >= MIN_RELAXATION_ROWS || groups.length < 2 || isSymbolDominatedQuery(query)) {
+    return tierOne
+  }
+
+  let best = tierOne
+  const rarest = rarestTermGroupIndex(db, groups, andClause, params)
+  if (rarest !== -1) {
+    const tierTwo = run(groups.filter((_, index) => index !== rarest).join(' AND '))
+    if (tierTwo.length >= MIN_RELAXATION_ROWS) {
+      return tierTwo
+    }
+    if (tierTwo.length > best.length) {
+      best = tierTwo
+    }
+  }
+
+  const tierThree = run(groups.join(' OR '))
+  return tierThree.length > best.length ? tierThree : best
+}
+
+// Index of the term-group present in the FEWEST indexed chunks (highest IDF). Run
+// lazily — only when tier-1 under-recalls — so the per-group count queries are paid
+// once per under-recalled search, never on the common path.
+function rarestTermGroupIndex(db: Database.Database, groups: string[], andClause: string, params: unknown[]): number {
+  const statement = db.prepare<unknown[], { n: number }>(
+    `
+      select count(*) as n
+      from chunks_fts
+      join chunks c on c.id = chunks_fts.chunk_id
+      where chunks_fts match ?
+      ${andClause}
+    `
+  )
+
+  let rarestIndex = -1
+  let rarestCount = Number.POSITIVE_INFINITY
+  groups.forEach((group, index) => {
+    const count = statement.get(group, ...params)?.n ?? 0
+    if (count < rarestCount) {
+      rarestCount = count
+      rarestIndex = index
+    }
+  })
+
+  return rarestIndex
+}
+
+// Ordered list of FTS5 term-groups for a query, one per distinct concept word
+// (each group OR-expands its synonyms). Order follows the query's word order; the
+// relaxation ladder reorders only by IDF when it drops the rarest group.
+function buildFtsTermGroups(query: string): string[] {
   const terms = [...new Set(buildNormalizedTerms(query).filter((term) => !DEFAULT_STOP_WORDS.has(term) && term.length > 1))]
   if (terms.length === 0) {
-    return null
+    return []
   }
 
   const groups: string[] = []
@@ -3115,7 +3196,12 @@ export function buildFtsQuery(query: string): string | null {
     groups.push(members.length > 1 ? `(${members.map(quoteFtsTerm).join(' OR ')})` : quoteFtsTerm(term))
   }
 
-  return groups.join(' AND ')
+  return groups
+}
+
+export function buildFtsQuery(query: string): string | null {
+  const groups = buildFtsTermGroups(query)
+  return groups.length === 0 ? null : groups.join(' AND ')
 }
 
 function quoteFtsTerm(term: string): string {

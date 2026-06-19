@@ -921,3 +921,58 @@ validate token signature credential check validate token signature credential ch
     expect(reranked.map((hit) => hit.file)).toEqual(fused.map((hit) => hit.file))
   })
 })
+
+describe('@codesift/core progressive FTS relaxation', () => {
+  it('recalls the target when an over-constrained concept query names a word the target lacks', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-relax-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    await writeFile(
+      join(repoRoot, 'src', 'signature.ts'),
+      `// Validate the JWT token signature before continuing.
+export function validateJwtSignature(token: string): boolean {
+  return token.split('.').length === 3
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'verify.ts'),
+      `// Verify a JWT token signature against the configured key.
+export function verifyTokenSignature(token: string): boolean {
+  return validateJwtSignature(token)
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'decode.ts'),
+      `// Decode a JWT token and read its signature payload.
+export function decodeJwtToken(token: string): string {
+  return token.split('.')[1] ?? ''
+}
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    // "webauthn" is indexed nowhere, so the unrelaxed full-AND FTS query requires a
+    // term the target lacks — it would match zero rows.
+    const overConstrained = 'validate jwt token signature webauthn'
+    expect(buildFtsQuery(overConstrained)).toContain('"webauthn"')
+    expect(buildFtsQuery(overConstrained)).toContain(' AND ')
+
+    // The relaxation ladder drops the absent word and still recalls the function.
+    const hits = await repo.search(overConstrained, { k: 5 })
+    expect(hits.length).toBeGreaterThan(0)
+    expect(hits.some((hit) => hit.file.endsWith('signature.ts'))).toBe(true)
+
+    // Sanity: the absent word in isolation recalls nothing, so the hit above came
+    // from relaxation widening the query, not from "webauthn" matching anything.
+    const absentOnly = await repo.search('webauthn', { k: 5 })
+    expect(absentOnly).toHaveLength(0)
+  })
+})
