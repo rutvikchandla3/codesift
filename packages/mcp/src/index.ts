@@ -27,8 +27,10 @@ export const DEFAULT_MCP_SEARCH_MAX_TOKENS = 700
 export const DEFAULT_MCP_GREP_MAX_TOKENS = 700
 export const DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS = 700
 export const DEFAULT_MCP_READ_CHUNK_MAX_TOKENS = 1000
+export const DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS = 200
 export const MIN_MCP_READ_CHUNK_MAX_TOKENS = 6
 export const MAX_MCP_READ_CHUNK_MAX_TOKENS = 4000
+export const MAX_MCP_INDEX_STATUS_MAX_TOKENS = 1000
 
 const SYMBOL_KINDS = [
   'class',
@@ -109,6 +111,14 @@ export interface ReadChunkArgs {
   id: string
   context_lines?: number | undefined
   max_tokens?: number | undefined
+}
+
+export interface IndexStatusArgs {
+  max_tokens?: number | undefined
+}
+
+export interface FormatMcpIndexStatusOptions {
+  maxTokens?: number | undefined
 }
 
 export interface McpToolDefinition {
@@ -204,12 +214,15 @@ const readChunkInputSchema = {
   max_tokens: z.number().int().min(MIN_MCP_READ_CHUNK_MAX_TOKENS).max(MAX_MCP_READ_CHUNK_MAX_TOKENS).optional().describe('Approx output tokens. Default 1000.')
 }
 
-const indexStatusInputSchema = {}
+const indexStatusInputSchema = {
+  max_tokens: z.number().int().positive().max(MAX_MCP_INDEX_STATUS_MAX_TOKENS).optional().describe('Approx output tokens. Default 200.')
+}
 
 const searchCodeArgsSchema = z.object(searchCodeInputSchema).strict()
 const findSymbolArgsSchema = z.object(findSymbolInputSchema).strict()
 const grepCodeArgsSchema = z.object(grepCodeInputSchema).strict()
 const readChunkArgsSchema = z.object(readChunkInputSchema).strict()
+const indexStatusArgsSchema = z.object(indexStatusInputSchema).strict()
 const toolCallParamsSchema = z.object({
   name: z.enum(MCP_TOOL_NAMES),
   arguments: z.unknown().optional()
@@ -275,7 +288,7 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
     },
     {
       name: 'grep_code',
-      description: 'Literal/regex indexed-file search for env vars, errors, operators, exact strings; keep context small.',
+      description: 'Literal/regex search for env vars, errors, operators, exact strings.',
       inputSchema: jsonSchema(['pattern'], {
         pattern: { type: 'string' },
         regex: { type: 'boolean', default: false },
@@ -302,8 +315,10 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
     },
     {
       name: 'index_status',
-      description: 'Inspect index freshness, sync state, counts, provider, vectors.',
-      inputSchema: jsonSchema([], {})
+      description: 'Inspect index health.',
+      inputSchema: jsonSchema([], {
+        max_tokens: { type: 'integer', minimum: 1, maximum: MAX_MCP_INDEX_STATUS_MAX_TOKENS, default: DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS }
+      })
     }
   ]
 }
@@ -435,7 +450,10 @@ export async function callMcpTool(repo: Repo, name: McpToolName, args: unknown):
         return formatMcpReadChunk(await router.readChunk(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_READ_CHUNK_MAX_TOKENS })
       }
     case 'index_status':
-      return JSON.stringify(await router.indexStatus())
+      {
+        const parsed = indexStatusArgsSchema.parse(args)
+        return formatMcpIndexStatus(await router.indexStatus(), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS })
+      }
   }
 }
 
@@ -512,8 +530,8 @@ export function createSdkServer(repo: Repo): McpServer {
   server.registerTool('read_chunk', { description: toolDescription('read_chunk'), inputSchema: readChunkInputSchema }, async (args) =>
     textResult(formatMcpReadChunk(await router.readChunk(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_READ_CHUNK_MAX_TOKENS }))
   )
-  server.registerTool('index_status', { description: toolDescription('index_status'), inputSchema: indexStatusInputSchema }, async () =>
-    textResult(JSON.stringify(await router.indexStatus()))
+  server.registerTool('index_status', { description: toolDescription('index_status'), inputSchema: indexStatusInputSchema }, async (args) =>
+    textResult(formatMcpIndexStatus(await router.indexStatus(), { maxTokens: args.max_tokens ?? DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS }))
   )
 
   return server
@@ -968,6 +986,215 @@ function formatUsageLineForBudget(usage: SymbolUsage, maxChars?: number): string
   }
 
   return `${prefix}${truncateWithEllipsis(snippet, maxChars - prefix.length)}`
+}
+
+export function formatMcpIndexStatus(status: RepoStatus, options: FormatMcpIndexStatusOptions = {}): string {
+  const lines = [
+    formatIndexStatusPrimaryLine(status),
+    ...formatIndexStatusDetailLines(status)
+  ]
+  const action = suggestedIndexStatusAction(status)
+  if (action) {
+    lines.push(`action=${action}`)
+  }
+
+  const output = lines.join('\n')
+  const maxTokens = options.maxTokens
+  if (maxTokens === undefined || output.length <= maxTokens * 4) {
+    return output
+  }
+
+  return fitIndexStatusOutputForBudget(lines[0]!, action ? `action=${action}` : undefined, lines.slice(1, action ? -1 : undefined), maxTokens * 4)
+}
+
+function formatIndexStatusPrimaryLine(status: RepoStatus): string {
+  return [
+    `indexed=${status.indexed ? 'yes' : 'no'}`,
+    `stale=${status.stale ? 'yes' : 'no'}`,
+    `sync=${status.sync.state}`,
+    `chunks=${status.chunkCount}`,
+    `symbols=${status.symbolCount}`,
+    `gen=${status.indexGeneration}`,
+    `generated=${status.generatedFileCount}/${status.generatedChunkCount}`,
+    formatIndexStatusProvider(status),
+    `compat=${status.compatibility.ok ? 'ok' : status.compatibility.code ?? 'mismatch'}`,
+    `vector=${status.vectorSearch.state}`
+  ].filter(Boolean).join(' ')
+}
+
+function formatIndexStatusProvider(status: RepoStatus): string {
+  if (!status.provider) {
+    return 'provider=unconfigured'
+  }
+
+  const parts = [`provider=${compactStatusValue(status.provider.id)}`]
+  if (status.provider.dims !== undefined) {
+    parts.push(`dims=${status.provider.dims}`)
+  }
+  if (status.provider.modelVersion) {
+    parts.push(`model=${compactStatusValue(status.provider.modelVersion, 48)}`)
+  }
+  return parts.join(' ')
+}
+
+function formatIndexStatusDetailLines(status: RepoStatus): string[] {
+  const lines: string[] = []
+
+  for (const reason of status.staleReasons ?? []) {
+    const parts = [`stale_reasons=${reason.code}`]
+    if (reason.count !== undefined) {
+      parts.push(`count=${reason.count}`)
+    }
+    if (reason.files?.length) {
+      parts.push(`files=${formatStatusFileList(reason.files)}`)
+    }
+    if (reason.message) {
+      parts.push(`message=${compactStatusValue(reason.message, 100)}`)
+    }
+    if (reason.indexed) {
+      parts.push(`indexed=${compactStatusValue(reason.indexed, 48)}`)
+    }
+    if (reason.current) {
+      parts.push(`current=${compactStatusValue(reason.current, 48)}`)
+    }
+    lines.push(parts.join(' '))
+  }
+
+  if (status.sync.error) {
+    lines.push(`sync_error=${compactStatusValue(status.sync.error, 140)}`)
+  }
+
+  if (!status.compatibility.ok) {
+    if (status.compatibility.message) {
+      lines.push(`compat_message=${compactStatusValue(status.compatibility.message, 160)}`)
+    } else if (status.compatibility.code) {
+      lines.push(`compat_code=${status.compatibility.code}`)
+    }
+  }
+
+  if (status.vectorSearch.reason) {
+    lines.push(`vector_reason=${status.vectorSearch.reason}`)
+  }
+  if (status.vectorSearch.state === 'unavailable' && status.vectorSearch.message) {
+    lines.push(`vector_message=${compactStatusValue(status.vectorSearch.message, 120)}`)
+  }
+
+  return lines
+}
+
+function suggestedIndexStatusAction(status: RepoStatus): string {
+  if (status.indexed && !status.compatibility.ok) {
+    return 'codesift index --rebuild'
+  }
+  if (!status.indexed) {
+    return 'codesift index'
+  }
+  if (status.sync.state === 'failed' || status.sync.state === 'aborted') {
+    return 'codesift sync'
+  }
+  if (status.stale) {
+    return 'codesift sync'
+  }
+  if (status.sync.state === 'running') {
+    return 'wait for sync'
+  }
+
+  return ''
+}
+
+function fitIndexStatusOutputForBudget(primaryLine: string, actionLine: string | undefined, detailLines: string[], maxChars: number): string {
+  const marker = indexStatusTruncationMarker(Math.max(0, maxChars - 1))
+  const prioritized = actionLine ? [primaryLine, actionLine] : [primaryLine]
+  const output = prioritized.join('\n')
+
+  if (!marker) {
+    return truncateWithEllipsis(output, maxChars)
+  }
+
+  const fitted = [...prioritized]
+  for (const detail of detailLines) {
+    const candidate = [...fitted, detail, marker].join('\n')
+    if (candidate.length <= maxChars) {
+      fitted.push(detail)
+      continue
+    }
+
+    const remainingForDetail = maxChars - fitted.join('\n').length - 1 - marker.length - 1
+    if (remainingForDetail > 0) {
+      const truncatedDetail = truncateWithEllipsis(detail, remainingForDetail)
+      const truncatedCandidate = [...fitted, truncatedDetail, marker].join('\n')
+      if (truncatedCandidate.length <= maxChars) {
+        fitted.push(truncatedDetail)
+      }
+    }
+    break
+  }
+
+  const fittedWithMarker = [...fitted, marker].join('\n')
+  if (fittedWithMarker.length <= maxChars) {
+    return fittedWithMarker
+  }
+
+  const primaryWithMarker = [primaryLine, marker].join('\n')
+  if (primaryWithMarker.length <= maxChars) {
+    return primaryWithMarker
+  }
+
+  let compactPrimaryOnlyFallback = ''
+  for (const compactPrimary of compactIndexStatusPrimaryLineVariants(primaryLine)) {
+    if (compactPrimary === primaryLine) {
+      continue
+    }
+    const compactPrioritized = actionLine ? [compactPrimary, actionLine] : [compactPrimary]
+    const compactWithMarker = [...compactPrioritized, marker].join('\n')
+    if (compactWithMarker.length <= maxChars) {
+      return compactWithMarker
+    }
+
+    const compactPrimaryWithMarker = [compactPrimary, marker].join('\n')
+    if (compactPrimaryWithMarker.length <= maxChars) {
+      compactPrimaryOnlyFallback ||= compactPrimaryWithMarker
+    }
+  }
+
+  if (compactPrimaryOnlyFallback) {
+    return compactPrimaryOnlyFallback
+  }
+
+  return truncateWithEllipsis(primaryLine, maxChars)
+}
+
+function compactIndexStatusPrimaryLineVariants(primaryLine: string): string[] {
+  const fields = primaryLine.split(' ')
+  return [
+    ['indexed=', 'stale=', 'sync=', 'compat=', 'vector='],
+    ['indexed=', 'stale=', 'sync='],
+    ['indexed=', 'sync=']
+  ].map((prefixes) => fields.filter((field) => prefixes.some((prefix) => field.startsWith(prefix))).join(' '))
+}
+
+function indexStatusTruncationMarker(maxChars?: number): string {
+  const full = 'status_truncated=true; raise max_tokens'
+  const bare = 'status_truncated=true'
+  if (maxChars !== undefined && bare.length <= maxChars) {
+    return bare
+  }
+  if (maxChars === undefined || full.length <= maxChars) {
+    return full
+  }
+
+  return bare.length <= maxChars ? bare : ''
+}
+
+function formatStatusFileList(files: string[]): string {
+  const kept = files.slice(0, 2)
+  const omitted = files.length - kept.length
+  return [...kept.map((file) => compactStatusValue(file, 60)), ...(omitted > 0 ? [`+${omitted}`] : [])].join(',')
+}
+
+function compactStatusValue(value: string, maxChars = 80): string {
+  const compact = value.replace(/\s+/g, ' ').trim()
+  return compact.length <= maxChars ? compact : truncateWithEllipsis(compact, maxChars)
 }
 
 function formatHitSymbol(hit: SearchHit): string {

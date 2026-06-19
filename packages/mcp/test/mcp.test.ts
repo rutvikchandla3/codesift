@@ -5,10 +5,11 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { openRepo, registerEmbeddingProvider, type GrepHit, type SearchHit, type SymbolDefinition } from '@codesift/core'
+import { openRepo, registerEmbeddingProvider, type GrepHit, type RepoStatus, type SearchHit, type SymbolDefinition } from '@codesift/core'
 
 import {
   DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS,
+  DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS,
   DEFAULT_MCP_SEARCH_MAX_TOKENS,
   DEFAULT_MCP_READ_CHUNK_MAX_TOKENS,
   DEFAULT_SEARCH_K,
@@ -19,6 +20,7 @@ import {
   createStdioServer,
   callMcpTool,
   formatMcpGrepHits,
+  formatMcpIndexStatus,
   formatMcpReadChunk,
   formatMcpSearchHits,
   formatMcpSymbols,
@@ -65,6 +67,9 @@ describe('@codesift/mcp server', () => {
       max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_SEARCH_MAX_TOKENS },
       context: { type: 'string', enum: ['sig', 'body'] },
       with_usages: { type: 'boolean' }
+    })
+    expect(getToolDefinitions().find((tool) => tool.name === 'index_status')?.inputSchema.properties).toMatchObject({
+      max_tokens: { type: 'integer', minimum: 1, maximum: 1000, default: DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS }
     })
     expect(MCP_SERVER_INSTRUCTIONS).toContain('literals/env/errors/operators/regex->grep_code')
   })
@@ -385,6 +390,145 @@ function makeSymbol(overrides: Partial<Omit<SymbolDefinition, 'body'>> & { body?
 
   return definition
 }
+
+function makeStatus(overrides: Partial<RepoStatus> = {}): RepoStatus {
+  return {
+    root: '/tmp/repo',
+    indexPath: '/tmp/repo/.codesift/index.db',
+    indexed: true,
+    stale: false,
+    sync: { state: 'completed', completedAt: '2026-06-20T00:00:00.000Z' },
+    chunkCount: 123,
+    symbolCount: 45,
+    generatedFileCount: 0,
+    generatedChunkCount: 0,
+    indexGeneration: 3,
+    provider: { id: 'local-hash' },
+    compatibility: { ok: true },
+    vectorSearch: { available: true, state: 'lazy' },
+    ...overrides
+  }
+}
+
+describe('formatMcpIndexStatus compact output', () => {
+  it('renders healthy status as compact lines without raw paths or JSON wrappers', () => {
+    const output = formatMcpIndexStatus(makeStatus())
+
+    expect(output).toBe('indexed=yes stale=no sync=completed chunks=123 symbols=45 gen=3 generated=0/0 provider=local-hash compat=ok vector=lazy')
+    expect(output).not.toContain('/tmp/repo')
+    expect(output).not.toContain('indexPath')
+    expect(output).not.toContain('{')
+  })
+
+  it('reports a missing index with an indexing action', () => {
+    const output = formatMcpIndexStatus(makeStatus({
+      indexed: false,
+      sync: { state: 'idle' },
+      chunkCount: 0,
+      symbolCount: 0,
+      indexGeneration: 0,
+      provider: null
+    }))
+
+    expect(output).toContain('indexed=no')
+    expect(output).toContain('provider=unconfigured')
+    expect(output).toContain('action=codesift index')
+  })
+
+  it('reports stale reason codes, clipped files, and sync action', () => {
+    const output = formatMcpIndexStatus(makeStatus({
+      stale: true,
+      staleReasons: [
+        { code: 'file_modified', message: '4 files modified', count: 4, files: ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts'] }
+      ]
+    }))
+
+    expect(output).toContain('stale=yes')
+    expect(output).toContain('stale_reasons=file_modified count=4 files=src/a.ts,src/b.ts,+2')
+    expect(output).toContain('message=4 files modified')
+    expect(output).toContain('action=codesift sync')
+  })
+
+  it('keeps sync errors and a truncation marker under small budgets when possible', () => {
+    const output = formatMcpIndexStatus(makeStatus({
+      sync: { state: 'failed', error: `planned failure ${'x'.repeat(300)}` }
+    }), { maxTokens: 45 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(45)
+    expect(output).toContain('sync=failed')
+    expect(output).toContain('action=codesift sync')
+    expect(output).toContain('sync_error=')
+    expect(output).toContain('status_truncated=true')
+  })
+
+  it('keeps action visible by compacting the primary line for tight actionable budgets', () => {
+    const output = formatMcpIndexStatus(makeStatus({
+      provider: { id: `provider-${'x'.repeat(80)}`, dims: 1536, modelVersion: `model-${'y'.repeat(80)}` },
+      compatibility: {
+        ok: false,
+        code: 'model_version_mismatch',
+        message: `provider model changed ${'z'.repeat(200)}`
+      }
+    }), { maxTokens: 32 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(32)
+    expect(output).toContain('indexed=yes')
+    expect(output).toContain('action=codesift index --rebuild')
+    expect(output).toContain('status_truncated=true')
+  })
+
+  it('reports compatibility mismatch without raw expected or actual snapshots', () => {
+    const output = formatMcpIndexStatus(makeStatus({
+      compatibility: {
+        ok: false,
+        code: 'provider_mismatch',
+        message: 'Provider changed; run codesift index --rebuild',
+        expected: { providerId: 'local-hash' },
+        actual: { providerId: 'cloud-provider' }
+      }
+    }))
+
+    expect(output).toContain('compat=provider_mismatch')
+    expect(output).toContain('compat_message=Provider changed; run codesift index --rebuild')
+    expect(output).toContain('action=codesift index --rebuild')
+    expect(output).not.toContain('expected')
+    expect(output).not.toContain('actual')
+  })
+
+  it('reports vector unavailability reason without dumping long detail', () => {
+    const output = formatMcpIndexStatus(makeStatus({
+      vectorSearch: {
+        available: false,
+        state: 'unavailable',
+        reason: 'native-dependency-unavailable',
+        message: 'vector search unavailable (native dep), lexical/symbol still works',
+        detail: `missing sqlite-vec prebuild ${'x'.repeat(200)}`
+      }
+    }))
+
+    expect(output).toContain('vector=unavailable')
+    expect(output).toContain('vector_reason=native-dependency-unavailable')
+    expect(output).toContain('vector_message=vector search unavailable')
+    expect(output).not.toContain('sqlite-vec prebuild')
+  })
+
+  it('budgets index_status output through callMcpTool', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-mcp-status-budget-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    await writeFile(join(repoRoot, 'src', 'demo.ts'), `export const demoValue = '${'x'.repeat(200)}'\n`, 'utf8')
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const output = await callMcpTool(repo, 'index_status', { max_tokens: 40 })
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(40)
+    expect(output).toContain('indexed=yes')
+    expect(output).not.toContain('indexPath')
+    expect(output).not.toContain('{')
+  })
+})
 
 describe('formatMcpSymbols budgeted output', () => {
   it('preserves no_symbols and under-budget output byte-for-byte', () => {
