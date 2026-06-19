@@ -851,7 +851,7 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
           rangesOverlap(matchingDef.range, query.expectedLineRange)
 
         if (!bodyResolves && matchingDef) {
-          const followUp = await readRangeSafely(repo, matchingDef.file, matchingDef.range)
+          const followUp = await readSymbolChunkSafely(repo, matchingDef)
           if (followUp !== null) {
             tokensToResolution += estimateTokenCount(followUp)
             callsToResolution = 2
@@ -1324,12 +1324,8 @@ async function readChunkSafely(repo: Awaited<ReturnType<typeof openRepo>>, id: s
   }
 }
 
-async function readRangeSafely(repo: Awaited<ReturnType<typeof openRepo>>, file: string, range: Range): Promise<string | null> {
-  try {
-    return await repo.readRange(file, range.startLine, range.endLine)
-  } catch {
-    return null
-  }
+async function readSymbolChunkSafely(repo: Awaited<ReturnType<typeof openRepo>>, definition: SymbolDefinition): Promise<string | null> {
+  return readChunkSafely(repo, `${definition.file}:${definition.range.startLine}-${definition.range.endLine}`)
 }
 
 function normalizePath(value: string): string {

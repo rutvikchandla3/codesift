@@ -4,6 +4,8 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
+import { DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS, DEFAULT_MCP_READ_CHUNK_MAX_TOKENS } from '@codesift/mcp'
+
 import { DEFAULT_MANIFEST_PATH, candidateFromRipgrep, candidateMatchesExpected, createEmptyManifest, diffLossBudgets, evaluateManifest, formatSummary, isRerankEvalEnabled, loadManifest, proveRoutingPolicy, runRipgrep, summarizeEmptyRun, type GoldenQuery, type GoldenQueryType, type RipgrepHit } from '../src/index.js'
 
 const temporaryDirectories: string[] = []
@@ -135,6 +137,50 @@ describe('@codesift/eval', () => {
     expect(codesiftRun?.taskSuccess).toBe(true)
     expect(codesiftRun?.meanReciprocalRank).toBe(1)
     expect(codesiftRun?.tokensToResolution).toBeLessThanOrEqual(730)
+  }, 30_000)
+
+  it('accounts body-less symbol follow-ups through the read_chunk MCP budget', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-eval-symbol-followup-budget-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    const makeFunction = (returnValue: string) => [
+      'export function inflateTarget() {',
+      ...Array.from({ length: 140 }, (_, index) => `  const noisy${index} = '${returnValue}_${index}_${'x'.repeat(180)}'`),
+      `  return '${returnValue}'`,
+      '}',
+      ''
+    ].join('\n')
+
+    await Promise.all([
+      writeFile(join(repoRoot, 'src', 'a.ts'), makeFunction('target'), 'utf8'),
+      writeFile(join(repoRoot, 'src', 'b.ts'), makeFunction('otherB'), 'utf8'),
+      writeFile(join(repoRoot, 'src', 'c.ts'), makeFunction('otherC'), 'utf8'),
+      writeFile(join(repoRoot, 'src', 'd.ts'), makeFunction('otherD'), 'utf8')
+    ])
+
+    const summary = await evaluateManifest({
+      repos: [{ id: 'symbol-followup-budget', language: 'typescript', repoPath: repoRoot }],
+      queries: [
+        {
+          id: 'symbol-followup-budget',
+          repoId: 'symbol-followup-budget',
+          queryType: 'symbol-def',
+          query: 'inflateTarget',
+          expected: [{ file: 'src/a.ts', symbol: 'inflateTarget' }],
+          expectedLineRange: { startLine: 1, endLine: 143 }
+        }
+      ]
+    }, { resultLimit: 10, inspectionLimit: 5, latencyToleranceMs: Number.POSITIVE_INFINITY })
+
+    const codesiftRun = summary.runs.find((run) => run.tool === 'codesift')
+
+    expect(codesiftRun?.taskSuccess).toBe(true)
+    expect(codesiftRun?.callsToResolution).toBe(2)
+    expect(codesiftRun?.tokensToResolution).toBeLessThanOrEqual(
+      DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS + DEFAULT_MCP_READ_CHUNK_MAX_TOKENS
+    )
   }, 30_000)
 
   it('measures end-to-end calls-to-resolution truthfully across both tools', async () => {
