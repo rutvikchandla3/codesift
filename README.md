@@ -39,6 +39,8 @@ Implemented today:
 - frozen `@codesift/core` SDK surface with a typedoc reference (`pnpm run docs`) and a documented quickstart proven by a test
 - pinned-OSS + local M3 fixture eval harness with paired tokens-to-resolution plus stdio cold-start latency vs ripgrep and a checked-in loss budget
 
+For the current one-call structural-search moat, including diagrams of the query path and efficiency model, see [`docs/moat.md`](docs/moat.md).
+
 Still intentionally deferred to later milestones:
 
 - production-default learned embedding provider (cloud providers ship opt-in in M5; a default learned/local model is M6)
