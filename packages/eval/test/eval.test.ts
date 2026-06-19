@@ -4,9 +4,16 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { DEFAULT_MANIFEST_PATH, candidateFromRipgrep, candidateMatchesExpected, createEmptyManifest, diffLossBudgets, evaluateManifest, formatSummary, isRerankEvalEnabled, loadManifest, proveRoutingPolicy, runRipgrep, summarizeEmptyRun, type GoldenQuery, type RipgrepHit } from '../src/index.js'
+import { DEFAULT_MANIFEST_PATH, candidateFromRipgrep, candidateMatchesExpected, createEmptyManifest, diffLossBudgets, evaluateManifest, formatSummary, isRerankEvalEnabled, loadManifest, proveRoutingPolicy, runRipgrep, summarizeEmptyRun, type GoldenQuery, type GoldenQueryType, type RipgrepHit } from '../src/index.js'
 
 const temporaryDirectories: string[] = []
+const stableLocalTokenCeilings: Partial<Record<GoldenQueryType, number>> = {
+  'nl-concept': 180,
+  'symbol-def': 125,
+  'exact-identifier': 75,
+  'string-literal': 40,
+  'error-trace': 40
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -75,6 +82,27 @@ describe('@codesift/eval', () => {
     expect(summary.routingProof.selections.map((selection) => selection.selectedTool)).toEqual(
       expect.arrayContaining(['search_code', 'find_symbol', 'grep_code'])
     )
+  }, 30_000)
+
+  it('keeps stable local codesift runs at one-call rank-1 resolution with low token envelopes', async () => {
+    const manifest = await loadManifest(DEFAULT_MANIFEST_PATH)
+    const stableLocalManifest = {
+      repos: manifest.repos.filter((repo) => repo.id.startsWith('m3-') || repo.id === 'collision-ts' || repo.id === 'usages-ts'),
+      queries: manifest.queries.filter((query) => query.repoId.startsWith('m3-') || query.repoId === 'collision-ts' || query.repoId === 'usages-ts')
+    }
+    const summary = await evaluateManifest(stableLocalManifest, { resultLimit: 10, inspectionLimit: 5, latencyToleranceMs: Number.POSITIVE_INFINITY })
+    const codesiftRuns = summary.runs.filter((run) => run.tool === 'codesift')
+
+    expect(codesiftRuns).toHaveLength(stableLocalManifest.queries.length)
+    for (const run of codesiftRuns) {
+      expect(run.taskSuccess).toBe(true)
+      expect(run.callsToResolution).toBe(1)
+      expect(run.meanReciprocalRank).toBe(1)
+
+      const tokenCeiling = stableLocalTokenCeilings[run.queryType]
+      expect(tokenCeiling).toBeDefined()
+      expect(run.tokensToResolution).toBeLessThanOrEqual(tokenCeiling!)
+    }
   }, 30_000)
 
   it('measures end-to-end calls-to-resolution truthfully across both tools', async () => {

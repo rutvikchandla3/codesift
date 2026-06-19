@@ -219,8 +219,12 @@ describe('@codesift/mcp server', () => {
         params: { name: 'search_code', arguments: { query: 'demoValue', k: 1 } }
       })
       const searchResult = await waitForJsonRpcMessage(messages, (message) => rpcId(message) === 3, () => parseError, child)
-      const searchText = JSON.stringify(searchResult)
+      const searchText = mcpText(searchResult)
       expect(searchText).toContain('src/demo.ts')
+      expect(searchText).toContain('1 | export function demoValue(): string {')
+      expect(searchText).toContain("2 |   return 'demo'")
+      expect(searchText).toContain('tokensReturned=')
+      expect(searchText).not.toContain(' ↩ ')
       const chunkId = /[=~+] ([^\s"]+)/.exec(searchText)?.[1]
       expect(chunkId).toBeTruthy()
 
@@ -263,7 +267,7 @@ describe('formatMcpSearchHits structure-preserving output', () => {
     const lines = output.split('\n')
     // Header carries reason + id (hash stripped) + symbol path.
     expect(lines[0]).toBe('~ src/auth.ts:10-14 verify')
-    // Body block is line-numbered from startLine, preserving indentation, no ' ↩ ' flattening.
+    // Body block is line-numbered from range.startLine, preserving indentation, no ' ↩ ' flattening.
     expect(lines[1]).toBe('10 | function verify(token: string): boolean {')
     expect(lines[2]).toBe('11 |   if (!token) {')
     expect(lines[3]).toBe('12 |     return false')
@@ -304,17 +308,22 @@ describe('formatMcpSearchHits structure-preserving output', () => {
     expect(output).toContain('3 | … (truncated — read_chunk src/auth.ts:10-14 for full)')
   })
 
-  it('renders a compact (no body) hit with real newlines, preserved indentation, and NN | line-number prefixes', () => {
+  it('renders a compact (no body) hit from snippetRange with real newlines, preserved indentation, and NN | prefixes', () => {
     const output = formatMcpSearchHits([
-      makeHit({ snippet: 'function verify() {\n  return true\n}' })
+      makeHit({
+        range: { startLine: 10, endLine: 30 },
+        snippet: 'function verify() {\n  return true\n}',
+        snippetRange: { startLine: 18, endLine: 20 }
+      })
     ])
     expect(output).not.toContain(' ↩ ')
     const lines = output.split('\n')
     expect(lines[0]).toBe('~ src/auth.ts:10-14 verify')
-    // Compact snippet is line-numbered from range.startLine and keeps original indentation.
-    expect(lines[1]).toBe('10 | function verify() {')
-    expect(lines[2]).toBe('11 |   return true')
-    expect(lines[3]).toBe('12 | }')
+    // Compact snippets are line-numbered from snippetRange.startLine; core may
+    // center snippets inside a wider hit range.
+    expect(lines[1]).toBe('18 | function verify() {')
+    expect(lines[2]).toBe('19 |   return true')
+    expect(lines[3]).toBe('20 | }')
     expect(output).toContain('tokensReturned=42')
   })
 
@@ -322,7 +331,8 @@ describe('formatMcpSearchHits structure-preserving output', () => {
     const output = formatMcpSearchHits([
       makeHit({
         snippet: 'class Auth {\n  verify() {\n    return this.token != null\n  }\n}',
-        range: { startLine: 20, endLine: 24 }
+        range: { startLine: 10, endLine: 30 },
+        snippetRange: { startLine: 20, endLine: 24 }
       })
     ])
     const lines = output.split('\n')
@@ -417,4 +427,31 @@ function rpcId(message: unknown): number | undefined {
 
   const id = (message as { id?: unknown }).id
   return typeof id === 'number' ? id : undefined
+}
+
+function mcpText(message: unknown): string {
+  if (typeof message !== 'object' || message === null || !('result' in message)) {
+    return ''
+  }
+
+  const result = (message as { result?: unknown }).result
+  if (typeof result !== 'object' || result === null || !('content' in result)) {
+    return ''
+  }
+
+  const content = (result as { content?: unknown }).content
+  if (!Array.isArray(content)) {
+    return ''
+  }
+
+  return content
+    .map((entry) => {
+      if (typeof entry !== 'object' || entry === null || !('text' in entry)) {
+        return ''
+      }
+
+      const text = (entry as { text?: unknown }).text
+      return typeof text === 'string' ? text : ''
+    })
+    .join('\n')
 }

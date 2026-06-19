@@ -542,7 +542,7 @@ export function formatMcpSearchHits(hits: SearchHit[]): string {
         return hit.usages?.length ? `${block}\n${formatUsageBlock(hit.usages)}` : block
       }
 
-      const snippet = compactHitSnippet(hit.snippet, hit.range.startLine ?? hit.snippetRange.startLine, 4)
+      const snippet = compactHitSnippet(hit.snippet, hit.snippetRange.startLine ?? hit.range.startLine, 4)
       const block = snippet ? `${header}\n${snippet}` : header
       return hit.usages?.length ? `${block}\n${formatUsageBlock(hit.usages)}` : block
     })
@@ -618,8 +618,8 @@ function compactSnippet(snippet: string, maxLines: number): string {
 }
 
 // Structure-preserving renderer for compact (no-body) search hits: keeps
-// original indentation and emits `NN | code` line-number prefixes, matching the
-// inlined-body block. Only trailing whitespace and a trailing newline are dropped.
+// original indentation and emits `NN | code` prefixes from the centered snippet
+// range. Only trailing whitespace and a trailing newline are dropped.
 function compactHitSnippet(snippet: string, startLine: number, maxLines: number): string {
   const lines = snippet.replace(/\n$/, '').split('\n').slice(0, maxLines)
   if (lines.length === 0) {
