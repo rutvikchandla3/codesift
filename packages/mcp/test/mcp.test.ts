@@ -1,15 +1,16 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { cp, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { openRepo, registerEmbeddingProvider, type GrepHit, type RepoStatus, type SearchHit, type SymbolDefinition } from '@codesift/core'
+import { openRepo, registerEmbeddingProvider, type EdgeResult, type GrepHit, type ImpactResult, type RepoStatus, type SearchHit, type SymbolDefinition } from '@codesift/core'
 
 import {
   DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS,
   DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS,
+  DEFAULT_MCP_RELATION_MAX_TOKENS,
   DEFAULT_MCP_SEARCH_MAX_TOKENS,
   DEFAULT_MCP_READ_CHUNK_MAX_TOKENS,
   DEFAULT_SEARCH_K,
@@ -19,9 +20,14 @@ import {
   createRouter,
   createStdioServer,
   callMcpTool,
+  formatMcpCallers,
   formatMcpGrepHits,
+  formatMcpImpact,
+  formatMcpImplementers,
+  formatMcpImporters,
   formatMcpIndexStatus,
   formatMcpReadChunk,
+  formatMcpReferences,
   formatMcpSearchHits,
   formatMcpSymbols,
   getToolDefinitions
@@ -44,11 +50,24 @@ afterEach(async () => {
   )
 })
 
+async function copyFixtureRepository(fixtureName: string, prefix: string): Promise<string> {
+  const parentDirectory = await mkdtemp(join(tmpdir(), prefix))
+  const repoRoot = join(parentDirectory, 'repo')
+  temporaryDirectories.push(parentDirectory)
+  await cp(join(process.cwd(), 'packages', 'eval', 'fixtures', fixtureName), repoRoot, { recursive: true })
+  return repoRoot
+}
+
 describe('@codesift/mcp server', () => {
   it('exposes the planned tool surface with routing schemas', () => {
     expect(getToolDefinitions().map((tool) => tool.name)).toEqual([
       'search_code',
       'find_symbol',
+      'find_callers',
+      'find_refs',
+      'find_importers',
+      'who_implements',
+      'impact',
       'grep_code',
       'read_chunk',
       'index_status'
@@ -58,8 +77,17 @@ describe('@codesift/mcp server', () => {
       max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: 700 }
     })
     expect(getToolDefinitions().find((tool) => tool.name === 'find_symbol')?.inputSchema.properties).toMatchObject({
+      with_callers: { type: 'boolean' },
       max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS }
     })
+    expect(getToolDefinitions().find((tool) => tool.name === 'find_callers')?.inputSchema.required).toEqual(['name'])
+    expect(getToolDefinitions().find((tool) => tool.name === 'find_callers')?.inputSchema.properties).toMatchObject({
+      max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_RELATION_MAX_TOKENS }
+    })
+    expect(getToolDefinitions().find((tool) => tool.name === 'find_refs')?.inputSchema.required).toEqual(['name'])
+    expect(getToolDefinitions().find((tool) => tool.name === 'find_importers')?.inputSchema.required).toEqual(['file'])
+    expect(getToolDefinitions().find((tool) => tool.name === 'who_implements')?.inputSchema.required).toEqual(['name'])
+    expect(getToolDefinitions().find((tool) => tool.name === 'impact')?.inputSchema.required).toEqual(['name'])
     expect(getToolDefinitions().find((tool) => tool.name === 'read_chunk')?.inputSchema.properties).toMatchObject({
       max_tokens: { type: 'integer', minimum: MIN_MCP_READ_CHUNK_MAX_TOKENS, maximum: 4000, default: DEFAULT_MCP_READ_CHUNK_MAX_TOKENS }
     })
@@ -71,29 +99,48 @@ describe('@codesift/mcp server', () => {
     expect(getToolDefinitions().find((tool) => tool.name === 'index_status')?.inputSchema.properties).toMatchObject({
       max_tokens: { type: 'integer', minimum: 1, maximum: 1000, default: DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS }
     })
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('literals/env/errors/operators/regex->grep_code')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('breakage/transitive callers->impact')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('approx:name-only')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('literals/regex/errors/env/operators->grep_code')
   })
 
   it('asserts single-call sufficiency in instructions and tool descriptions', () => {
     const lowerInstructions = MCP_SERVER_INSTRUCTIONS.toLowerCase()
-    expect(lowerInstructions).toContain('top search_code body is inline')
-    expect(lowerInstructions).toContain('read_chunk only for non-top hits/wider context')
+    expect(lowerInstructions).toContain('top search_code body inline')
+    expect(lowerInstructions).toContain('read_chunk only for non-top/wider context')
 
     const tools = getToolDefinitions()
     const searchDescription = tools.find((tool) => tool.name === 'search_code')?.description ?? ''
     expect(searchDescription.toLowerCase()).toContain('top body inline')
 
     const findDescription = tools.find((tool) => tool.name === 'find_symbol')?.description ?? ''
-    expect(findDescription.toLowerCase()).toContain('top unambiguous body inline')
+    expect(findDescription.toLowerCase()).toContain('top body inline')
+    expect(findDescription.toLowerCase()).toContain('relations')
+
+    const callersDescription = tools.find((tool) => tool.name === 'find_callers')?.description ?? ''
+    expect(callersDescription).toContain('approx:name-only')
+
+    const refsDescription = tools.find((tool) => tool.name === 'find_refs')?.description ?? ''
+    expect(refsDescription).toContain('approx:name-only')
+
+    const implementersDescription = tools.find((tool) => tool.name === 'who_implements')?.description ?? ''
+    expect(implementersDescription).toContain('approx:name-only')
+
+    const impactDescription = tools.find((tool) => tool.name === 'impact')?.description ?? ''
+    expect(impactDescription).toContain('approx:name-only')
 
     const readDescription = tools.find((tool) => tool.name === 'read_chunk')?.description ?? ''
     expect(readDescription.toLowerCase()).toContain('not needed for top search_code/find_symbol hits')
     expect(readDescription.toLowerCase()).toContain('returned inline')
 
-    // The routing guidance for find_symbol/grep_code is preserved.
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('identifiers/definitions->find_symbol')
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('concepts/unknown names->search_code')
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('Broad search_code: k=5-8')
+    // The routing guidance for find_symbol/graph/grep_code is preserved.
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('identifiers->find_symbol')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('callers/uses->find_callers/find_refs')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('importers->find_importers')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('implements/extends->who_implements')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('breakage/transitive callers->impact')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('concepts/fuzzy names->search_code')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('Broad search k=5-8')
     expect(MCP_SERVER_INSTRUCTIONS).toContain('Check index_status')
   })
 
@@ -103,13 +150,18 @@ describe('@codesift/mcp server', () => {
     const toolDescriptionCeilings = new Map([
       ['search_code', 190],
       ['find_symbol', 130],
+      ['find_callers', 120],
+      ['find_refs', 120],
+      ['find_importers', 90],
+      ['who_implements', 125],
+      ['impact', 110],
       ['grep_code', 120],
       ['read_chunk', 120],
       ['index_status', 90]
     ])
 
-    expect(payload.length).toBeLessThanOrEqual(3500)
-    expect(Math.ceil(payload.length / 4)).toBeLessThanOrEqual(875)
+    expect(payload.length).toBeLessThanOrEqual(6000)
+    expect(Math.ceil(payload.length / 4)).toBeLessThanOrEqual(1500)
     expect(MCP_SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(430)
     for (const tool of tools) {
       expect(tool.description.length).toBeLessThanOrEqual(toolDescriptionCeilings.get(tool.name) ?? 120)
@@ -177,6 +229,187 @@ describe('@codesift/mcp server', () => {
     expect(await router.readChunk({ id: hits[0]!.id })).toContain("return 'demo'")
     expect((await router.indexStatus()).indexed).toBe(true)
     expect(DEFAULT_SEARCH_K).toBe(8)
+  })
+
+  it('routes graph tool calls through the core repo contract', async () => {
+    const repoRoot = await copyFixtureRepository('usages-ts', 'codesift-mcp-graph-router-')
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+    const router = createRouter(repo)
+    const callers = await router.findCallers({ name: 'parseToken' })
+    const refs = await router.findReferences({ name: 'parseToken' })
+    const importers = await router.findImporters({ file: 'src/token.ts' })
+
+    expect(callers.map((result) => `${result.file}:${result.line}:${result.srcSymbol}:${result.edgeKind}`)).toEqual([
+      'src/api.ts:4:readSubject:call',
+      'src/worker.ts:4:enqueueToken:call'
+    ])
+    expect(refs.map((result) => `${result.file}:${result.line}:${result.srcSymbol}:${result.edgeKind}`)).toEqual([
+      'src/api.ts:4:readSubject:call',
+      'src/worker.ts:4:enqueueToken:call'
+    ])
+    expect(importers.map((result) => `${result.file}:${result.line}:${result.edgeKind}`)).toEqual([
+      'src/api.ts:1:import',
+      'src/worker.ts:1:import'
+    ])
+  })
+
+  it('returns one-call find_symbol relations and bounded impact through the MCP contract', async () => {
+    const repoRoot = await copyFixtureRepository('usages-ts', 'codesift-mcp-relations-impact-')
+    await writeFile(
+      join(repoRoot, 'src', 'service.ts'),
+      `import { readSubject } from './api'
+
+export function handleToken(header: string): string {
+  return readSubject(header)
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'app.ts'),
+      `import { handleToken } from './service'
+
+export function runApp(header: string): string {
+  return handleToken(header)
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'cli.ts'),
+      `import { runApp } from './app'
+
+export function main(header: string): string {
+  return runApp(header)
+}
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+    const router = createRouter(repo)
+
+    const symbols = await router.findSymbol({ name: 'parseToken', with_callers: true })
+    expect(symbols[0]?.body).toContain('export function parseToken')
+    expect(symbols[0]?.relations?.sites.map((site) => `${site.file}:${site.line}:${site.srcSymbol}:${site.edgeKind}`)).toEqual([
+      'src/api.ts:4:readSubject:call',
+      'src/worker.ts:4:enqueueToken:call'
+    ])
+
+    const impact = await router.impact({ name: 'parseToken', depth: 2 })
+    expect(impact.nodes.map((node) => `${node.depth}:${node.file}:${node.line}:${node.srcSymbol}:${node.edgeKind}`)).toEqual([
+      '0:src/api.ts:4:readSubject:call',
+      '0:src/worker.ts:4:enqueueToken:call',
+      '1:src/service.ts:4:handleToken:call',
+      '2:src/app.ts:4:runApp:call'
+    ])
+    expect(impact.depthCapped).toBe(true)
+  })
+
+  it('routes implementer lookups through the core repo contract', async () => {
+    const repoRoot = await copyFixtureRepository('heritage-ts', 'codesift-mcp-heritage-router-')
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+    const router = createRouter(repo)
+    const implementers = await router.findImplementers({ name: 'AuthStrategy' })
+
+    expect(implementers.map((result) => `${result.file}:${result.line}:${result.srcSymbol}:${result.edgeKind}`)).toEqual([
+      'src/impl.ts:3:JwtVerifier:implements',
+      'src/impl.ts:9:StrictStrategy:extends'
+    ])
+  })
+
+  it('formats graph MCP tools with honest resolution labels and definition-path disambiguation', async () => {
+    const usagesRepoRoot = await copyFixtureRepository('usages-ts', 'codesift-mcp-graph-tools-')
+    const usagesRepo = await openRepo(usagesRepoRoot)
+    await usagesRepo.sync()
+
+    const callersOutput = await callMcpTool(usagesRepo, 'find_callers', { name: 'parseToken', max_tokens: 80 })
+    expect(callersOutput).toContain('src/api.ts:4 readSubject call import-resolved |')
+    expect(callersOutput).toContain('src/worker.ts:4 enqueueToken call import-resolved |')
+
+    const importersOutput = await callMcpTool(usagesRepo, 'find_importers', { file: 'src/token.ts', max_tokens: 80 })
+    expect(importersOutput).toContain("src/api.ts:1 top-level import import-resolved | import { parseToken } from './token'")
+    expect(importersOutput).toContain("src/worker.ts:1 top-level import import-resolved | import { parseToken } from './token'")
+
+    const collisionRepoRoot = await copyFixtureRepository('collision-ts', 'codesift-mcp-graph-collision-')
+    const collisionRepo = await openRepo(collisionRepoRoot)
+    await collisionRepo.sync()
+
+    const refsOutput = await callMcpTool(collisionRepo, 'find_refs', {
+      name: 'validate',
+      kind: 'function',
+      path_glob: 'src/schema/**',
+      max_tokens: 80
+    })
+    expect(refsOutput).toContain('src/api/handler.ts:6 handleRequest call import-resolved |')
+    expect(refsOutput).not.toContain('src/auth/token.ts')
+    expect(refsOutput).not.toContain('src/forms/checkout.ts')
+
+    const heritageRepoRoot = await copyFixtureRepository('heritage-ts', 'codesift-mcp-graph-heritage-')
+    const heritageRepo = await openRepo(heritageRepoRoot)
+    await heritageRepo.sync()
+
+    const implementersOutput = await callMcpTool(heritageRepo, 'who_implements', {
+      name: 'AuthStrategy',
+      max_tokens: 80
+    })
+    expect(implementersOutput).toContain('src/impl.ts:3 JwtVerifier implements import-resolved | export class JwtVerifier extends BaseVerifier implements AuthStrategy {')
+    expect(implementersOutput).toContain('src/impl.ts:9 StrictStrategy extends import-resolved | export interface StrictStrategy extends AuthStrategy {}')
+  })
+
+  it('formats one-call find_symbol relations and bounded impact output', async () => {
+    const repoRoot = await copyFixtureRepository('usages-ts', 'codesift-mcp-relations-output-')
+    await writeFile(
+      join(repoRoot, 'src', 'service.ts'),
+      `import { readSubject } from './api'
+
+export function handleToken(header: string): string {
+  return readSubject(header)
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'app.ts'),
+      `import { handleToken } from './service'
+
+export function runApp(header: string): string {
+  return handleToken(header)
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'cli.ts'),
+      `import { runApp } from './app'
+
+export function main(header: string): string {
+  return runApp(header)
+}
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const symbolOutput = await callMcpTool(repo, 'find_symbol', { name: 'parseToken', with_callers: true, max_tokens: 120 })
+    expect(symbolOutput).toContain('#1 function parseToken src/token.ts:6-9')
+    expect(symbolOutput).toContain('relations:')
+    expect(symbolOutput).toContain('- call src/api.ts:4 readSubject import-resolved')
+    expect(symbolOutput).toContain('- call src/worker.ts:4 enqueueToken import-resolved')
+    expect(symbolOutput).toContain('- neighbor interface ParsedToken 1-4')
+
+    const impactOutput = await callMcpTool(repo, 'impact', { name: 'parseToken', depth: 2, max_tokens: 180 })
+    expect(impactOutput).toContain('src/api.ts:4 readSubject d0 call import-resolved |')
+    expect(impactOutput).toContain('src/service.ts:4 handleToken d1 call import-resolved |')
+    expect(impactOutput).toContain('src/app.ts:4 runApp d2 call import-resolved |')
+    expect(impactOutput).toContain('depth_capped=2')
   })
 
   it('budgets find_symbol output through the MCP call surface', async () => {
@@ -391,6 +624,51 @@ function makeSymbol(overrides: Partial<Omit<SymbolDefinition, 'body'>> & { body?
   return definition
 }
 
+function makeEdgeResult(overrides: Partial<Omit<EdgeResult, 'srcSymbol'>> & { srcSymbol?: string | undefined } = {}): EdgeResult {
+  const { srcSymbol, ...rest } = overrides
+  const result: EdgeResult = {
+    file: 'src/auth.ts',
+    range: { startLine: 10, endLine: 10 },
+    line: 10,
+    snippet: '  return verifyToken(token)',
+    srcSymbol: 'handleRequest',
+    edgeKind: 'call',
+    resolution: 'import-resolved',
+    ...rest
+  }
+
+  if ('srcSymbol' in overrides) {
+    if (srcSymbol === undefined) {
+      delete result.srcSymbol
+    } else {
+      result.srcSymbol = srcSymbol
+    }
+  }
+
+  return result
+}
+
+function makeImpactResult(overrides: Partial<ImpactResult> = {}): ImpactResult {
+  return {
+    nodes: [
+      {
+        name: 'handleRequest',
+        file: 'src/auth.ts',
+        range: { startLine: 10, endLine: 10 },
+        line: 10,
+        snippet: '  return verifyToken(token)',
+        srcSymbol: 'handleRequest',
+        depth: 1,
+        edgeKind: 'call',
+        resolution: 'import-resolved'
+      }
+    ],
+    depthLimit: 2,
+    maxNodes: 50,
+    ...overrides
+  }
+}
+
 function makeStatus(overrides: Partial<RepoStatus> = {}): RepoStatus {
   return {
     root: '/tmp/repo',
@@ -530,6 +808,107 @@ describe('formatMcpIndexStatus compact output', () => {
   })
 })
 
+describe('formatMcpCallers/References/Importers/Implementers budgeted output', () => {
+  it('preserves empty markers and under-budget edge rows byte-for-byte', () => {
+    const results = [makeEdgeResult()]
+    const expected = 'src/auth.ts:10 handleRequest call import-resolved | return verifyToken(token)'
+
+    expect(formatMcpCallers([])).toBe('no_callers')
+    expect(formatMcpReferences([])).toBe('no_refs')
+    expect(formatMcpImporters([])).toBe('no_importers')
+    expect(formatMcpImplementers([])).toBe('no_implementers')
+    expect(formatMcpCallers(results)).toBe(expected)
+    expect(formatMcpReferences(results)).toBe(expected)
+    expect(formatMcpImporters([makeEdgeResult({ srcSymbol: undefined, edgeKind: 'import', snippet: "import { verifyToken } from './auth'" })])).toBe(
+      "src/auth.ts:10 top-level import import-resolved | import { verifyToken } from './auth'"
+    )
+    expect(formatMcpImplementers([makeEdgeResult({ srcSymbol: 'JwtVerifier', edgeKind: 'implements', snippet: 'class JwtVerifier extends BaseVerifier implements AuthStrategy {' })])).toBe(
+      'src/auth.ts:10 JwtVerifier implements import-resolved | class JwtVerifier extends BaseVerifier implements AuthStrategy {'
+    )
+  })
+
+  it('marks name-only rows as approximate and emits omission markers when truncated', () => {
+    const results = Array.from({ length: 5 }, (_, index) => makeEdgeResult({
+      file: `src/callers/${index}.ts`,
+      line: index + 10,
+      range: { startLine: index + 10, endLine: index + 10 },
+      resolution: index === 0 ? 'name-only' : 'import-resolved',
+      snippet: `  return verifyToken(token, '${'x'.repeat(90)}')`
+    }))
+
+    const output = formatMcpCallers(results, { maxTokens: 35 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(35)
+    expect(output).toContain('approx:name-only')
+    expect(output).toContain('callers_omitted=')
+    expect(output).not.toContain('src/callers/4.ts')
+  })
+
+  it('uses the tool-specific omission marker for tiny budgets', () => {
+    const output = formatMcpImporters([
+      makeEdgeResult({ srcSymbol: undefined, edgeKind: 'import', snippet: `import { verifyToken } from './${'deep/'.repeat(8)}auth'` }),
+      makeEdgeResult({ file: 'src/other.ts', srcSymbol: undefined, edgeKind: 'import' })
+    ], { maxTokens: 8 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(8)
+    expect(output).toContain('importers_omitted=1')
+    expect(output).not.toContain('src/other.ts')
+  })
+
+  it('uses the implementers omission marker for tight budgets', () => {
+    const output = formatMcpImplementers([
+      makeEdgeResult({ edgeKind: 'implements', snippet: `class JwtVerifier implements ${'AuthStrategy'.repeat(12)}` }),
+      makeEdgeResult({ file: 'src/other.ts', line: 11, range: { startLine: 11, endLine: 11 }, edgeKind: 'extends', srcSymbol: 'StrictStrategy' })
+    ], { maxTokens: 10 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(10)
+    expect(output).toContain('implementers_omitted=1')
+    expect(output).not.toContain('src/other.ts')
+  })
+})
+
+describe('formatMcpImpact budgeted output', () => {
+  it('renders bounded impact notes and keeps a truncation marker under tight budgets', () => {
+    const output = formatMcpImpact(makeImpactResult({
+      nodes: [
+        {
+          name: 'handleRequest',
+          file: 'src/auth.ts',
+          range: { startLine: 10, endLine: 10 },
+          line: 10,
+          snippet: `  return verifyToken(token, '${'x'.repeat(120)}')`,
+          srcSymbol: 'handleRequest',
+          depth: 2,
+          edgeKind: 'call',
+          resolution: 'name-only'
+        },
+        {
+          name: 'runApp',
+          file: 'src/app.ts',
+          range: { startLine: 4, endLine: 4 },
+          line: 4,
+          snippet: '  return handleRequest(token)',
+          srcSymbol: 'runApp',
+          depth: 3,
+          edgeKind: 'call',
+          resolution: 'import-resolved'
+        }
+      ],
+      depthCapped: true,
+      nodesCapped: true,
+      impactTruncated: true,
+      depthLimit: 2,
+      maxNodes: 50
+    }), { maxTokens: 28 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(28)
+    expect(output).toContain('approx:name-only')
+    expect(output).toContain('impact_truncated=true')
+    expect(output).toContain('depth_capped=2')
+    expect(output).toContain('nodes_capped=50')
+  })
+})
+
 describe('formatMcpSymbols budgeted output', () => {
   it('preserves no_symbols and under-budget output byte-for-byte', () => {
     const definitions = [makeSymbol()]
@@ -584,6 +963,29 @@ describe('formatMcpSymbols budgeted output', () => {
 
     expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(5)
     expect(output).toContain('symbols_omitted=1')
+  })
+
+  it('adds a bounded relations block and relation omission marker when requested output is tight', () => {
+    const output = formatMcpSymbols([
+      makeSymbol({
+        relations: {
+          sites: Array.from({ length: 5 }, (_, index) => makeEdgeResult({
+            file: `src/callers/${index}.ts`,
+            line: index + 10,
+            range: { startLine: index + 10, endLine: index + 10 },
+            srcSymbol: `caller${index}`
+          })),
+          neighbors: [
+            { name: 'ParsedToken', file: 'src/auth.ts', range: { startLine: 1, endLine: 4 }, kind: 'interface' }
+          ],
+          omitted: 3
+        }
+      })
+    ], { maxTokens: 45 })
+
+    expect(Math.ceil(output.length / 4)).toBeLessThanOrEqual(45)
+    expect(output).toContain('relations:')
+    expect(output).toContain('relations_omitted=')
   })
 })
 

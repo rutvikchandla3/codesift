@@ -8,14 +8,50 @@ import Database from 'better-sqlite3'
 import { minimatch } from 'minimatch'
 import * as sqliteVec from 'sqlite-vec'
 
-import { buildChunks, type ChunkRecord } from './chunking.js'
+import { buildChunks, getCachedTypeScriptSourceFile, maskCStyleSyntax, type ChunkRecord } from './chunking.js'
 import { readConfig } from './config.js'
 import { DEFAULT_EMBEDDING_PROVIDER_ID, expandTermToOrGroup, getEmbeddingProvider, isCloudEmbeddingProvider, isLearnedEmbeddingProvider } from './embedding.js'
-import { isCodeLanguage, isDocumentationLanguage, isPythonLike, isTypeScriptLike } from './languages.js'
+import { isCodeLanguage, isDocumentationLanguage, isGoLike, isJavaLike, isPythonLike, isRubyLike, isRustLike, isTypeScriptLike } from './languages.js'
 import { resolveReranker } from './reranker.js'
 import { scanRepository, scanRepositoryManifest, type ScannedFile } from './scan.js'
 import { prepareForCloud } from './secret-scan.js'
-import { DEFAULT_SEARCH_K, type EmbeddingProvider, type FindSymbolOptions, type GrepHit, type GrepOptions, type IndexCompatibilitySnapshot, type IndexCompatibilityStatus, type ReadChunkOptions, type ReadRangeOptions, type RerankResult, type Repo, type RepoOptions, type RepoStaleReason, type RepoStatus, type RepoSyncStatus, type SearchHit, type SearchOptions, type SearchReasonTag, type StopWatching, type SymbolDefinition, type SymbolKind, type SymbolUsage, type SyncOptions, type SyncResult, type VectorSearchStatus, type WatchOptions } from './types.js'
+import {
+  DEFAULT_SEARCH_K,
+  type Edge,
+  type EdgeResult,
+  type EmbeddingProvider,
+  type FindEdgeOptions,
+  type FindImportersOptions,
+  type FindSymbolOptions,
+  type GrepHit,
+  type GrepOptions,
+  type ImpactNode,
+  type ImpactOptions,
+  type ImpactResult,
+  type IndexCompatibilitySnapshot,
+  type IndexCompatibilityStatus,
+  type ReadChunkOptions,
+  type ReadRangeOptions,
+  type Repo,
+  type RepoOptions,
+  type RepoStaleReason,
+  type RepoStatus,
+  type RepoSyncStatus,
+  type RerankResult,
+  type SearchHit,
+  type SearchOptions,
+  type SearchReasonTag,
+  type StopWatching,
+  type SymbolDefinition,
+  type SymbolKind,
+  type SymbolNeighbor,
+  type SymbolRelations,
+  type SymbolUsage,
+  type SyncOptions,
+  type SyncResult,
+  type VectorSearchStatus,
+  type WatchOptions
+} from './types.js'
 
 interface ChunkRow {
   id: string
@@ -68,6 +104,54 @@ interface RankedChunkRow {
   row: ChunkRow
   score: number
   reasons: Set<SearchReasonTag>
+}
+
+interface SourceSymbolRange {
+  startLine: number
+  endLine: number
+  symbol?: string
+  kind?: SymbolKind | null
+}
+
+interface EdgeUsageRow {
+  id: number
+  src_file: string
+  src_line: number
+  language: string | null
+  resolution: Edge['resolution']
+}
+
+interface EdgeResultRow {
+  id: number
+  src_file: string
+  src_line: number
+  src_symbol: string | null
+  edge_kind: Edge['edgeKind']
+  resolution: Edge['resolution']
+  language: string | null
+}
+
+interface ImpactNodeRow extends EdgeResultRow {
+  name: string
+  depth: number
+}
+
+interface EdgeBinding {
+  dstName: string
+  dstFile?: string
+  resolution: Edge['resolution']
+}
+
+interface DefinitionEdgeTarget {
+  names: string[]
+  resolutionMode: Edge['resolution']
+  file?: string
+}
+
+interface ReadRowsResult<T> {
+  items: T[]
+  tokenTruncated: boolean
+  readFailures: number
 }
 
 interface IndexedFileRow {
@@ -128,7 +212,7 @@ interface SyncApplyContext {
   completedAt: string
 }
 
-const SCHEMA_VERSION = '7'
+const SCHEMA_VERSION = '8'
 const DEFAULT_RRF_K = 60
 const DEFAULT_VECTOR_LIMIT = 50
 const DEFAULT_PATH_FILTERED_LIMIT = 200
@@ -155,6 +239,11 @@ const MIN_RELAXATION_ROWS = 3
 // Above this many exact rows the identifier collides across the repo, so picking
 // one body to inline would be misleading — keep every row compact instead.
 const FIND_SYMBOL_INLINE_MAX_EXACT_ROWS = 3
+const FIND_SYMBOL_RELATION_MAX_SITES = 5
+const FIND_SYMBOL_RELATION_MAX_NEIGHBORS = 4
+const DEFAULT_IMPACT_DEPTH = 2
+const DEFAULT_IMPACT_MAX_NODES = 50
+const HARD_MAX_IMPACT_BOUND = 50
 // When an identifier-shaped query collides across ≥2 definitions, single_best does
 // NOT collapse to one (that would hide the collision and silently pick a winner);
 // instead it returns up to this many candidates with an "ambiguous: N defs" hint so
@@ -653,56 +742,62 @@ export class SqliteRepo implements Repo {
       this.ensureIndexCompatibleForQueries(db)
 
       const kinds = normalizeKinds(options?.kind)
-
-    const exactWhere = ['lower(name) = lower(?)']
-    const exactParams: string[] = [name]
-    if (kinds.length > 0) {
-      exactWhere.push(`kind in (${kinds.map(() => '?').join(', ')})`)
-      exactParams.push(...kinds)
-    }
-    if (options?.pathGlob) {
-      exactWhere.push('codesift_minimatch(file_path, ?) = 1')
-      exactParams.push(options.pathGlob)
-    }
-
-    const exactRows = db
-      .prepare<unknown[], SymbolRow>(
-        `
-          select id, name, file_path, start_line, end_line, kind, signature, parent, language
-          from symbols
-          where ${exactWhere.join(' and ')}
-          order by file_path asc, start_line asc
-        `
-      )
-      .all(...exactParams)
-
-    const partialRows =
-      exactRows.length > 0
-        ? []
-        : selectPartialSymbolRows(db, name, kinds, options?.pathGlob)
-
-    const rows = [...exactRows, ...partialRows]
-
-    // One-call moat: inline the verbatim enclosing-symbol body for the top exact
-    // match when the lookup is unambiguous, so an identifier query resolves
-    // without a mandatory follow-up read. Disk-fresh, capped, never throws.
-    let topBody: string | undefined
-    if (
-      options?.withBody !== false &&
-      exactRows.length > 0 &&
-      exactRows.length <= FIND_SYMBOL_INLINE_MAX_EXACT_ROWS
-    ) {
-      const top = exactRows[0]!
-      try {
-        const source = await this.readRange(top.file_path, top.start_line, top.end_line)
-        const { body } = capInlineBody(source, chunkLocator(top.file_path, top.start_line, top.end_line))
-        if (body) {
-          topBody = body
-        }
-      } catch {
-        // A disk failure or out-of-range read leaves every row compact.
+      const exactWhere = ['lower(name) = lower(?)']
+      const exactParams: string[] = [name]
+      if (kinds.length > 0) {
+        exactWhere.push(`kind in (${kinds.map(() => '?').join(', ')})`)
+        exactParams.push(...kinds)
       }
-    }
+      if (options?.pathGlob) {
+        exactWhere.push('codesift_minimatch(file_path, ?) = 1')
+        exactParams.push(options.pathGlob)
+      }
+
+      const exactRows = db
+        .prepare<unknown[], SymbolRow>(
+          `
+            select id, name, file_path, start_line, end_line, kind, signature, parent, language
+            from symbols
+            where ${exactWhere.join(' and ')}
+            order by file_path asc, start_line asc
+          `
+        )
+        .all(...exactParams)
+
+      const partialRows =
+        exactRows.length > 0
+          ? []
+          : selectPartialSymbolRows(db, name, kinds, options?.pathGlob)
+
+      const rows = [...exactRows, ...partialRows]
+
+      const canEnrichTopExactRow = exactRows.length > 0 && exactRows.length <= FIND_SYMBOL_INLINE_MAX_EXACT_ROWS
+
+      // One-call moat: inline the verbatim enclosing-symbol body for the top exact
+      // match when the lookup is unambiguous, so an identifier query resolves
+      // without a mandatory follow-up read. Disk-fresh, capped, never throws.
+      let topBody: string | undefined
+      if (options?.withBody !== false && canEnrichTopExactRow) {
+        const top = exactRows[0]!
+        try {
+          const source = await this.readRange(top.file_path, top.start_line, top.end_line)
+          const { body } = capInlineBody(source, chunkLocator(top.file_path, top.start_line, top.end_line))
+          if (body) {
+            topBody = body
+          }
+        } catch {
+          // A disk failure or out-of-range read leaves every row compact.
+        }
+      }
+
+      let topRelations: SymbolRelations | undefined
+      if (options?.withCallers === true && canEnrichTopExactRow) {
+        try {
+          topRelations = await this.readFindSymbolRelations(db, exactRows[0]!)
+        } catch {
+          // Relation bundling is best-effort and must never fail the base lookup.
+        }
+      }
 
       return rows.map((row, index) => {
         const definition: SymbolDefinition = {
@@ -728,9 +823,14 @@ export class SqliteRepo implements Repo {
           definition.language = row.language
         }
 
-        // Only the top exact row (rows[0] when exactRows is non-empty) carries a body.
+        // Only the top exact row (rows[0] when exactRows is non-empty) carries
+        // the optional single-call enrichments.
         if (index === 0 && topBody !== undefined) {
           definition.body = topBody
+        }
+
+        if (index === 0 && topRelations !== undefined) {
+          definition.relations = topRelations
         }
 
         return definition
@@ -738,6 +838,192 @@ export class SqliteRepo implements Repo {
     } finally {
       releaseDatabase()
     }
+  }
+
+  async findCallers(name: string, options?: FindEdgeOptions): Promise<EdgeResult[]> {
+    return this.findDefinitionEdges(name, options, ['call'], true)
+  }
+
+  async findReferences(name: string, options?: FindEdgeOptions): Promise<EdgeResult[]> {
+    return this.findDefinitionEdges(name, options, ['call', 'ref'], false)
+  }
+
+  async findImplementers(name: string, options?: FindEdgeOptions): Promise<EdgeResult[]> {
+    return this.findDefinitionEdges(name, options, ['implements', 'extends'], false)
+  }
+
+  async findImporters(file: string, options?: FindImportersOptions): Promise<EdgeResult[]> {
+    if (!file.trim() || !existsSync(this.indexPath)) {
+      return []
+    }
+
+    const releaseDatabase = await this.enterDatabaseUser()
+    let rows: EdgeResultRow[] = []
+    try {
+      const db = this.openDatabase()
+      this.ensureIndexCompatibleForQueries(db)
+      rows = selectImporterEdgeRows(db, file)
+    } finally {
+      releaseDatabase()
+    }
+
+    return (await readEdgeResultsFromRows(this.root, rows, options?.maxTokens)).items
+  }
+
+  async impact(name: string, options?: ImpactOptions): Promise<ImpactResult> {
+    const depthLimit = normalizeImpactDepth(options?.depth)
+    const maxNodes = normalizeImpactMaxNodes(options?.maxNodes)
+    if (!name.trim() || !existsSync(this.indexPath)) {
+      return { nodes: [], depthLimit, maxNodes }
+    }
+
+    const releaseDatabase = await this.enterDatabaseUser()
+    let rows: ImpactNodeRow[] = []
+    let depthCapped = false
+    let nodesCapped = false
+    try {
+      const db = this.openDatabase()
+      this.ensureIndexCompatibleForQueries(db)
+
+      const initialDefinitions = selectExactDefinitionRows(db, name, normalizeKinds(options?.kind), options?.pathGlob)
+      if (initialDefinitions.length === 0) {
+        return { nodes: [], depthLimit, maxNodes }
+      }
+
+      const defaultExportCache = new Map<string, Promise<Set<string>>>()
+      const queue: Array<{ name: string; targetFiles: string[]; depth: number }> = [
+        { name, targetFiles: [...new Set(initialDefinitions.map((definition) => definition.file_path))], depth: 0 }
+      ]
+      const visitedTargets = new Set(initialDefinitions.map((definition) => `${definition.name.toLowerCase()}\u0000${definition.file_path}`))
+
+      while (queue.length > 0 && rows.length < maxNodes) {
+        const current = queue.shift()!
+        const remainingNodes = maxNodes - rows.length
+        const currentTargets = await resolveDefinitionEdgeTargetsForNameAndFiles(
+          db,
+          this.root,
+          current.name,
+          current.targetFiles,
+          defaultExportCache
+        )
+        if (currentTargets.length === 0) {
+          continue
+        }
+
+        const edgeRows = selectDefinitionEdgeRows(db, currentTargets, ['call'], true, remainingNodes + 1)
+
+        if (edgeRows.length > remainingNodes) {
+          nodesCapped = true
+        }
+
+        for (const edgeRow of edgeRows.slice(0, remainingNodes)) {
+          const nodeName = edgeRow.src_symbol?.trim() || 'top-level'
+          rows.push({ ...edgeRow, name: nodeName, depth: current.depth })
+
+          if (current.depth >= depthLimit) {
+            if (edgeRow.src_symbol) {
+              depthCapped = true
+            }
+            continue
+          }
+
+          if (!edgeRow.src_symbol) {
+            continue
+          }
+
+          const nextKey = `${edgeRow.src_symbol.toLowerCase()}\u0000${edgeRow.src_file}`
+          if (visitedTargets.has(nextKey)) {
+            continue
+          }
+
+          visitedTargets.add(nextKey)
+          queue.push({
+            name: edgeRow.src_symbol,
+            targetFiles: [edgeRow.src_file],
+            depth: current.depth + 1
+          })
+        }
+
+        if (nodesCapped) {
+          break
+        }
+      }
+
+      if (queue.length > 0) {
+        nodesCapped = true
+      }
+    } finally {
+      releaseDatabase()
+    }
+
+    const { items: nodes, tokenTruncated } = await readImpactNodesFromRows(this.root, rows, options?.maxTokens)
+    return {
+      nodes,
+      impactTruncated: nodesCapped || tokenTruncated,
+      depthCapped,
+      nodesCapped,
+      depthLimit,
+      maxNodes
+    }
+  }
+
+  private async readFindSymbolRelations(db: Database.Database, definition: SymbolRow): Promise<SymbolRelations | undefined> {
+    const targets = await resolveDefinitionEdgeTargets(this.root, [definition])
+    const siteRows = selectDefinitionEdgeRows(db, targets, ['call', 'ref'], true, FIND_SYMBOL_RELATION_MAX_SITES)
+    const { items: sites } = await readEdgeResultsFromRows(this.root, siteRows, undefined)
+    const totalSites = countDefinitionEdgeRows(db, targets, ['call', 'ref'])
+
+    const neighborRows = selectSameFileNeighborRows(
+      db,
+      definition.file_path,
+      definition.id,
+      definition.start_line,
+      FIND_SYMBOL_RELATION_MAX_NEIGHBORS
+    )
+    const neighbors = neighborRows.map((row) => buildSymbolNeighbor(row))
+    const totalNeighbors = countSameFileNeighborRows(db, definition.file_path, definition.id)
+    const omitted = Math.max(0, totalSites - siteRows.length) + Math.max(0, totalNeighbors - neighbors.length)
+
+    if (sites.length === 0 && neighbors.length === 0 && omitted === 0) {
+      return undefined
+    }
+
+    const relations: SymbolRelations = { sites, neighbors }
+    if (omitted > 0) {
+      relations.omitted = omitted
+    }
+
+    return relations
+  }
+
+  private async findDefinitionEdges(
+    name: string,
+    options: FindEdgeOptions | undefined,
+    edgeKinds: ReadonlyArray<Edge['edgeKind']>,
+    preferCallsFirst: boolean
+  ): Promise<EdgeResult[]> {
+    if (!name.trim() || !existsSync(this.indexPath)) {
+      return []
+    }
+
+    const releaseDatabase = await this.enterDatabaseUser()
+    let rows: EdgeResultRow[] = []
+    try {
+      const db = this.openDatabase()
+      this.ensureIndexCompatibleForQueries(db)
+
+      const definitions = selectExactDefinitionRows(db, name, normalizeKinds(options?.kind), options?.pathGlob)
+      if (definitions.length === 0) {
+        return []
+      }
+
+      const targets = await resolveDefinitionEdgeTargets(this.root, definitions)
+      rows = selectDefinitionEdgeRows(db, targets, edgeKinds, preferCallsFirst)
+    } finally {
+      releaseDatabase()
+    }
+
+    return (await readEdgeResultsFromRows(this.root, rows, options?.maxTokens)).items
   }
 
   async readChunk(id: string, options?: ReadChunkOptions): Promise<string> {
@@ -1210,6 +1496,22 @@ export class SqliteRepo implements Repo {
       create index if not exists idx_symbols_name on symbols(name);
       create index if not exists idx_symbols_kind on symbols(kind);
 
+      create table if not exists edges(
+        id integer primary key autoincrement,
+        src_file text not null references files(path) on delete cascade,
+        src_line integer not null,
+        src_symbol text,
+        dst_name text not null,
+        dst_file text,
+        edge_kind text not null,
+        resolution text not null,
+        language text
+      );
+
+      create index if not exists idx_edges_dst on edges(dst_name, dst_file);
+      create index if not exists idx_edges_src on edges(src_file);
+      create index if not exists idx_edges_kind on edges(edge_kind);
+
       create table if not exists embedding_cache(
         provider_id text not null,
         provider_dims integer not null,
@@ -1228,6 +1530,7 @@ export class SqliteRepo implements Repo {
   private clearIndex(db: Database.Database): void {
     db.exec(`
       delete from symbols;
+      delete from edges;
       delete from chunks_fts;
       delete from chunks;
       delete from files;
@@ -1372,6 +1675,12 @@ function applySyncChanges(db: Database.Database, context: SyncApplyContext): voi
       values (?, ?, ?, ?, ?, ?, ?, ?)
     `
   )
+  const insertEdge = db.prepare(
+    `
+      insert into edges(src_file, src_line, src_symbol, dst_name, dst_file, edge_kind, resolution, language)
+      values (?, ?, ?, ?, ?, ?, ?, ?)
+    `
+  )
   const upsertEmbeddingCache = db.prepare(
     `
       insert into embedding_cache(provider_id, provider_dims, model_version, content_hash, embedding, updated_at)
@@ -1389,9 +1698,12 @@ function applySyncChanges(db: Database.Database, context: SyncApplyContext): voi
   const selectChunkIdsByFile = db.prepare<[string], { id: string }>('select id from chunks where file_path = ?')
   const deleteChunkFts = db.prepare<[string]>('delete from chunks_fts where chunk_id = ?')
   const deleteSymbolsByFile = db.prepare<[string]>('delete from symbols where file_path = ?')
+  const deleteEdgesBySrcFile = db.prepare<[string]>('delete from edges where src_file = ?')
+  const deleteEdgesByDstFile = db.prepare<[string]>('delete from edges where dst_file = ?')
   const deleteChunksByFile = db.prepare<[string]>('delete from chunks where file_path = ?')
   const deleteFile = db.prepare<[string]>('delete from files where path = ?')
   const replacementPaths = [...context.diff.removedPaths, ...context.diff.changedFiles.map((file) => file.relativePath)]
+  const symbolRangesByFile = groupSymbolRangesByFile(context.embeddedChunks)
 
   db.transaction(() => {
     for (const filePath of replacementPaths) {
@@ -1400,8 +1712,13 @@ function applySyncChanges(db: Database.Database, context: SyncApplyContext): voi
       }
 
       deleteSymbolsByFile.run(filePath)
+      deleteEdgesBySrcFile.run(filePath)
       deleteChunksByFile.run(filePath)
       deleteFile.run(filePath)
+    }
+
+    for (const removedPath of context.diff.removedPaths) {
+      deleteEdgesByDstFile.run(removedPath)
     }
 
     for (const file of context.diff.touchedFiles) {
@@ -1410,6 +1727,19 @@ function applySyncChanges(db: Database.Database, context: SyncApplyContext): voi
 
     for (const file of context.diff.changedFiles) {
       insertFile.run(fileToManifestRow(file))
+
+      for (const edge of extractEdges(file, symbolRangesByFile.get(file.relativePath) ?? [])) {
+        insertEdge.run(
+          edge.srcFile,
+          edge.srcLine,
+          edge.srcSymbol ?? null,
+          edge.dstName,
+          edge.dstFile ?? null,
+          edge.edgeKind,
+          edge.resolution,
+          edge.language ?? null
+        )
+      }
     }
 
     for (const { row, embedding } of context.embeddedChunks) {
@@ -1472,6 +1802,43 @@ function applySyncChanges(db: Database.Database, context: SyncApplyContext): voi
       completedAt: context.completedAt
     })
   })()
+}
+
+function extractEdges(file: ScannedFile, symbolRanges: SourceSymbolRange[]): Edge[] {
+  if (isTypeScriptLike(file.language)) {
+    return extractTypeScriptEdges(file, symbolRanges)
+  }
+
+  if (isPythonLike(file.language)) {
+    return extractPythonEdges(file, symbolRanges)
+  }
+
+  if (isGoLike(file.language) || isJavaLike(file.language) || isRubyLike(file.language) || isRustLike(file.language)) {
+    return extractNameOnlyCallEdges(file, symbolRanges)
+  }
+
+  return []
+}
+
+function groupSymbolRangesByFile(records: EmbeddedChunkRecord[]): Map<string, SourceSymbolRange[]> {
+  const rangesByFile = new Map<string, SourceSymbolRange[]>()
+
+  for (const { row } of records) {
+    if (!row.symbol || !row.kind || row.kind === 'file') {
+      continue
+    }
+
+    const ranges = rangesByFile.get(row.file) ?? []
+    ranges.push({
+      startLine: row.startLine,
+      endLine: row.endLine,
+      symbol: row.symbol,
+      kind: row.kind
+    })
+    rangesByFile.set(row.file, ranges)
+  }
+
+  return rangesByFile
 }
 
 function fileToManifestRow(file: ScannedFile): IndexedFileRow {
@@ -2149,6 +2516,22 @@ function normalizeSearchTokenBudget(value: number | undefined): number | undefin
   return Math.floor(value)
 }
 
+function normalizeImpactDepth(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value < 0) {
+    return DEFAULT_IMPACT_DEPTH
+  }
+
+  return Math.min(Math.floor(value), HARD_MAX_IMPACT_BOUND)
+}
+
+function normalizeImpactMaxNodes(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_IMPACT_MAX_NODES
+  }
+
+  return Math.min(Math.floor(value), HARD_MAX_IMPACT_BOUND)
+}
+
 function estimateSearchHitTokens(row: ChunkRow, snippet: string): number {
   const header = `${row.file_path}:${row.start_line}-${row.end_line} ${row.symbol ?? ''} ${row.kind ?? ''}`
   // The compact renderer emits up to COMPACT_SNIPPET_MAX_LINES lines, each with a
@@ -2359,168 +2742,331 @@ async function attachUsagesToTopDefinitionHit(
   }
 }
 
+const MAX_ATTACHED_USAGES = 5
+
 async function findImportResolvedUsages(
   db: Database.Database,
   root: string,
   definition: SearchHit,
   options?: SearchOptions
 ): Promise<SymbolUsage[]> {
-  if (!definition.symbol || !definition.language) {
+  if (
+    !definition.symbol ||
+    !definition.language ||
+    (!isTypeScriptLike(definition.language) && !isPythonLike(definition.language))
+  ) {
     return []
   }
 
-  const candidateFiles = selectUsageCandidateFiles(db, definition.language, options?.pathGlob)
-  if (candidateFiles.length === 0) {
+  const targets = await resolveDefinitionEdgeTargets(root, [
+    {
+      name: definition.symbol,
+      file_path: definition.file,
+      language: definition.language
+    }
+  ])
+  if (targets.length === 0) {
     return []
   }
 
-  if (isTypeScriptLike(definition.language)) {
-    return findTypeScriptUsages(root, definition, candidateFiles)
-  }
+  const rows = selectDefinitionUsageRows(db, targets, {
+    excludedSrcFile: definition.file,
+    excludedStartLine: definition.range.startLine,
+    excludedEndLine: definition.range.endLine,
+    ...(options?.pathGlob ? { pathGlob: options.pathGlob } : {}),
+    limit: MAX_ATTACHED_USAGES
+  })
 
-  if (isPythonLike(definition.language)) {
-    return findPythonUsages(root, definition, candidateFiles)
-  }
-
-  return []
+  return readUsagesFromEdgeRows(root, rows)
 }
 
-function selectUsageCandidateFiles(db: Database.Database, language: string, pathGlob?: string): Array<{ path: string; language: string }> {
-  const family = isTypeScriptLike(language)
-    ? ['typescript', 'tsx', 'javascript', 'jsx']
-    : isPythonLike(language)
-      ? ['python']
-      : [language]
-
-  const whereClauses = [`language in (${family.map(() => '?').join(', ')})`]
-  const params: string[] = [...family]
-
-  if (pathGlob) {
-    whereClauses.push('codesift_minimatch(path, ?) = 1')
-    params.push(pathGlob)
-  }
-
-  return db
-    .prepare<unknown[], { path: string; language: string }>(
-      `
-        select path, language
-        from files
-        where ${whereClauses.join(' and ')}
-        order by path asc
-      `
-    )
-    .all(...params)
-}
-
-async function findTypeScriptUsages(
-  root: string,
-  definition: SearchHit,
-  candidateFiles: Array<{ path: string; language: string }>
-): Promise<SymbolUsage[]> {
+async function readUsagesFromEdgeRows(root: string, rows: EdgeUsageRow[]): Promise<SymbolUsage[]> {
+  const linesByFile = new Map<string, string[]>()
   const usages: SymbolUsage[] = []
-  const seen = new Set<string>()
 
-  for (const candidate of candidateFiles) {
-    if (usages.length >= 5) {
-      break
+  for (const row of rows) {
+    let lines = linesByFile.get(row.src_file)
+    if (!lines) {
+      try {
+        lines = splitLines(await readFile(resolve(root, row.src_file), 'utf8'))
+        linesByFile.set(row.src_file, lines)
+      } catch {
+        continue
+      }
     }
 
-    const absolutePath = resolve(root, candidate.path)
-    let content: string
-    try {
-      content = await readFile(absolutePath, 'utf8')
-    } catch {
+    const usage: SymbolUsage = {
+      file: row.src_file,
+      range: { startLine: row.src_line, endLine: row.src_line },
+      line: row.src_line,
+      snippet: (lines[row.src_line - 1] ?? '').trimEnd(),
+      resolution: row.resolution
+    }
+
+    if (row.language) {
+      usage.language = row.language
+    }
+
+    usages.push(usage)
+  }
+
+  return usages
+}
+
+function extractTypeScriptEdges(file: ScannedFile, symbolRanges: SourceSymbolRange[]): Edge[] {
+  const sourceFile =
+    getCachedTypeScriptSourceFile(file) ??
+    ts.createSourceFile(file.relativePath, file.content, ts.ScriptTarget.Latest, true, scriptKindFromPath(file.relativePath))
+  const directBindings = new Map<string, EdgeBinding>()
+  const namespaceBindings = new Map<string, EdgeBinding>()
+  const sameFileSymbols = collectSameFileSymbols(symbolRanges)
+  const scopeDeclarations = collectTypeScriptUsageScopeDeclarations(sourceFile)
+  const scopeStack: Array<Set<string>> = []
+  const edgesByKey = new Map<string, Edge>()
+
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement)) {
       continue
     }
 
-    const sourceFile = ts.createSourceFile(candidate.path, content, ts.ScriptTarget.Latest, true, scriptKindFromPath(candidate.path))
-    const directNames = new Set<string>()
-    const namespaceNames = new Set<string>()
-
-    if (candidate.path === definition.file) {
-      directNames.add(definition.symbol!)
+    const moduleSpecifier = ts.isStringLiteral(statement.moduleSpecifier) ? statement.moduleSpecifier.text : null
+    const dstFile = moduleSpecifier ? resolveTypeScriptModuleTarget(file, moduleSpecifier) : null
+    const clause = statement.importClause
+    if (!clause) {
+      continue
     }
 
-    for (const statement of sourceFile.statements) {
-      if (!ts.isImportDeclaration(statement)) {
-        continue
-      }
+    if (clause.name && dstFile) {
+      directBindings.set(clause.name.text, { dstName: 'default', dstFile, resolution: 'import-resolved' })
+      pushEdge(
+        edgesByKey,
+        buildEdge({
+          srcFile: file.relativePath,
+          srcLine: lineNumberForOffsetInSourceFile(sourceFile, clause.name.getStart(sourceFile)),
+          srcSymbol: selectEnclosingSourceSymbol(symbolRanges, lineNumberForOffsetInSourceFile(sourceFile, clause.name.getStart(sourceFile))),
+          dstName: 'default',
+          dstFile,
+          edgeKind: 'import',
+          resolution: 'import-resolved',
+          language: file.language
+        })
+      )
+    }
 
-      const moduleSpecifier = ts.isStringLiteral(statement.moduleSpecifier) ? statement.moduleSpecifier.text : null
-      if (!moduleSpecifier || !moduleSpecifierCouldResolveToFile(candidate.path, moduleSpecifier, definition.file)) {
-        continue
-      }
+    const namedBindings = clause.namedBindings
+    if (!namedBindings) {
+      continue
+    }
 
-      const clause = statement.importClause
-      if (!clause) {
-        continue
-      }
-
-      if (clause.name && definition.symbol === 'default') {
-        directNames.add(clause.name.text)
-      }
-
-      const namedBindings = clause.namedBindings
-      if (!namedBindings) {
-        continue
-      }
-
-      if (ts.isNamedImports(namedBindings)) {
-        for (const element of namedBindings.elements) {
-          const importedName = (element.propertyName ?? element.name).text
-          if (importedName === definition.symbol) {
-            directNames.add(element.name.text)
-          }
+    if (ts.isNamedImports(namedBindings)) {
+      for (const element of namedBindings.elements) {
+        const importedName = (element.propertyName ?? element.name).text
+        if (!dstFile) {
+          continue
         }
-      } else if (ts.isNamespaceImport(namedBindings)) {
-        namespaceNames.add(namedBindings.name.text)
-      }
-    }
 
-    if (directNames.size === 0 && namespaceNames.size === 0) {
+        directBindings.set(element.name.text, {
+          dstName: importedName,
+          dstFile,
+          resolution: 'import-resolved'
+        })
+        const srcLine = lineNumberForOffsetInSourceFile(sourceFile, element.name.getStart(sourceFile))
+        pushEdge(
+          edgesByKey,
+          buildEdge({
+            srcFile: file.relativePath,
+            srcLine,
+            srcSymbol: selectEnclosingSourceSymbol(symbolRanges, srcLine),
+            dstName: importedName,
+            dstFile,
+            edgeKind: 'import',
+            resolution: 'import-resolved',
+            language: file.language
+          })
+        )
+      }
       continue
     }
 
-    const lines = splitLines(content)
-    const lineStarts = buildLineStarts(content)
-    const recordUsage = (offset: number, lineNumberOverride?: number) => {
-      const lineNumber = lineNumberOverride ?? lineNumberForOffset(lineStarts, offset)
-      if (candidate.path === definition.file && lineNumber >= definition.range.startLine && lineNumber <= definition.range.endLine) {
-        return
-      }
-
-      const key = `${candidate.path}:${lineNumber}`
-      if (seen.has(key)) {
-        return
-      }
-      seen.add(key)
-
-      usages.push({
-        file: candidate.path,
-        range: { startLine: lineNumber, endLine: lineNumber },
-        line: lineNumber,
-        snippet: (lines[lineNumber - 1] ?? '').trimEnd(),
-        language: candidate.language,
+    if (ts.isNamespaceImport(namedBindings) && dstFile) {
+      namespaceBindings.set(namedBindings.name.text, {
+        dstName: '*',
+        dstFile,
         resolution: 'import-resolved'
       })
+      const srcLine = lineNumberForOffsetInSourceFile(sourceFile, namedBindings.name.getStart(sourceFile))
+      pushEdge(
+        edgesByKey,
+        buildEdge({
+          srcFile: file.relativePath,
+          srcLine,
+          srcSymbol: selectEnclosingSourceSymbol(symbolRanges, srcLine),
+          dstName: '*',
+          dstFile,
+          edgeKind: 'import',
+          resolution: 'import-resolved',
+          language: file.language
+        })
+      )
+    }
+  }
+
+  for (const statement of sourceFile.statements) {
+    if (!ts.isClassDeclaration(statement) && !ts.isInterfaceDeclaration(statement)) {
+      continue
     }
 
-    const visit = (node: ts.Node): void => {
-      if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) && namespaceNames.has(node.expression.text) && node.name.text === definition.symbol) {
-        recordUsage(node.name.getStart(sourceFile))
+    for (const clause of statement.heritageClauses ?? []) {
+      const edgeKind = clause.token === ts.SyntaxKind.ImplementsKeyword
+        ? 'implements'
+        : clause.token === ts.SyntaxKind.ExtendsKeyword
+          ? 'extends'
+          : null
+      if (!edgeKind) {
+        continue
       }
 
-      if (ts.isIdentifier(node) && directNames.has(node.text) && isUsageIdentifier(node)) {
-        recordUsage(node.getStart(sourceFile))
+      for (const typeNode of clause.types) {
+        const binding = resolveTypeScriptHeritageTarget(typeNode.expression, directBindings, namespaceBindings, sameFileSymbols, file)
+        if (!binding) {
+          continue
+        }
+
+        const srcLine = lineNumberForOffsetInSourceFile(sourceFile, typeNode.expression.getStart(sourceFile))
+        pushEdge(
+          edgesByKey,
+          buildEdge({
+            srcFile: file.relativePath,
+            srcLine,
+            srcSymbol: selectEnclosingSourceSymbol(symbolRanges, srcLine),
+            dstName: binding.dstName,
+            ...(binding.dstFile ? { dstFile: binding.dstFile } : {}),
+            edgeKind,
+            resolution: binding.resolution,
+            language: file.language
+          })
+        )
+      }
+    }
+  }
+
+  const visit = (node: ts.Node): void => {
+    const declarations = scopeDeclarations.get(node)
+    if (declarations) {
+      scopeStack.push(declarations)
+    }
+
+    try {
+      if ((ts.isPropertyAccessExpression(node) || ts.isPropertyAccessChain(node)) && ts.isIdentifier(node.expression)) {
+        const binding = namespaceBindings.get(node.expression.text)
+        if (binding?.dstFile) {
+          const srcLine = lineNumberForOffsetInSourceFile(sourceFile, node.name.getStart(sourceFile))
+          pushEdge(
+            edgesByKey,
+            buildEdge({
+              srcFile: file.relativePath,
+              srcLine,
+              srcSymbol: selectEnclosingSourceSymbol(symbolRanges, srcLine),
+              dstName: node.name.text,
+              dstFile: binding.dstFile,
+              edgeKind: isTypeScriptCallTarget(node) ? 'call' : 'ref',
+              resolution: binding.resolution,
+              language: file.language
+            })
+          )
+        }
+      }
+
+      if (ts.isIdentifier(node) && isUsageIdentifier(node)) {
+        const binding = directBindings.get(node.text)
+        const srcLine = lineNumberForOffsetInSourceFile(sourceFile, node.getStart(sourceFile))
+        if (binding?.dstFile) {
+          pushEdge(
+            edgesByKey,
+            buildEdge({
+              srcFile: file.relativePath,
+              srcLine,
+              srcSymbol: selectEnclosingSourceSymbol(symbolRanges, srcLine),
+              dstName: binding.dstName,
+              dstFile: binding.dstFile,
+              edgeKind: isTypeScriptCallTarget(node) ? 'call' : 'ref',
+              resolution: binding.resolution,
+              language: file.language
+            })
+          )
+        } else if (sameFileSymbols.has(node.text) && !isTypeScriptSameFileReferenceShadowed(node.text, scopeStack)) {
+          pushEdge(
+            edgesByKey,
+            buildEdge({
+              srcFile: file.relativePath,
+              srcLine,
+              srcSymbol: selectEnclosingSourceSymbol(symbolRanges, srcLine),
+              dstName: node.text,
+              dstFile: file.relativePath,
+              edgeKind: isTypeScriptCallTarget(node) ? 'call' : 'ref',
+              resolution: 'import-resolved',
+              language: file.language
+            })
+          )
+        }
       }
 
       ts.forEachChild(node, visit)
+    } finally {
+      if (declarations) {
+        scopeStack.pop()
+      }
     }
-
-    visit(sourceFile)
   }
 
-  return usages.slice(0, 5)
+  visit(sourceFile)
+  return [...edgesByKey.values()]
+}
+
+function resolveTypeScriptHeritageTarget(
+  expression: ts.Expression,
+  directBindings: Map<string, EdgeBinding>,
+  namespaceBindings: Map<string, EdgeBinding>,
+  sameFileSymbols: Set<string>,
+  file: ScannedFile
+): EdgeBinding | undefined {
+  if (ts.isIdentifier(expression)) {
+    const binding = directBindings.get(expression.text)
+    if (binding?.dstFile) {
+      return binding
+    }
+
+    if (sameFileSymbols.has(expression.text)) {
+      return {
+        dstName: expression.text,
+        dstFile: file.relativePath,
+        resolution: 'import-resolved'
+      }
+    }
+
+    return {
+      dstName: expression.text,
+      resolution: 'name-only'
+    }
+  }
+
+  if ((ts.isPropertyAccessExpression(expression) || ts.isPropertyAccessChain(expression)) && ts.isIdentifier(expression.expression)) {
+    const binding = namespaceBindings.get(expression.expression.text)
+    if (binding?.dstFile) {
+      return {
+        dstName: expression.name.text,
+        dstFile: binding.dstFile,
+        resolution: binding.resolution
+      }
+    }
+
+    return {
+      dstName: expression.name.text,
+      resolution: 'name-only'
+    }
+  }
+
+  return undefined
 }
 
 function isUsageIdentifier(node: ts.Identifier): boolean {
@@ -2541,7 +3087,7 @@ function isUsageIdentifier(node: ts.Identifier): boolean {
     return false
   }
 
-  if (ts.isPropertyAccessExpression(parent) && parent.name === node) {
+  if ((ts.isPropertyAccessExpression(parent) || ts.isPropertyAccessChain(parent)) && parent.name === node) {
     return false
   }
 
@@ -2556,115 +3102,515 @@ function isUsageIdentifier(node: ts.Identifier): boolean {
   return true
 }
 
-async function findPythonUsages(
-  root: string,
-  definition: SearchHit,
-  candidateFiles: Array<{ path: string; language: string }>
-): Promise<SymbolUsage[]> {
-  const usages: SymbolUsage[] = []
-  const seen = new Set<string>()
-
-  for (const candidate of candidateFiles) {
-    if (usages.length >= 5) {
-      break
-    }
-
-    const absolutePath = resolve(root, candidate.path)
-    let content: string
-    try {
-      content = await readFile(absolutePath, 'utf8')
-    } catch {
-      continue
-    }
-
-    const lines = splitLines(content)
-    const maskedLines = maskPythonLines(lines)
-    const directNames = new Set<string>()
-    const moduleAliases = new Set<string>()
-
-    if (candidate.path === definition.file) {
-      directNames.add(definition.symbol!)
-    }
-
-    for (let index = 0; index < lines.length; index += 1) {
-      const rawLine = lines[index] ?? ''
-      const trimmed = rawLine.trim()
-      if (!trimmed) {
-        continue
-      }
-
-      const fromImport = trimmed.match(/^from\s+([.A-Za-z0-9_]+)\s+import\s+(.+)$/)
-      if (fromImport && pythonModuleCouldResolveToFile(candidate.path, fromImport[1]!, definition.file)) {
-        for (const part of fromImport[2]!.split(',')) {
-          const match = part.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?$/)
-          const importedName = match?.[1]
-          if (importedName && importedName === definition.symbol) {
-            directNames.add(match?.[2] ?? importedName)
-          }
-        }
-      }
-
-      const importAlias = trimmed.match(/^import\s+([.A-Za-z0-9_]+)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)$/)
-      if (importAlias && pythonModuleCouldResolveToFile(candidate.path, importAlias[1]!, definition.file)) {
-        moduleAliases.add(importAlias[2]!)
-      }
-    }
-
-    if (directNames.size === 0 && moduleAliases.size === 0) {
-      continue
-    }
-
-    for (let index = 0; index < maskedLines.length; index += 1) {
-      const lineNumber = index + 1
-      if (candidate.path === definition.file && lineNumber >= definition.range.startLine && lineNumber <= definition.range.endLine) {
-        continue
-      }
-
-      const rawLine = lines[index]?.trim() ?? ''
-      if (/^(from\s+.+\s+import\s+.+|import\s+.+)$/.test(rawLine)) {
-        continue
-      }
-
-      const masked = maskedLines[index] ?? ''
-      const directMatch = [...directNames].some((name) => new RegExp(`\\b${escapeRegExp(name)}\\b`).test(masked))
-      const moduleMatch = [...moduleAliases].some((alias) => new RegExp(`\\b${escapeRegExp(alias)}\\.${escapeRegExp(definition.symbol!)}\\b`).test(masked))
-      if (!directMatch && !moduleMatch) {
-        continue
-      }
-
-      const key = `${candidate.path}:${lineNumber}`
-      if (seen.has(key)) {
-        continue
-      }
-      seen.add(key)
-
-      usages.push({
-        file: candidate.path,
-        range: { startLine: lineNumber, endLine: lineNumber },
-        line: lineNumber,
-        snippet: (lines[index] ?? '').trimEnd(),
-        language: candidate.language,
-        resolution: 'import-resolved'
-      })
-
-      if (usages.length >= 5) {
-        break
-      }
-    }
-  }
-
-  return usages.slice(0, 5)
-}
-
-function moduleSpecifierCouldResolveToFile(importerFile: string, moduleSpecifier: string, targetFile: string): boolean {
-  if (!moduleSpecifier.startsWith('.')) {
+function isTypeScriptCallTarget(node: ts.Node): boolean {
+  const parent = node.parent
+  if (!parent) {
     return false
   }
 
+  return (
+    ((ts.isCallExpression(parent) || ts.isCallChain(parent)) && parent.expression === node) ||
+    (ts.isNewExpression(parent) && parent.expression === node) ||
+    (ts.isTaggedTemplateExpression(parent) && parent.tag === node)
+  )
+}
+
+function extractPythonEdges(file: ScannedFile, symbolRanges: SourceSymbolRange[]): Edge[] {
+  const lines = splitLines(file.content)
+  const maskedLines = maskPythonLines(lines)
+  const edgesByKey = new Map<string, Edge>()
+  const directBindings = new Map<string, EdgeBinding>()
+  const moduleBindings = new Map<string, EdgeBinding>()
+
+  for (const symbol of collectSameFileSymbols(symbolRanges)) {
+    directBindings.set(symbol, {
+      dstName: symbol,
+      dstFile: file.relativePath,
+      resolution: 'import-resolved'
+    })
+  }
+
+  for (let index = 0; index < maskedLines.length; index += 1) {
+    const lineNumber = index + 1
+    const trimmed = maskedLines[index]?.trim() ?? ''
+    if (!trimmed) {
+      continue
+    }
+
+    const fromImport = trimmed.match(/^from\s+([.A-Za-z0-9_]+)\s+import\s+(.+)$/)
+    if (fromImport) {
+      const dstFile = resolvePythonModuleTarget(file, fromImport[1]!)
+      for (const part of fromImport[2]!.split(',')) {
+        const match = part.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?$/)
+        const importedName = match?.[1]
+        if (!importedName) {
+          continue
+        }
+
+        directBindings.set(match?.[2] ?? importedName, {
+          dstName: importedName,
+          ...(dstFile ? { dstFile } : {}),
+          resolution: dstFile ? 'import-resolved' : 'name-only'
+        })
+      }
+      continue
+    }
+
+    const importMatch = trimmed.match(/^import\s+([.A-Za-z0-9_]+)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?$/)
+    if (importMatch) {
+      const dstFile = resolvePythonModuleTarget(file, importMatch[1]!)
+      // Known limitation: `import a.b.c` still keys the top-level alias only; deeper dotted-module binding stays approximate noise.
+      const localName = importMatch[2] ?? importMatch[1]!.split('.')[0] ?? ''
+      if (localName) {
+        moduleBindings.set(localName, {
+          dstName: '*',
+          ...(dstFile ? { dstFile } : {}),
+          resolution: dstFile ? 'import-resolved' : 'name-only'
+        })
+      }
+    }
+  }
+
+  for (let index = 0; index < maskedLines.length; index += 1) {
+    const lineNumber = index + 1
+    const masked = maskedLines[index] ?? ''
+    const trimmed = masked.trim()
+    if (!trimmed || /^(from\s+.+\s+import\s+.+|import\s+.+|class\s+.+|def\s+.+)$/.test(trimmed)) {
+      continue
+    }
+
+    for (const [alias, binding] of moduleBindings) {
+      const pattern = new RegExp(`\\b${escapeRegExp(alias)}\\.([A-Za-z_][A-Za-z0-9_]*)\\b`, 'g')
+      for (const match of masked.matchAll(pattern)) {
+        const propertyName = match[1]
+        const matchText = match[0]
+        const matchIndex = match.index ?? -1
+        if (!propertyName || matchIndex < 0) {
+          continue
+        }
+
+        const edgeKind = /^\s*\(/.test(masked.slice(matchIndex + matchText.length)) ? 'call' : 'ref'
+        pushEdge(
+          edgesByKey,
+          buildEdge({
+            srcFile: file.relativePath,
+            srcLine: lineNumber,
+            srcSymbol: selectEnclosingSourceSymbol(symbolRanges, lineNumber),
+            dstName: propertyName,
+            ...(binding.dstFile ? { dstFile: binding.dstFile } : {}),
+            edgeKind,
+            resolution: binding.resolution,
+            language: file.language
+          })
+        )
+      }
+    }
+
+    for (const [localName, binding] of directBindings) {
+      const pattern = new RegExp(`\\b${escapeRegExp(localName)}\\b`, 'g')
+      for (const match of masked.matchAll(pattern)) {
+        const matchText = match[0]
+        const matchIndex = match.index ?? -1
+        if (!matchText || matchIndex < 0) {
+          continue
+        }
+
+        if (matchIndex > 0 && masked[matchIndex - 1] === '.') {
+          continue
+        }
+
+        const edgeKind = /^\s*\(/.test(masked.slice(matchIndex + matchText.length)) ? 'call' : 'ref'
+        pushEdge(
+          edgesByKey,
+          buildEdge({
+            srcFile: file.relativePath,
+            srcLine: lineNumber,
+            srcSymbol: selectEnclosingSourceSymbol(symbolRanges, lineNumber),
+            dstName: binding.dstName,
+            ...(binding.dstFile ? { dstFile: binding.dstFile } : {}),
+            edgeKind,
+            resolution: binding.resolution,
+            language: file.language
+          })
+        )
+      }
+    }
+  }
+
+  return [...edgesByKey.values()]
+}
+
+function extractNameOnlyCallEdges(file: ScannedFile, symbolRanges: SourceSymbolRange[]): Edge[] {
+  const lines = splitLines(file.content)
+  const maskedLines = isRubyLike(file.language) ? maskRubySyntaxLines(lines) : maskCStyleSyntax(lines)
+  const callPattern = callPatternForNameOnlyLanguage(file.language)
+  const edgesByKey = new Map<string, Edge>()
+
+  for (let index = 0; index < maskedLines.length; index += 1) {
+    const lineNumber = index + 1
+    const masked = maskedLines[index] ?? ''
+    const trimmed = masked.trim()
+    if (!trimmed || shouldSkipNameOnlyCallLine(file.language, trimmed)) {
+      continue
+    }
+
+    const enclosing = selectEnclosingSourceSymbolRange(symbolRanges, lineNumber)
+    if (isGoLike(file.language) && enclosing?.kind && !['function', 'method', 'variable', 'constant'].includes(enclosing.kind)) {
+      continue
+    }
+
+    for (const match of masked.matchAll(callPattern)) {
+      const callee = match[1]
+      const matchIndex = match.index ?? -1
+      if (!callee || matchIndex < 0 || isNameOnlyCallKeyword(file.language, callee)) {
+        continue
+      }
+
+      if (
+        enclosing?.symbol === callee &&
+        enclosing.startLine === lineNumber &&
+        (enclosing.kind === 'function' || enclosing.kind === 'method')
+      ) {
+        continue
+      }
+
+      pushEdge(
+        edgesByKey,
+        buildEdge({
+          srcFile: file.relativePath,
+          srcLine: lineNumber,
+          srcSymbol: enclosing?.symbol,
+          dstName: callee,
+          edgeKind: 'call',
+          resolution: 'name-only',
+          language: file.language
+        })
+      )
+    }
+  }
+
+  return [...edgesByKey.values()]
+}
+
+function callPatternForNameOnlyLanguage(language: string): RegExp {
+  if (isJavaLike(language)) {
+    return /([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g
+  }
+
+  if (isRubyLike(language)) {
+    return /([A-Za-z_][A-Za-z0-9_!?=]*)\s*\(/g
+  }
+
+  return /([A-Za-z_][A-Za-z0-9_]*)\s*\(/g
+}
+
+function shouldSkipNameOnlyCallLine(language: string, trimmed: string): boolean {
+  if (isGoLike(language)) {
+    return /^(?:package|import)\b/.test(trimmed)
+  }
+
+  if (isJavaLike(language)) {
+    return /^(?:package|import)\b/.test(trimmed) || trimmed.startsWith('@')
+  }
+
+  if (isRubyLike(language)) {
+    return /^(?:class|module|def)\b/.test(trimmed)
+  }
+
+  if (isRustLike(language)) {
+    return /^(?:use|mod)\b/.test(trimmed) || trimmed.startsWith('#[')
+  }
+
+  return false
+}
+
+function isNameOnlyCallKeyword(language: string, callee: string): boolean {
+  if (isGoLike(language)) {
+    return GO_NAME_ONLY_CALL_KEYWORDS.has(callee)
+  }
+
+  if (isJavaLike(language)) {
+    return JAVA_NAME_ONLY_CALL_KEYWORDS.has(callee)
+  }
+
+  if (isRubyLike(language)) {
+    return RUBY_NAME_ONLY_CALL_KEYWORDS.has(callee)
+  }
+
+  if (isRustLike(language)) {
+    return RUST_NAME_ONLY_CALL_KEYWORDS.has(callee)
+  }
+
+  return false
+}
+
+const GO_NAME_ONLY_CALL_KEYWORDS = new Set(['if', 'for', 'switch', 'select'])
+const JAVA_NAME_ONLY_CALL_KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'try', 'synchronized', 'do'])
+const RUBY_NAME_ONLY_CALL_KEYWORDS = new Set(['if', 'unless', 'while', 'until', 'for', 'case'])
+const RUST_NAME_ONLY_CALL_KEYWORDS = new Set(['if', 'for', 'while', 'match', 'loop'])
+
+// Known limitation: Ruby heredocs, `%w`, and `=begin` blocks are only partially masked here; downstream Ruby edges stay name-only/approximate.
+function maskRubySyntaxLines(lines: string[]): string[] {
+  const maskedLines: string[] = []
+
+  for (const line of lines) {
+    let masked = ''
+    let stringQuote: '"' | "'" | null = null
+    let escaped = false
+
+    for (let index = 0; index < line.length; index += 1) {
+      const char = line[index]!
+
+      if (stringQuote) {
+        if (escaped) {
+          escaped = false
+          masked += ' '
+          continue
+        }
+
+        if (char === '\\') {
+          escaped = true
+          masked += ' '
+          continue
+        }
+
+        if (char === stringQuote) {
+          stringQuote = null
+        }
+
+        masked += ' '
+        continue
+      }
+
+      if (char === '#') {
+        masked += ' '.repeat(line.length - index)
+        break
+      }
+
+      if (char === '"' || char === "'") {
+        stringQuote = char
+        masked += ' '
+        continue
+      }
+
+      masked += char
+    }
+
+    maskedLines.push(masked)
+  }
+
+  return maskedLines
+}
+
+function collectSameFileSymbols(symbolRanges: SourceSymbolRange[]): Set<string> {
+  return new Set(symbolRanges.flatMap((range) => (range.symbol ? [range.symbol] : [])))
+}
+
+function collectTypeScriptUsageScopeDeclarations(sourceFile: ts.SourceFile): Map<ts.Node, Set<string>> {
+  const declarationsByScope = new Map<ts.Node, Set<string>>()
+
+  const addToScope = (scope: ts.Node | undefined, name: string | undefined): void => {
+    if (!scope || !name || ts.isSourceFile(scope)) {
+      return
+    }
+
+    const declarations = declarationsByScope.get(scope) ?? new Set<string>()
+    declarations.add(name)
+    declarationsByScope.set(scope, declarations)
+  }
+
+  const visit = (node: ts.Node): void => {
+    if (ts.isParameter(node)) {
+      for (const name of collectTypeScriptBindingNames(node.name)) {
+        addToScope(findNearestTypeScriptFunctionScope(node), name)
+      }
+    } else if (ts.isVariableDeclaration(node)) {
+      const declarationList = ts.isVariableDeclarationList(node.parent) ? node.parent : undefined
+      const scope = declarationList && (declarationList.flags & ts.NodeFlags.BlockScoped)
+        ? findNearestTypeScriptBlockScope(node)
+        : findNearestTypeScriptFunctionScope(node)
+      for (const name of collectTypeScriptBindingNames(node.name)) {
+        addToScope(scope, name)
+      }
+    } else if (ts.isFunctionDeclaration(node) && node.name) {
+      addToScope(findNearestTypeScriptBlockScope(node), node.name.text)
+    } else if (ts.isClassDeclaration(node) && node.name) {
+      addToScope(findNearestTypeScriptBlockScope(node), node.name.text)
+    } else if (ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node) || ts.isEnumDeclaration(node)) {
+      addToScope(findNearestTypeScriptBlockScope(node), node.name.text)
+    } else if (ts.isFunctionExpression(node) && node.name) {
+      addToScope(node, node.name.text)
+    }
+
+    ts.forEachChild(node, visit)
+  }
+
+  visit(sourceFile)
+  return declarationsByScope
+}
+
+function collectTypeScriptBindingNames(name: ts.BindingName): string[] {
+  if (ts.isIdentifier(name)) {
+    return [name.text]
+  }
+
+  const names: string[] = []
+  for (const element of name.elements) {
+    if (ts.isOmittedExpression(element)) {
+      continue
+    }
+
+    names.push(...collectTypeScriptBindingNames(element.name))
+  }
+
+  return names
+}
+
+function findNearestTypeScriptFunctionScope(node: ts.Node): ts.Node | undefined {
+  let current: ts.Node | undefined = node.parent
+  while (current) {
+    if (ts.isFunctionLike(current) || ts.isSourceFile(current)) {
+      return current
+    }
+    current = current.parent
+  }
+
+  return undefined
+}
+
+function findNearestTypeScriptBlockScope(node: ts.Node): ts.Node | undefined {
+  let current: ts.Node | undefined = node.parent
+  while (current) {
+    if (
+      ts.isBlock(current) ||
+      ts.isModuleBlock(current) ||
+      ts.isCaseBlock(current) ||
+      ts.isForStatement(current) ||
+      ts.isForInStatement(current) ||
+      ts.isForOfStatement(current) ||
+      ts.isCatchClause(current) ||
+      ts.isFunctionLike(current) ||
+      ts.isSourceFile(current)
+    ) {
+      return current
+    }
+    current = current.parent
+  }
+
+  return undefined
+}
+
+function isTypeScriptSameFileReferenceShadowed(name: string, scopeStack: ReadonlyArray<Set<string>>): boolean {
+  return scopeStack.some((scope) => scope.has(name))
+}
+
+function selectEnclosingSourceSymbolRange(symbolRanges: SourceSymbolRange[], lineNumber: number): SourceSymbolRange | undefined {
+  let best: SourceSymbolRange | undefined
+
+  for (const range of symbolRanges) {
+    if (!range.symbol || lineNumber < range.startLine || lineNumber > range.endLine) {
+      continue
+    }
+
+    if (!best) {
+      best = range
+      continue
+    }
+
+    const span = range.endLine - range.startLine
+    const bestSpan = best.endLine - best.startLine
+    if (span < bestSpan || (span === bestSpan && range.startLine >= best.startLine)) {
+      best = range
+    }
+  }
+
+  return best
+}
+
+function selectEnclosingSourceSymbol(symbolRanges: SourceSymbolRange[], lineNumber: number): string | undefined {
+  return selectEnclosingSourceSymbolRange(symbolRanges, lineNumber)?.symbol
+}
+
+function buildEdge(params: {
+  srcFile: string
+  srcLine: number
+  srcSymbol: string | undefined
+  dstName: string
+  dstFile?: string
+  edgeKind: Edge['edgeKind']
+  resolution: Edge['resolution']
+  language?: string
+}): Edge {
+  const edge: Edge = {
+    srcFile: params.srcFile,
+    srcLine: params.srcLine,
+    dstName: params.dstName,
+    edgeKind: params.edgeKind,
+    resolution: params.resolution
+  }
+
+  if (params.srcSymbol) {
+    edge.srcSymbol = params.srcSymbol
+  }
+
+  if (params.dstFile) {
+    edge.dstFile = params.dstFile
+  }
+
+  if (params.language) {
+    edge.language = params.language
+  }
+
+  return edge
+}
+
+function pushEdge(edgesByKey: Map<string, Edge>, edge: Edge): void {
+  const bucket = edge.edgeKind === 'import'
+    ? 'import'
+    : edge.edgeKind === 'call' || edge.edgeKind === 'ref'
+      ? 'usage'
+      : edge.edgeKind
+  const key = [bucket, edge.srcFile, edge.srcLine, edge.dstName, edge.dstFile ?? ''].join('\0')
+  const existing = edgesByKey.get(key)
+  if (!existing) {
+    edgesByKey.set(key, edge)
+    return
+  }
+
+  if (existing.edgeKind === 'ref' && edge.edgeKind === 'call') {
+    existing.edgeKind = 'call'
+  }
+
+  if (existing.resolution === 'name-only' && edge.resolution === 'import-resolved') {
+    existing.resolution = 'import-resolved'
+    if (edge.dstFile) {
+      existing.dstFile = edge.dstFile
+    }
+  }
+}
+
+function lineNumberForOffsetInSourceFile(sourceFile: ts.SourceFile, offset: number): number {
+  return sourceFile.getLineAndCharacterOfPosition(offset).line + 1
+}
+
+function resolveTypeScriptModuleTarget(file: ScannedFile, moduleSpecifier: string): string | null {
+  if (!moduleSpecifier.startsWith('.')) {
+    return null
+  }
+
+  for (const candidate of buildTypeScriptModuleCandidates(file.relativePath, moduleSpecifier)) {
+    if (existsSync(resolve(scannedFileRoot(file), candidate))) {
+      return candidate
+    }
+  }
+
+  return null
+}
+
+function buildTypeScriptModuleCandidates(importerFile: string, moduleSpecifier: string): string[] {
   const importerDirectory = dirname(importerFile)
-  const base = normalizeRepoPath(resolve('/', importerDirectory, moduleSpecifier))
-  const target = normalizeRepoPath(resolve('/', targetFile))
-  const candidates = new Set([
+  const base = normalizeRelativeRepoPath(resolve('/', importerDirectory, moduleSpecifier))
+  return [
     base,
     `${base}.ts`,
     `${base}.tsx`,
@@ -2678,14 +3624,21 @@ function moduleSpecifierCouldResolveToFile(importerFile: string, moduleSpecifier
     `${base}/index.jsx`,
     `${base}/index.mts`,
     `${base}/index.cts`
-  ])
-
-  return candidates.has(target)
+  ]
 }
 
-function pythonModuleCouldResolveToFile(importerFile: string, moduleSpecifier: string, targetFile: string): boolean {
+function resolvePythonModuleTarget(file: ScannedFile, moduleSpecifier: string): string | null {
+  for (const candidate of buildPythonModuleCandidates(file.relativePath, moduleSpecifier)) {
+    if (existsSync(resolve(scannedFileRoot(file), candidate))) {
+      return candidate
+    }
+  }
+
+  return null
+}
+
+function buildPythonModuleCandidates(importerFile: string, moduleSpecifier: string): string[] {
   const importerDirectory = dirname(importerFile)
-  const target = normalizeRepoPath(resolve('/', targetFile))
   const relativeMatch = moduleSpecifier.match(/^(\.+)(.*)$/)
 
   let base: string
@@ -2693,17 +3646,32 @@ function pythonModuleCouldResolveToFile(importerFile: string, moduleSpecifier: s
     const dots = relativeMatch[1]!.length
     const rest = relativeMatch[2] ?? ''
     const parentDirectory = dots > 1 ? resolve('/', importerDirectory, ...Array.from({ length: dots - 1 }, () => '..')) : resolve('/', importerDirectory)
-    base = normalizeRepoPath(resolve(parentDirectory, rest.replace(/\./g, '/')))
+    base = normalizeRelativeRepoPath(resolve(parentDirectory, rest.replace(/\./g, '/')))
   } else {
-    base = normalizeRepoPath(resolve('/', moduleSpecifier.replace(/\./g, '/')))
+    base = normalizeRelativeRepoPath(resolve('/', moduleSpecifier.replace(/\./g, '/')))
   }
 
-  const candidates = new Set([base, `${base}.py`, `${base}/__init__.py`])
-  return candidates.has(target)
+  return [base, `${base}.py`, `${base}/__init__.py`]
+}
+
+function scannedFileRoot(file: ScannedFile): string {
+  const normalizedAbsolute = normalizePath(file.absolutePath)
+  const normalizedRelative = normalizeRelativeRepoPath(file.relativePath)
+  const suffix = normalizedRelative ? `/${normalizedRelative}` : ''
+
+  if (suffix && normalizedAbsolute.endsWith(suffix)) {
+    return normalizedAbsolute.slice(0, -suffix.length) || '/'
+  }
+
+  return dirname(normalizedAbsolute)
 }
 
 function normalizeRepoPath(value: string): string {
   return value.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/$/, '')
+}
+
+function normalizeRelativeRepoPath(value: string): string {
+  return normalizeRepoPath(value).replace(/^\/+/, '')
 }
 
 function scriptKindFromPath(filePath: string): ts.ScriptKind {
@@ -2925,6 +3893,480 @@ function selectPartialSymbolRows(db: Database.Database, name: string, kinds: Sym
       `
     )
     .all(...params, name)
+}
+
+function selectExactDefinitionRows(
+  db: Database.Database,
+  name: string,
+  kinds: SymbolKind[],
+  pathGlob?: string
+): SymbolRow[] {
+  const whereClauses = ['lower(name) = lower(?)']
+  const params: string[] = [name]
+
+  if (kinds.length > 0) {
+    whereClauses.push(`kind in (${kinds.map(() => '?').join(', ')})`)
+    params.push(...kinds)
+  }
+
+  if (pathGlob) {
+    whereClauses.push('codesift_minimatch(file_path, ?) = 1')
+    params.push(pathGlob)
+  }
+
+  return db
+    .prepare<unknown[], SymbolRow>(
+      `
+        select id, name, file_path, start_line, end_line, kind, signature, parent, language
+        from symbols
+        where ${whereClauses.join(' and ')}
+        order by file_path asc, start_line asc, id asc
+      `
+    )
+    .all(...params)
+}
+
+function selectDefinitionRowsByNameAndFiles(
+  db: Database.Database,
+  name: string,
+  targetFiles: ReadonlyArray<string>
+): SymbolRow[] {
+  if (targetFiles.length === 0) {
+    return []
+  }
+
+  const targetFilePlaceholders = targetFiles.map(() => '?').join(', ')
+  return db
+    .prepare<unknown[], SymbolRow>(
+      `
+        select id, name, file_path, start_line, end_line, kind, signature, parent, language
+        from symbols
+        where lower(name) = lower(?) and file_path in (${targetFilePlaceholders})
+        order by file_path asc, start_line asc, id asc
+      `
+    )
+    .all(name, ...targetFiles)
+}
+
+async function resolveDefinitionEdgeTargetsForNameAndFiles(
+  db: Database.Database,
+  root: string,
+  name: string,
+  targetFiles: ReadonlyArray<string>,
+  defaultExportCache?: Map<string, Promise<Set<string>>>
+): Promise<DefinitionEdgeTarget[]> {
+  const definitions = selectDefinitionRowsByNameAndFiles(db, name, targetFiles)
+  return resolveDefinitionEdgeTargets(root, definitions, defaultExportCache)
+}
+
+async function resolveDefinitionEdgeTargets(
+  root: string,
+  definitions: ReadonlyArray<Pick<SymbolRow, 'name' | 'file_path' | 'language'>>,
+  defaultExportCache: Map<string, Promise<Set<string>>> = new Map()
+): Promise<DefinitionEdgeTarget[]> {
+  const targetsByKey = new Map<string, DefinitionEdgeTarget>()
+
+  for (const definition of definitions) {
+    const resolutionMode: Edge['resolution'] = isImportResolvedDefinitionLanguage(definition.language)
+      ? 'import-resolved'
+      : 'name-only'
+    const names = new Set([definition.name])
+
+    if (resolutionMode === 'import-resolved' && definition.language && isTypeScriptLike(definition.language)) {
+      const defaultExportNames = await getTypeScriptDefaultExportNames(root, definition.file_path, defaultExportCache)
+      if (defaultExportNames.has(definition.name) || definition.name === 'default') {
+        names.add('default')
+      }
+    }
+
+    const key = resolutionMode === 'import-resolved'
+      ? `import-resolved\u0000${definition.file_path}`
+      : `name-only\u0000${definition.name.toLowerCase()}`
+    const existing = targetsByKey.get(key)
+    if (existing) {
+      for (const name of names) {
+        if (!existing.names.includes(name)) {
+          existing.names.push(name)
+        }
+      }
+      continue
+    }
+
+    const target: DefinitionEdgeTarget = {
+      names: [...names],
+      resolutionMode
+    }
+    if (resolutionMode === 'import-resolved') {
+      target.file = definition.file_path
+    }
+    targetsByKey.set(key, target)
+  }
+
+  return [...targetsByKey.values()]
+}
+
+function isImportResolvedDefinitionLanguage(language: string | null | undefined): boolean {
+  return Boolean(language && (isTypeScriptLike(language) || isPythonLike(language)))
+}
+
+async function getTypeScriptDefaultExportNames(
+  root: string,
+  file: string,
+  cache: Map<string, Promise<Set<string>>>
+): Promise<Set<string>> {
+  const cached = cache.get(file)
+  if (cached) {
+    return cached
+  }
+
+  const load = readFile(resolve(root, file), 'utf8')
+    .then((content) => {
+      const sourceFile = ts.createSourceFile(file, content, ts.ScriptTarget.Latest, true, scriptKindFromPath(file))
+      return collectTypeScriptDefaultExportNames(sourceFile)
+    })
+    .catch(() => new Set<string>())
+  cache.set(file, load)
+  return load
+}
+
+function collectTypeScriptDefaultExportNames(sourceFile: ts.SourceFile): Set<string> {
+  const names = new Set<string>()
+
+  for (const statement of sourceFile.statements) {
+    if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement)) && hasTypeScriptDefaultExportModifier(statement)) {
+      names.add(statement.name?.text ?? 'default')
+      continue
+    }
+
+    if (ts.isExportAssignment(statement) && !statement.isExportEquals) {
+      if (ts.isIdentifier(statement.expression)) {
+        names.add(statement.expression.text)
+      } else if (ts.isFunctionExpression(statement.expression) || ts.isClassExpression(statement.expression)) {
+        names.add(statement.expression.name?.text ?? 'default')
+      } else {
+        names.add('default')
+      }
+      continue
+    }
+
+    if (ts.isExportDeclaration(statement) && statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+      for (const element of statement.exportClause.elements) {
+        if (element.name.text === 'default') {
+          names.add((element.propertyName ?? element.name).text)
+        }
+      }
+    }
+  }
+
+  return names
+}
+
+function hasTypeScriptDefaultExportModifier(node: ts.Node): boolean {
+  const modifiers = ts.canHaveModifiers(node) ? (ts.getModifiers(node) ?? []) : []
+  return modifiers.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword) &&
+    modifiers.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword)
+}
+
+function selectDefinitionEdgeRows(
+  db: Database.Database,
+  targets: ReadonlyArray<DefinitionEdgeTarget>,
+  edgeKinds: ReadonlyArray<Edge['edgeKind']>,
+  preferCallsFirst: boolean,
+  limit?: number
+): EdgeResultRow[] {
+  if (targets.length === 0 || edgeKinds.length === 0) {
+    return []
+  }
+
+  const edgeKindPlaceholders = edgeKinds.map(() => '?').join(', ')
+  const rowsById = new Map<number, EdgeResultRow>()
+
+  for (const target of targets) {
+    if (target.names.length === 0) {
+      continue
+    }
+
+    const nameClauses = target.names.map(() => 'lower(dst_name) = lower(?)').join(' or ')
+    const params: string[] = [...target.names]
+    let whereClause = `(${nameClauses}) and dst_file is null and edge_kind in (${edgeKindPlaceholders})`
+    if (target.resolutionMode === 'import-resolved' && target.file) {
+      whereClause = `(${nameClauses}) and dst_file = ? and edge_kind in (${edgeKindPlaceholders})`
+      params.push(target.file)
+    }
+    params.push(...edgeKinds)
+
+    const targetRows = db
+      .prepare<unknown[], EdgeResultRow>(
+        `
+          select id, src_file, src_line, src_symbol, edge_kind, resolution, language
+          from edges
+          where ${whereClause}
+        `
+      )
+      .all(...params)
+
+    for (const row of targetRows) {
+      rowsById.set(row.id, row)
+    }
+  }
+
+  const rows = [...rowsById.values()].sort((left, right) => compareEdgeResultRows(left, right, preferCallsFirst))
+  return limit === undefined ? rows : rows.slice(0, limit)
+}
+
+function compareEdgeResultRows(left: EdgeResultRow, right: EdgeResultRow, preferCallsFirst: boolean): number {
+  if (preferCallsFirst && left.edge_kind !== right.edge_kind) {
+    if (left.edge_kind === 'call') {
+      return -1
+    }
+    if (right.edge_kind === 'call') {
+      return 1
+    }
+  }
+
+  return (
+    left.src_file.localeCompare(right.src_file) ||
+    left.src_line - right.src_line ||
+    left.id - right.id
+  )
+}
+
+function selectDefinitionUsageRows(
+  db: Database.Database,
+  targets: ReadonlyArray<DefinitionEdgeTarget>,
+  options: {
+    excludedSrcFile: string
+    excludedStartLine: number
+    excludedEndLine: number
+    pathGlob?: string
+    limit?: number
+  }
+): EdgeUsageRow[] {
+  const rows = selectDefinitionEdgeRows(db, targets, ['call', 'ref'], false)
+    .filter(
+      (row) =>
+        !(row.src_file === options.excludedSrcFile && row.src_line >= options.excludedStartLine && row.src_line <= options.excludedEndLine)
+    )
+    .filter((row) => !options.pathGlob || minimatch(row.src_file, options.pathGlob))
+    .map<EdgeUsageRow>((row) => ({
+      id: row.id,
+      src_file: row.src_file,
+      src_line: row.src_line,
+      language: row.language,
+      resolution: row.resolution
+    }))
+
+  return options.limit === undefined ? rows : rows.slice(0, options.limit)
+}
+
+function countDefinitionEdgeRows(
+  db: Database.Database,
+  targets: ReadonlyArray<DefinitionEdgeTarget>,
+  edgeKinds: ReadonlyArray<Edge['edgeKind']>
+): number {
+  return selectDefinitionEdgeRows(db, targets, edgeKinds, false).length
+}
+
+function selectImporterEdgeRows(db: Database.Database, file: string): EdgeResultRow[] {
+  return db
+    .prepare<unknown[], EdgeResultRow>(
+      `
+        select id, src_file, src_line, src_symbol, edge_kind, resolution, language
+        from edges
+        where dst_file = ? and edge_kind = 'import'
+        order by src_file asc, src_line asc, id asc
+      `
+    )
+    .all(file)
+}
+
+function selectSameFileNeighborRows(
+  db: Database.Database,
+  file: string,
+  excludedId: number,
+  anchorStartLine: number,
+  limit: number
+): SymbolRow[] {
+  return db
+    .prepare<unknown[], SymbolRow>(
+      `
+        select id, name, file_path, start_line, end_line, kind, signature, parent, language
+        from symbols
+        where file_path = ? and id <> ?
+        order by abs(start_line - ?) asc, start_line asc, id asc
+        limit ${limit}
+      `
+    )
+    .all(file, excludedId, anchorStartLine)
+}
+
+function countSameFileNeighborRows(db: Database.Database, file: string, excludedId: number): number {
+  return db
+    .prepare<unknown[], { count: number }>(
+      `
+        select count(*) as count
+        from symbols
+        where file_path = ? and id <> ?
+      `
+    )
+    .get(file, excludedId)?.count ?? 0
+}
+
+function buildSymbolNeighbor(row: SymbolRow): SymbolNeighbor {
+  const neighbor: SymbolNeighbor = {
+    name: row.name,
+    file: row.file_path,
+    range: { startLine: row.start_line, endLine: row.end_line },
+    kind: row.kind
+  }
+
+  if (row.parent) {
+    neighbor.parent = row.parent
+  }
+
+  if (row.language) {
+    neighbor.language = row.language
+  }
+
+  return neighbor
+}
+
+async function readEdgeResultsFromRows(
+  root: string,
+  rows: EdgeResultRow[],
+  maxTokens: number | undefined
+): Promise<ReadRowsResult<EdgeResult>> {
+  const tokenBudget = normalizeSearchTokenBudget(maxTokens)
+  const linesByFile = new Map<string, string[]>()
+  const results: EdgeResult[] = []
+  let tokensUsed = 0
+  let tokenTruncated = false
+  let readFailures = 0
+
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index]!
+    let lines = linesByFile.get(row.src_file)
+    if (!lines) {
+      try {
+        lines = splitLines(await readFile(resolve(root, row.src_file), 'utf8'))
+        linesByFile.set(row.src_file, lines)
+      } catch {
+        readFailures += 1
+        continue
+      }
+    }
+
+    const result: EdgeResult = {
+      file: row.src_file,
+      range: { startLine: row.src_line, endLine: row.src_line },
+      line: row.src_line,
+      snippet: (lines[row.src_line - 1] ?? '').trimEnd(),
+      edgeKind: row.edge_kind,
+      resolution: row.resolution
+    }
+
+    if (row.src_symbol) {
+      result.srcSymbol = row.src_symbol
+    }
+
+    if (row.language) {
+      result.language = row.language
+    }
+
+    const estimatedTokens = estimateEdgeResultTokens(result)
+    if (tokenBudget !== undefined && tokensUsed + estimatedTokens > tokenBudget) {
+      if (results.length === 0) {
+        results.push({
+          ...result,
+          snippet: truncateToTokenBudget(result.snippet, Math.max(1, Math.max(0, tokenBudget - 8)))
+        })
+        tokenTruncated = index < rows.length - 1
+      } else {
+        tokenTruncated = true
+      }
+      break
+    }
+
+    results.push(result)
+    tokensUsed += estimatedTokens
+  }
+
+  return { items: results, tokenTruncated, readFailures }
+}
+
+function estimateEdgeResultTokens(result: EdgeResult): number {
+  const header = `${result.file}:${result.line} ${result.srcSymbol ?? ''} ${result.edgeKind} ${result.resolution}`
+  return SEARCH_HIT_TOKEN_OVERHEAD + estimateTokenCount(header) + estimateTokenCount(result.snippet)
+}
+
+async function readImpactNodesFromRows(
+  root: string,
+  rows: ImpactNodeRow[],
+  maxTokens: number | undefined
+): Promise<ReadRowsResult<ImpactNode>> {
+  const tokenBudget = normalizeSearchTokenBudget(maxTokens)
+  const linesByFile = new Map<string, string[]>()
+  const nodes: ImpactNode[] = []
+  let tokensUsed = 0
+  let tokenTruncated = false
+  let readFailures = 0
+
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index]!
+    let lines = linesByFile.get(row.src_file)
+    if (!lines) {
+      try {
+        lines = splitLines(await readFile(resolve(root, row.src_file), 'utf8'))
+        linesByFile.set(row.src_file, lines)
+      } catch {
+        readFailures += 1
+        continue
+      }
+    }
+
+    const node: ImpactNode = {
+      name: row.name,
+      file: row.src_file,
+      range: { startLine: row.src_line, endLine: row.src_line },
+      line: row.src_line,
+      snippet: (lines[row.src_line - 1] ?? '').trimEnd(),
+      depth: row.depth,
+      edgeKind: row.edge_kind,
+      resolution: row.resolution
+    }
+
+    if (row.src_symbol) {
+      node.srcSymbol = row.src_symbol
+    }
+
+    if (row.language) {
+      node.language = row.language
+    }
+
+    const estimatedTokens = estimateImpactNodeTokens(node)
+    if (tokenBudget !== undefined && tokensUsed + estimatedTokens > tokenBudget) {
+      if (nodes.length === 0) {
+        nodes.push({
+          ...node,
+          snippet: truncateToTokenBudget(node.snippet, Math.max(1, Math.max(0, tokenBudget - 10)))
+        })
+        tokenTruncated = index < rows.length - 1
+      } else {
+        tokenTruncated = true
+      }
+      break
+    }
+
+    nodes.push(node)
+    tokensUsed += estimatedTokens
+  }
+
+  return { items: nodes, tokenTruncated, readFailures }
+}
+
+function estimateImpactNodeTokens(node: ImpactNode): number {
+  const header = `${node.file}:${node.line} ${node.name} d${node.depth} ${node.edgeKind} ${node.resolution}`
+  return SEARCH_HIT_TOKEN_OVERHEAD + estimateTokenCount(header) + estimateTokenCount(node.snippet)
 }
 
 function selectGrepCandidateFiles(db: Database.Database, options?: GrepOptions): Array<{ path: string; language: string }> {

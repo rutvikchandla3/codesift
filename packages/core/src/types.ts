@@ -22,6 +22,22 @@ export interface Range {
 
 export type SearchReasonTag = '=' | '~' | '+'
 
+export type EdgeKind = 'ref' | 'call' | 'import' | 'implements' | 'extends'
+
+export type EdgeResolution = 'import-resolved' | 'name-only'
+
+export interface Edge {
+  id?: number
+  srcFile: string
+  srcLine: number
+  srcSymbol?: string
+  dstName: string
+  dstFile?: string
+  edgeKind: EdgeKind
+  resolution: EdgeResolution
+  language?: string
+}
+
 export interface SymbolUsage {
   file: string
   range: Range
@@ -29,9 +45,34 @@ export interface SymbolUsage {
   snippet: string
   language?: string
   /**
-   * Honest provenance marker: usages are import-resolved/local, not type-resolved.
+   * Honest provenance marker: usages are import-resolved or name-only, never type-resolved.
    */
-  resolution: 'import-resolved'
+  resolution: EdgeResolution
+}
+
+export interface SymbolNeighbor {
+  name: string
+  file: string
+  range: Range
+  kind: SymbolKind
+  parent?: string
+  language?: string
+}
+
+export interface SymbolRelations {
+  /**
+   * Top caller/reference sites for the resolved definition. These reuse the
+   * persisted edge rows and stay honest about resolution confidence.
+   */
+  sites: EdgeResult[]
+  /**
+   * Nearby same-file symbols around the resolved definition for quick local context.
+   */
+  neighbors: SymbolNeighbor[]
+  /**
+   * Additional relation items omitted by the bounded read-side bundle.
+   */
+  omitted?: number
 }
 
 export interface SearchHit {
@@ -99,6 +140,12 @@ export interface SymbolDefinition {
    * on compact/ambiguous rows.
    */
   body?: string
+  /**
+   * OPT-IN bounded relational context for the top exact match: top caller/ref
+   * sites plus same-file neighbors. Present only when requested and only on the
+   * top exact row of an unambiguous lookup.
+   */
+  relations?: SymbolRelations
 }
 
 export interface SearchOptions {
@@ -153,6 +200,74 @@ export interface FindSymbolOptions {
    * compact. Capped like search bodies. Set false for a compact name→location list.
    */
   withBody?: boolean
+  /**
+   * OPT-IN bounded relational addendum for the top exact match: top caller/ref
+   * sites plus same-file neighbors. Default false.
+   */
+  withCallers?: boolean
+}
+
+export interface FindEdgeOptions {
+  /**
+   * Target definition kind filter used while resolving the destination symbol.
+   */
+  kind?: SymbolKind | SymbolKind[]
+  /**
+   * Target definition path glob used for collision disambiguation, e.g. `src/schema/**`.
+   */
+  pathGlob?: string
+  /**
+   * Approx output token budget for the returned edge rows.
+   */
+  maxTokens?: number
+}
+
+export interface FindImportersOptions {
+  /**
+   * Approx output token budget for the returned importer rows.
+   */
+  maxTokens?: number
+}
+
+export interface ImpactOptions extends FindEdgeOptions {
+  /**
+   * Caller depth to traverse: 0=direct callers only, 1=callers of callers, etc.
+   * Default 2.
+   */
+  depth?: number
+  /**
+   * Hard cap on returned graph nodes. Default 50.
+   */
+  maxNodes?: number
+}
+
+export interface EdgeResult {
+  file: string
+  range: Range
+  line: number
+  snippet: string
+  srcSymbol?: string
+  edgeKind: EdgeKind
+  resolution: EdgeResolution
+  language?: string
+}
+
+export interface ImpactNode extends EdgeResult {
+  /**
+   * Symbol name traversed at this node. Falls back to `top-level` when the edge
+   * originates outside an enclosing symbol.
+   */
+  name: string
+  depth: number
+}
+
+export interface ImpactResult {
+  nodes: ImpactNode[]
+  impactTruncated?: boolean
+  depthCapped?: boolean
+  nodesCapped?: boolean
+  depthLimit: number
+  maxNodes: number
 }
 
 export interface SyncProgressEvent {
@@ -280,6 +395,11 @@ export interface Repo {
   search(query: string, options?: SearchOptions): Promise<SearchHit[]>
   grep(pattern: string, options?: GrepOptions): Promise<GrepHit[]>
   findSymbol(name: string, options?: FindSymbolOptions): Promise<SymbolDefinition[]>
+  findCallers(name: string, options?: FindEdgeOptions): Promise<EdgeResult[]>
+  impact(name: string, options?: ImpactOptions): Promise<ImpactResult>
+  findReferences(name: string, options?: FindEdgeOptions): Promise<EdgeResult[]>
+  findImplementers(name: string, options?: FindEdgeOptions): Promise<EdgeResult[]>
+  findImporters(file: string, options?: FindImportersOptions): Promise<EdgeResult[]>
   readChunk(id: string, options?: ReadChunkOptions): Promise<string>
   readRange(file: string, startLine: number, endLine: number, options?: ReadRangeOptions): Promise<string>
   status(): Promise<RepoStatus>
