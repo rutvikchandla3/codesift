@@ -3158,9 +3158,9 @@ function extractPythonEdges(file: ScannedFile, symbolRanges: SourceSymbolRange[]
 
     const importMatch = trimmed.match(/^import\s+([.A-Za-z0-9_]+)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?$/)
     if (importMatch) {
-      const dstFile = resolvePythonModuleTarget(file, importMatch[1]!)
-      // Known limitation: `import a.b.c` still keys the top-level alias only; deeper dotted-module binding stays approximate noise.
-      const localName = importMatch[2] ?? importMatch[1]!.split('.')[0] ?? ''
+      const moduleSpecifier = importMatch[1]!
+      const dstFile = resolvePythonModuleTarget(file, moduleSpecifier)
+      const localName = importMatch[2] ?? moduleSpecifier
       if (localName) {
         moduleBindings.set(localName, {
           dstName: '*',
@@ -3349,12 +3349,39 @@ const JAVA_NAME_ONLY_CALL_KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'c
 const RUBY_NAME_ONLY_CALL_KEYWORDS = new Set(['if', 'unless', 'while', 'until', 'for', 'case'])
 const RUST_NAME_ONLY_CALL_KEYWORDS = new Set(['if', 'for', 'while', 'match', 'loop'])
 
-// Known limitation: Ruby heredocs, `%w`, and `=begin` blocks are only partially masked here; downstream Ruby edges stay name-only/approximate.
+// Ruby masking stays heuristic and line-based: it blanks quoted strings, `#` comments, `=begin`/`=end`
+// blocks, conservative heredoc bodies (`<<~`, `<<-`, quoted tags, and plain `<<IDENT` with
+// `IDENT = [A-Z_][A-Za-z0-9_]*` so `array << item` is left alone), and single-line `%w/%i/%W/%I`
+// literals. Interpolation and multiline literal edge cases still stay opaque/approximate text.
 function maskRubySyntaxLines(lines: string[]): string[] {
   const maskedLines: string[] = []
+  let insideBlockComment = false
+  const pendingHeredocs: Array<{ tag: string; allowsIndentedTerminator: boolean }> = []
 
   for (const line of lines) {
-    let masked = ''
+    if (insideBlockComment) {
+      maskedLines.push(' '.repeat(line.length))
+      if (/^=end\b/.test(line)) {
+        insideBlockComment = false
+      }
+      continue
+    }
+
+    if (pendingHeredocs.length > 0) {
+      maskedLines.push(' '.repeat(line.length))
+      if (matchesRubyHeredocTerminator(line, pendingHeredocs[0]!)) {
+        pendingHeredocs.shift()
+      }
+      continue
+    }
+
+    if (/^=begin\b/.test(line)) {
+      maskedLines.push(' '.repeat(line.length))
+      insideBlockComment = true
+      continue
+    }
+
+    const masked = line.split('')
     let stringQuote: '"' | "'" | null = null
     let escaped = false
 
@@ -3362,15 +3389,14 @@ function maskRubySyntaxLines(lines: string[]): string[] {
       const char = line[index]!
 
       if (stringQuote) {
+        masked[index] = ' '
         if (escaped) {
           escaped = false
-          masked += ' '
           continue
         }
 
         if (char === '\\') {
           escaped = true
-          masked += ' '
           continue
         }
 
@@ -3378,28 +3404,180 @@ function maskRubySyntaxLines(lines: string[]): string[] {
           stringQuote = null
         }
 
-        masked += ' '
+        continue
+      }
+
+      const heredocOpener = findRubyHeredocOpenerAt(line, index)
+      if (heredocOpener) {
+        for (const opener of collectRubyHeredocOpeners(line, index)) {
+          pendingHeredocs.push({
+            tag: opener.tag,
+            allowsIndentedTerminator: opener.allowsIndentedTerminator
+          })
+        }
+        maskRubyRange(masked, index, line.length)
+        break
+      }
+
+      const wordArrayLength = findRubyWordArrayLength(line, index)
+      if (wordArrayLength > 0) {
+        maskRubyRange(masked, index, index + wordArrayLength)
+        index += wordArrayLength - 1
         continue
       }
 
       if (char === '#') {
-        masked += ' '.repeat(line.length - index)
+        maskRubyRange(masked, index, line.length)
         break
       }
 
       if (char === '"' || char === "'") {
         stringQuote = char
-        masked += ' '
-        continue
+        escaped = false
+        masked[index] = ' '
       }
-
-      masked += char
     }
 
-    maskedLines.push(masked)
+    maskedLines.push(masked.join(''))
   }
 
   return maskedLines
+}
+
+function maskRubyRange(chars: string[], start: number, endExclusive: number): void {
+  for (let index = start; index < endExclusive; index += 1) {
+    chars[index] = ' '
+  }
+}
+
+function matchesRubyHeredocTerminator(
+  line: string,
+  heredoc: { tag: string; allowsIndentedTerminator: boolean }
+): boolean {
+  return heredoc.allowsIndentedTerminator ? line.trim() === heredoc.tag : line === heredoc.tag
+}
+
+function collectRubyHeredocOpeners(
+  line: string,
+  startIndex: number
+): Array<{ tag: string; allowsIndentedTerminator: boolean }> {
+  const openers: Array<{ tag: string; allowsIndentedTerminator: boolean }> = []
+  let stringQuote: '"' | "'" | null = null
+  let escaped = false
+
+  for (let index = startIndex; index < line.length; index += 1) {
+    const char = line[index]!
+
+    if (stringQuote) {
+      if (escaped) {
+        escaped = false
+        continue
+      }
+
+      if (char === '\\') {
+        escaped = true
+        continue
+      }
+
+      if (char === stringQuote) {
+        stringQuote = null
+      }
+
+      continue
+    }
+
+    if (char === '#') {
+      break
+    }
+
+    const opener = findRubyHeredocOpenerAt(line, index)
+    if (opener) {
+      openers.push({ tag: opener.tag, allowsIndentedTerminator: opener.allowsIndentedTerminator })
+      index += opener.length - 1
+      continue
+    }
+
+    if (char === '"' || char === "'") {
+      stringQuote = char
+      escaped = false
+    }
+  }
+
+  return openers
+}
+
+function findRubyHeredocOpenerAt(
+  line: string,
+  index: number
+): { tag: string; allowsIndentedTerminator: boolean; length: number } | null {
+  if (line[index] !== '<' || line[index + 1] !== '<') {
+    return null
+  }
+
+  let cursor = index + 2
+  let allowsIndentedTerminator = false
+  if (line[cursor] === '~' || line[cursor] === '-') {
+    allowsIndentedTerminator = true
+    cursor += 1
+  }
+
+  const quote = line[cursor]
+  if (quote === '"' || quote === "'") {
+    const endQuote = line.indexOf(quote, cursor + 1)
+    if (endQuote <= cursor + 1) {
+      return null
+    }
+
+    return {
+      tag: line.slice(cursor + 1, endQuote),
+      allowsIndentedTerminator,
+      length: endQuote - index + 1
+    }
+  }
+
+  const identMatch = line.slice(cursor).match(/^[A-Z_][A-Za-z0-9_]*/)
+  if (!identMatch) {
+    return null
+  }
+
+  return {
+    tag: identMatch[0],
+    allowsIndentedTerminator,
+    length: cursor - index + identMatch[0].length
+  }
+}
+
+const RUBY_WORD_ARRAY_DELIMITERS = new Map<string, string>([
+  ['[', ']'],
+  ['{', '}'],
+  ['(', ')'],
+  ['<', '>'],
+  ['|', '|'],
+  ['/', '/']
+])
+
+function findRubyWordArrayLength(line: string, index: number): number {
+  if (line[index] !== '%') {
+    return 0
+  }
+
+  const literalKind = line[index + 1]
+  const opener = line[index + 2]
+  if (!literalKind || !opener || !'wWiI'.includes(literalKind)) {
+    return 0
+  }
+
+  const closer = RUBY_WORD_ARRAY_DELIMITERS.get(opener)
+  if (!closer) {
+    return 0
+  }
+
+  const closeIndex = line.indexOf(closer, index + 3)
+  if (closeIndex < 0) {
+    return line.length - index
+  }
+
+  return closeIndex - index + 1
 }
 
 function collectSameFileSymbols(symbolRanges: SourceSymbolRange[]): Set<string> {
