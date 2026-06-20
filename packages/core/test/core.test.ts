@@ -1432,6 +1432,515 @@ func ValidateBearer(token string) bool {
     ])
   })
 
+  it('writes name-only Java call edges and serves callers from persisted edges', async () => {
+    const repoRoot = await copyFixtureRepository('m3-java', 'codesift-fixture-graph-m3-java-')
+    await writeFile(
+      join(repoRoot, 'src', 'auth', 'Consumer.java'),
+      `package auth;
+
+public class Consumer {
+  boolean validateBearer(String token) {
+    TokenVerifier verifier = new TokenVerifier();
+    return verifier.verifyToken(token);
+  }
+}
+`,
+      'utf8'
+    )
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+
+    const db = new Database(join(repoRoot, '.codesift', 'index.db'))
+    const rows = db
+      .prepare<
+        [string],
+        {
+          src_file: string
+          src_line: number
+          src_symbol: string | null
+          dst_file: string | null
+          edge_kind: string
+          resolution: string
+        }
+      >(
+        `
+          select src_file, src_line, src_symbol, dst_file, edge_kind, resolution
+          from edges
+          where dst_name = ? and edge_kind = 'call'
+          order by src_file asc, src_line asc
+        `
+      )
+      .all('verifyToken')
+    db.close()
+
+    expect(rows).toEqual([
+      {
+        src_file: 'src/auth/Consumer.java',
+        src_line: 6,
+        src_symbol: 'validateBearer',
+        dst_file: null,
+        edge_kind: 'call',
+        resolution: 'name-only'
+      }
+    ])
+
+    const callers = await repo.findCallers('verifyToken', { kind: 'method', pathGlob: 'src/auth/**' })
+    expect(callers).toMatchObject([
+      {
+        file: 'src/auth/Consumer.java',
+        line: 6,
+        srcSymbol: 'validateBearer',
+        edgeKind: 'call',
+        resolution: 'name-only',
+        language: 'java'
+      }
+    ])
+  })
+
+  it('writes name-only Ruby call edges and serves callers from persisted edges', async () => {
+    const repoRoot = await copyFixtureRepository('m3-ruby', 'codesift-fixture-graph-m3-ruby-')
+    await writeFile(
+      join(repoRoot, 'lib', 'auth', 'consumer.rb'),
+      `module Auth
+  class Consumer
+    def validate_bearer(token)
+      verifier = TokenVerifier.new
+      verifier.verify_token(token)
+    end
+  end
+end
+`,
+      'utf8'
+    )
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+
+    const db = new Database(join(repoRoot, '.codesift', 'index.db'))
+    const rows = db
+      .prepare<
+        [string],
+        {
+          src_file: string
+          src_line: number
+          src_symbol: string | null
+          dst_file: string | null
+          edge_kind: string
+          resolution: string
+        }
+      >(
+        `
+          select src_file, src_line, src_symbol, dst_file, edge_kind, resolution
+          from edges
+          where dst_name = ? and edge_kind = 'call'
+          order by src_file asc, src_line asc
+        `
+      )
+      .all('verify_token')
+    db.close()
+
+    expect(rows).toEqual([
+      {
+        src_file: 'lib/auth/consumer.rb',
+        src_line: 5,
+        src_symbol: 'validate_bearer',
+        dst_file: null,
+        edge_kind: 'call',
+        resolution: 'name-only'
+      }
+    ])
+
+    const callers = await repo.findCallers('verify_token', { kind: 'method', pathGlob: 'lib/auth/**' })
+    expect(callers).toMatchObject([
+      {
+        file: 'lib/auth/consumer.rb',
+        line: 5,
+        srcSymbol: 'validate_bearer',
+        edgeKind: 'call',
+        resolution: 'name-only',
+        language: 'ruby'
+      }
+    ])
+  })
+
+  it('writes name-only Rust call edges and serves callers from persisted edges', async () => {
+    const repoRoot = await copyFixtureRepository('m3-rust', 'codesift-fixture-graph-m3-rust-')
+    await writeFile(
+      join(repoRoot, 'src', 'consumer.rs'),
+      `pub fn validate_bearer(token: &str) -> bool {
+    let verifier = auth::TokenVerifier;
+    verifier.verify_token(token)
+}
+`,
+      'utf8'
+    )
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+
+    const db = new Database(join(repoRoot, '.codesift', 'index.db'))
+    const rows = db
+      .prepare<
+        [string],
+        {
+          src_file: string
+          src_line: number
+          src_symbol: string | null
+          dst_file: string | null
+          edge_kind: string
+          resolution: string
+        }
+      >(
+        `
+          select src_file, src_line, src_symbol, dst_file, edge_kind, resolution
+          from edges
+          where dst_name = ? and edge_kind = 'call'
+          order by src_file asc, src_line asc
+        `
+      )
+      .all('verify_token')
+    db.close()
+
+    expect(rows).toEqual([
+      {
+        src_file: 'src/consumer.rs',
+        src_line: 3,
+        src_symbol: 'validate_bearer',
+        dst_file: null,
+        edge_kind: 'call',
+        resolution: 'name-only'
+      }
+    ])
+
+    const callers = await repo.findCallers('verify_token', { kind: 'method', pathGlob: 'src/**' })
+    expect(callers).toMatchObject([
+      {
+        file: 'src/consumer.rs',
+        line: 3,
+        srcSymbol: 'validate_bearer',
+        edgeKind: 'call',
+        resolution: 'name-only',
+        language: 'rust'
+      }
+    ])
+  })
+
+  it('resolves dotted Python module imports to the final member without bogus intermediate edges', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-usages-py-dotted-import-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'a', 'b'), { recursive: true })
+
+    await writeFile(join(repoRoot, 'a', '__init__.py'), '', 'utf8')
+    await writeFile(join(repoRoot, 'a', 'b', '__init__.py'), '', 'utf8')
+    await writeFile(
+      join(repoRoot, 'a', 'b', 'c.py'),
+      `def func() -> str:
+    return 'ok'
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'consumer.py'),
+      `import a.b.c
+
+
+def handle() -> None:
+    a.b.c.func()
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const db = new Database(join(repoRoot, '.codesift', 'index.db'))
+    const rows = db
+      .prepare<
+        [string],
+        {
+          src_file: string
+          src_line: number
+          src_symbol: string | null
+          dst_file: string | null
+          edge_kind: string
+          resolution: string
+        }
+      >(
+        `
+          select src_file, src_line, src_symbol, dst_file, edge_kind, resolution
+          from edges
+          where dst_name = ? and edge_kind in ('call', 'ref')
+          order by src_file asc, src_line asc
+        `
+      )
+      .all('func')
+    const bogusRows = db
+      .prepare<[string, number], { dst_name: string }>(
+        `
+          select dst_name
+          from edges
+          where src_file = ? and src_line = ? and dst_name in ('b', 'c')
+          order by dst_name asc
+        `
+      )
+      .all('consumer.py', 5)
+    db.close()
+
+    expect(rows).toEqual([
+      {
+        src_file: 'consumer.py',
+        src_line: 5,
+        src_symbol: 'handle',
+        dst_file: 'a/b/c.py',
+        edge_kind: 'call',
+        resolution: 'import-resolved'
+      }
+    ])
+    expect(bogusRows).toEqual([])
+
+    const callers = await repo.findCallers('func', { kind: 'function', pathGlob: 'a/**' })
+    expect(callers).toMatchObject([
+      {
+        file: 'consumer.py',
+        line: 5,
+        srcSymbol: 'handle',
+        edgeKind: 'call',
+        resolution: 'import-resolved',
+        language: 'python'
+      }
+    ])
+  })
+
+  it('resolves dotted Python from-imports to the dotted module file', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-usages-py-dotted-from-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'a', 'b'), { recursive: true })
+
+    await writeFile(join(repoRoot, 'a', '__init__.py'), '', 'utf8')
+    await writeFile(join(repoRoot, 'a', 'b', '__init__.py'), '', 'utf8')
+    await writeFile(
+      join(repoRoot, 'a', 'b', 'c.py'),
+      `def func() -> str:
+    return 'ok'
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'consumer.py'),
+      `from a.b.c import func
+
+
+def handle() -> str:
+    return func()
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const db = new Database(join(repoRoot, '.codesift', 'index.db'))
+    const rows = db
+      .prepare<
+        [string],
+        {
+          src_file: string
+          src_line: number
+          src_symbol: string | null
+          dst_file: string | null
+          edge_kind: string
+          resolution: string
+        }
+      >(
+        `
+          select src_file, src_line, src_symbol, dst_file, edge_kind, resolution
+          from edges
+          where dst_name = ? and edge_kind in ('call', 'ref')
+          order by src_file asc, src_line asc
+        `
+      )
+      .all('func')
+    db.close()
+
+    expect(rows).toEqual([
+      {
+        src_file: 'consumer.py',
+        src_line: 5,
+        src_symbol: 'handle',
+        dst_file: 'a/b/c.py',
+        edge_kind: 'call',
+        resolution: 'import-resolved'
+      }
+    ])
+
+    const callers = await repo.findCallers('func', { kind: 'function', pathGlob: 'a/**' })
+    expect(callers).toMatchObject([
+      {
+        file: 'consumer.py',
+        line: 5,
+        srcSymbol: 'handle',
+        edgeKind: 'call',
+        resolution: 'import-resolved',
+        language: 'python'
+      }
+    ])
+  })
+
+  it('masks Ruby heredocs, word arrays, and block comments without swallowing real calls', async () => {
+    const repoRoot = await copyFixtureRepository('m3-ruby', 'codesift-fixture-graph-ruby-masking-')
+    await writeFile(
+      join(repoRoot, 'lib', 'auth', 'query_consumer.rb'),
+      `=begin
+ghost_call()
+=end
+
+module Auth
+  class QueryConsumer
+    def run(token)
+      sql = <<~SQL
+        select(:id)
+      SQL
+      labels = %w[foo bar]
+      metrics = %W[notify(#{token}) audit]
+      verifier = TokenVerifier.new
+      verifier.verify_token(token)
+    end
+  end
+end
+`,
+      'utf8'
+    )
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+
+    const db = new Database(join(repoRoot, '.codesift', 'index.db'))
+    const rows = db
+      .prepare<
+        [string],
+        {
+          src_file: string
+          src_line: number
+          src_symbol: string | null
+          dst_file: string | null
+          edge_kind: string
+          resolution: string
+        }
+      >(
+        `
+          select src_file, src_line, src_symbol, dst_file, edge_kind, resolution
+          from edges
+          where dst_name = ? and edge_kind = 'call'
+          order by src_file asc, src_line asc
+        `
+      )
+      .all('verify_token')
+    const noiseRows = db
+      .prepare<[string], { dst_name: string }>(
+        `
+          select dst_name
+          from edges
+          where src_file = ? and dst_name in ('ghost_call', 'notify', 'select')
+          order by dst_name asc
+        `
+      )
+      .all('lib/auth/query_consumer.rb')
+    db.close()
+
+    expect(rows).toEqual([
+      {
+        src_file: 'lib/auth/query_consumer.rb',
+        src_line: 14,
+        src_symbol: 'run',
+        dst_file: null,
+        edge_kind: 'call',
+        resolution: 'name-only'
+      }
+    ])
+    expect(noiseRows).toEqual([])
+
+    const callers = await repo.findCallers('verify_token', { kind: 'method', pathGlob: 'lib/auth/**' })
+    expect(callers).toMatchObject([
+      {
+        file: 'lib/auth/query_consumer.rb',
+        line: 14,
+        srcSymbol: 'run',
+        edgeKind: 'call',
+        resolution: 'name-only',
+        language: 'ruby'
+      }
+    ])
+  })
+
+  it('does not treat Ruby left-shift as a heredoc opener', async () => {
+    const repoRoot = await copyFixtureRepository('m3-ruby', 'codesift-fixture-graph-ruby-left-shift-')
+    await writeFile(
+      join(repoRoot, 'lib', 'auth', 'left_shift_consumer.rb'),
+      `module Auth
+  class LeftShiftConsumer
+    def run(token)
+      values = []
+      values << token
+      verifier = TokenVerifier.new
+      verifier.verify_token(token)
+    end
+  end
+end
+`,
+      'utf8'
+    )
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+
+    const db = new Database(join(repoRoot, '.codesift', 'index.db'))
+    const rows = db
+      .prepare<
+        [string],
+        {
+          src_file: string
+          src_line: number
+          src_symbol: string | null
+          dst_file: string | null
+          edge_kind: string
+          resolution: string
+        }
+      >(
+        `
+          select src_file, src_line, src_symbol, dst_file, edge_kind, resolution
+          from edges
+          where dst_name = ? and edge_kind = 'call'
+          order by src_file asc, src_line asc
+        `
+      )
+      .all('verify_token')
+    db.close()
+
+    expect(rows).toEqual([
+      {
+        src_file: 'lib/auth/left_shift_consumer.rb',
+        src_line: 7,
+        src_symbol: 'run',
+        dst_file: null,
+        edge_kind: 'call',
+        resolution: 'name-only'
+      }
+    ])
+
+    const callers = await repo.findCallers('verify_token', { kind: 'method', pathGlob: 'lib/auth/**' })
+    expect(callers).toMatchObject([
+      {
+        file: 'lib/auth/left_shift_consumer.rb',
+        line: 7,
+        srcSymbol: 'run',
+        edgeKind: 'call',
+        resolution: 'name-only',
+        language: 'ruby'
+      }
+    ])
+  })
+
   it('bundles Python import-resolved usages for the top definition hit', async () => {
     const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-usages-py-'))
     temporaryDirectories.push(repoRoot)
