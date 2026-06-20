@@ -7,7 +7,16 @@ import { execFile as execFileCallback, spawn, type ChildProcessWithoutNullStream
 import { promisify } from 'node:util'
 
 import { VOYAGE_RERANK_PROVIDER_ID, openRepo, type FindSymbolOptions, type GrepHit, type GrepOptions, type Range, type SearchHit, type SearchOptions, type SymbolDefinition } from '@codesift/core'
-import { formatMcpGrepHits, formatMcpSearchHits, formatMcpSymbols } from '@codesift/mcp'
+import {
+  DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS,
+  DEFAULT_MCP_GREP_MAX_TOKENS,
+  DEFAULT_MCP_READ_CHUNK_MAX_TOKENS,
+  DEFAULT_MCP_SEARCH_MAX_TOKENS,
+  formatMcpGrepHits,
+  formatMcpReadChunk,
+  formatMcpSearchHits,
+  formatMcpSymbols
+} from '@codesift/mcp'
 
 const execFile = promisify(execFileCallback)
 
@@ -129,6 +138,7 @@ export interface UsageReportEntry {
   missingUsageFiles: string[]
   withoutUsagesCallsToResolution: number
   withUsagesCallsToResolution: number
+  withUsagesTokensToResolution: number
 }
 
 export interface RerankReportEntry {
@@ -366,7 +376,7 @@ export function formatSummary(summary: EvalSummary): string {
     lines.push('with_usages report-only')
     for (const entry of summary.usagesReport) {
       lines.push(
-        `  - ${entry.queryId}: usageRecall=${formatRatio(entry.usageRecall)} savedCallsΔ=${formatSignedNumber(entry.withUsagesCallsDelta)} bundled=${formatNumber(entry.withUsagesCallsToResolution)} baseline=${formatNumber(entry.withoutUsagesCallsToResolution)} matched=${entry.matchedUsageFiles.join(', ') || 'none'} missing=${entry.missingUsageFiles.join(', ') || 'none'}`
+        `  - ${entry.queryId}: usageRecall=${formatRatio(entry.usageRecall)} savedCallsΔ=${formatSignedNumber(entry.withUsagesCallsDelta)} bundledCalls=${formatNumber(entry.withUsagesCallsToResolution)} baselineCalls=${formatNumber(entry.withoutUsagesCallsToResolution)} bundledTokens=${formatNumber(entry.withUsagesTokensToResolution)} matched=${entry.matchedUsageFiles.join(', ') || 'none'} missing=${entry.missingUsageFiles.join(', ') || 'none'}`
       )
     }
     lines.push('')
@@ -579,7 +589,8 @@ async function measureWithUsagesReport(
     matchedUsageFiles,
     missingUsageFiles,
     withoutUsagesCallsToResolution,
-    withUsagesCallsToResolution: withUsagesRun.callsToResolution
+    withUsagesCallsToResolution: withUsagesRun.callsToResolution,
+    withUsagesTokensToResolution: withUsagesRun.tokensToResolution
   }
 }
 
@@ -681,17 +692,17 @@ function buildCodesiftToolCall(query: GoldenQuery, resultLimit: number): { name:
   switch (query.queryType) {
     case 'symbol-def':
     case 'exact-identifier':
-      return { name: 'find_symbol', arguments: { name: query.query, ...pathGlob } }
+      return { name: 'find_symbol', arguments: { name: query.query, max_tokens: DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS, ...pathGlob } }
     case 'string-literal':
     case 'error-trace':
       return {
         name: 'grep_code',
-        arguments: { pattern: query.grepPattern ?? query.query, max_matches: resultLimit, ...pathGlob }
+        arguments: { pattern: query.grepPattern ?? query.query, max_matches: resultLimit, max_tokens: DEFAULT_MCP_GREP_MAX_TOKENS, ...pathGlob }
       }
     case 'nl-concept':
       return {
         name: 'search_code',
-        arguments: { query: query.query, k: resultLimit, max_tokens: 700, ...pathGlob }
+        arguments: { query: query.query, k: resultLimit, max_tokens: DEFAULT_MCP_SEARCH_MAX_TOKENS, ...pathGlob }
       }
   }
 }
@@ -741,7 +752,7 @@ function rpcId(message: unknown): number | undefined {
 function buildSearchOptions(query: GoldenQuery, resultLimit: number, overrides: Partial<SearchOptions> = {}): SearchOptions {
   const options: SearchOptions = {
     k: resultLimit,
-    maxTokens: 700,
+    maxTokens: DEFAULT_MCP_SEARCH_MAX_TOKENS,
     ...overrides
   }
 
@@ -764,7 +775,7 @@ async function runSearchPolicy(
   const score = scoreCandidates(candidates, query, inspectionLimit)
   const matchingRank = score.matchingRank
 
-  let tokensToResolution = estimateTokenCount(formatMcpSearchHits(hits))
+  let tokensToResolution = estimateTokenCount(formatMcpSearchHits(hits, { maxTokens: DEFAULT_MCP_SEARCH_MAX_TOKENS }))
   let callsToResolution = 1
 
   if (matchingRank !== null && query.expected.length === 1) {
@@ -829,7 +840,7 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
       // non-top match) still forces a follow-up read — count it as 2 calls. A
       // MULTI-target lookup ("where are all the Xs") is answered by the location set
       // in a single call, so it is never charged a per-body follow-up.
-      let tokensToResolution = estimateTokenCount(formatMcpSymbols(definitions))
+      let tokensToResolution = estimateTokenCount(formatMcpSymbols(definitions, { maxTokens: DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS }))
       let callsToResolution = 1
 
       if (matchingRank !== null && query.expected.length === 1) {
@@ -840,7 +851,7 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
           rangesOverlap(matchingDef.range, query.expectedLineRange)
 
         if (!bodyResolves && matchingDef) {
-          const followUp = await readRangeSafely(repo, matchingDef.file, matchingDef.range)
+          const followUp = await readSymbolChunkSafely(repo, matchingDef)
           if (followUp !== null) {
             tokensToResolution += estimateTokenCount(followUp)
             callsToResolution = 2
@@ -869,7 +880,7 @@ async function runCodesiftPolicy(repo: Awaited<ReturnType<typeof openRepo>>, que
       const pattern = query.grepPattern ?? query.query
       const hits = await repo.grep(pattern, grepOptions)
       const candidates = hits.map(candidateFromGrep)
-      const tokens = estimateTokenCount(formatMcpGrepHits(hits))
+      const tokens = estimateTokenCount(formatMcpGrepHits(hits, { maxTokens: DEFAULT_MCP_GREP_MAX_TOKENS }))
       return evaluateRankedCandidates(candidates, query, tokens, inspectionLimit)
     }
     case 'nl-concept': {
@@ -1307,18 +1318,14 @@ function bodyOverlapsExpected(hit: SearchHit, expected: Range): boolean {
 
 async function readChunkSafely(repo: Awaited<ReturnType<typeof openRepo>>, id: string): Promise<string | null> {
   try {
-    return await repo.readChunk(id)
+    return formatMcpReadChunk(await repo.readChunk(id), { maxTokens: DEFAULT_MCP_READ_CHUNK_MAX_TOKENS })
   } catch {
     return null
   }
 }
 
-async function readRangeSafely(repo: Awaited<ReturnType<typeof openRepo>>, file: string, range: Range): Promise<string | null> {
-  try {
-    return await repo.readRange(file, range.startLine, range.endLine)
-  } catch {
-    return null
-  }
+async function readSymbolChunkSafely(repo: Awaited<ReturnType<typeof openRepo>>, definition: SymbolDefinition): Promise<string | null> {
+  return readChunkSafely(repo, `${definition.file}:${definition.range.startLine}-${definition.range.endLine}`)
 }
 
 function normalizePath(value: string): string {

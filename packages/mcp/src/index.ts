@@ -6,9 +6,13 @@ import {
   DEFAULT_SEARCH_K as CORE_DEFAULT_SEARCH_K,
   getDefaultEmbeddingProvider,
   isLearnedEmbeddingProvider,
+  type EdgeResult,
+  type FindEdgeOptions,
   type FindSymbolOptions,
   type GrepHit,
   type GrepOptions,
+  type ImpactOptions,
+  type ImpactResult,
   type Repo,
   type RepoStatus,
   type SearchHit,
@@ -23,6 +27,15 @@ import { createHttpServerHandle } from './http.js'
 export { HttpMcpServerHandle, createHttpServerHandle } from './http.js'
 
 export const DEFAULT_SEARCH_K = CORE_DEFAULT_SEARCH_K
+export const DEFAULT_MCP_SEARCH_MAX_TOKENS = 700
+export const DEFAULT_MCP_GREP_MAX_TOKENS = 700
+export const DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS = 700
+export const DEFAULT_MCP_RELATION_MAX_TOKENS = 700
+export const DEFAULT_MCP_READ_CHUNK_MAX_TOKENS = 1000
+export const DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS = 200
+export const MIN_MCP_READ_CHUNK_MAX_TOKENS = 6
+export const MAX_MCP_READ_CHUNK_MAX_TOKENS = 4000
+export const MAX_MCP_INDEX_STATUS_MAX_TOKENS = 1000
 
 const SYMBOL_KINDS = [
   'class',
@@ -41,6 +54,11 @@ const SYMBOL_KINDS = [
 export const MCP_TOOL_NAMES = [
   'search_code',
   'find_symbol',
+  'find_callers',
+  'find_refs',
+  'find_importers',
+  'who_implements',
+  'impact',
   'grep_code',
   'read_chunk',
   'index_status'
@@ -65,6 +83,40 @@ export interface FindSymbolArgs {
   kind?: FindSymbolOptions['kind'] | undefined
   path_glob?: string | undefined
   with_body?: boolean | undefined
+  with_callers?: boolean | undefined
+  max_tokens?: number | undefined
+}
+
+export interface FindCallersArgs {
+  name: string
+  kind?: FindEdgeOptions['kind'] | undefined
+  path_glob?: string | undefined
+  max_tokens?: number | undefined
+}
+
+export interface FindRefsArgs {
+  name: string
+  kind?: FindEdgeOptions['kind'] | undefined
+  path_glob?: string | undefined
+  max_tokens?: number | undefined
+}
+
+export interface FindImportersArgs {
+  file: string
+  max_tokens?: number | undefined
+}
+
+export interface FindImplementersArgs {
+  name: string
+  max_tokens?: number | undefined
+}
+
+export interface ImpactArgs {
+  name: string
+  depth?: number | undefined
+  kind?: ImpactOptions['kind'] | undefined
+  path_glob?: string | undefined
+  max_tokens?: number | undefined
 }
 
 export interface GrepCodeArgs {
@@ -79,11 +131,45 @@ export interface GrepCodeArgs {
   before_context_lines?: number | undefined
   after_context_lines?: number | undefined
   max_matches?: number | undefined
+  max_tokens?: number | undefined
+}
+
+export interface FormatMcpGrepHitsOptions {
+  maxTokens?: number | undefined
+}
+
+export interface FormatMcpSearchHitsOptions {
+  maxTokens?: number | undefined
+}
+
+export interface FormatMcpReadChunkOptions {
+  maxTokens?: number | undefined
+}
+
+export interface FormatMcpSymbolsOptions {
+  maxTokens?: number | undefined
+}
+
+export interface FormatMcpEdgeResultsOptions {
+  maxTokens?: number | undefined
+}
+
+export interface FormatMcpImpactOptions {
+  maxTokens?: number | undefined
 }
 
 export interface ReadChunkArgs {
   id: string
   context_lines?: number | undefined
+  max_tokens?: number | undefined
+}
+
+export interface IndexStatusArgs {
+  max_tokens?: number | undefined
+}
+
+export interface FormatMcpIndexStatusOptions {
+  maxTokens?: number | undefined
 }
 
 export interface McpToolDefinition {
@@ -113,6 +199,11 @@ export interface McpServerHandle {
 export interface McpRouter {
   searchCode(args: SearchCodeArgs): Promise<SearchHit[]>
   findSymbol(args: FindSymbolArgs): Promise<SymbolDefinition[]>
+  findCallers(args: FindCallersArgs): Promise<EdgeResult[]>
+  findReferences(args: FindRefsArgs): Promise<EdgeResult[]>
+  findImporters(args: FindImportersArgs): Promise<EdgeResult[]>
+  findImplementers(args: FindImplementersArgs): Promise<EdgeResult[]>
+  impact(args: ImpactArgs): Promise<ImpactResult>
   grepCode(args: GrepCodeArgs): Promise<GrepHit[]>
   readChunk(args: ReadChunkArgs): Promise<string>
   indexStatus(): Promise<RepoStatus>
@@ -130,60 +221,102 @@ export type McpJsonRpcResponse =
   | { jsonrpc: '2.0'; id: string | number | null; error: { code: number; message: string; data?: unknown } }
 
 export const MCP_SERVER_INSTRUCTIONS = [
-  'codesift is the repo search tool. Prefer it before host grep/read-file flows because results are compact and include stable ids for follow-up reads.',
-  'Routing policy: use find_symbol for exact identifiers/definitions; use grep_code for literal strings, env vars, error messages, operators, or regex; use search_code for concepts/behaviors/natural language.',
-  'search_code returns the complete top result inline (the full enclosing symbol body); no follow-up read is normally needed. Use read_chunk only to expand an ADDITIONAL hit beyond the top result or to widen context.',
-  'For search_code, start with k=5-8 and set max_tokens when context is tight. For grep_code, keep context_lines small unless the user asks for surrounding code.',
-  'If index_status reports no index, stale data, or a running/failed/aborted sync, suggest running codesift index before relying on results.'
+  'codesift;identifiers->find_symbol;callers/uses->find_callers/find_refs;breakage/transitive callers->impact;importers->find_importers;implements/extends->who_implements;G/J/Rb/Rs approx:name-only;literals/regex/errors/env/operators->grep_code;concepts/fuzzy names->search_code',
+  'Top search_code body inline;read_chunk only for non-top/wider context;Broad search k=5-8.',
+  'Check index_status;warn+sync if missing/stale/running/failed.'
 ].join('\n')
 
 const symbolKindSchema = z.enum(SYMBOL_KINDS)
 const kindFilterSchema = z.union([symbolKindSchema, z.array(symbolKindSchema)])
 
 const searchCodeInputSchema = {
-  query: z.string().min(1).describe('Natural-language, behavior, or symbol-aware query. Use grep_code instead for exact literals/regex.'),
-  k: z.number().int().positive().max(50).optional().describe('Maximum hits to return. Default is 8.'),
-  lang: z.array(z.string().min(1)).optional().describe('Language filter, e.g. ["typescript"], ["python"].'),
-  path_glob: z.string().min(1).optional().describe('Repo-relative glob, e.g. "src/**".'),
-  kind: kindFilterSchema.optional().describe('Symbol kind filter for matching chunks.'),
-  max_tokens: z.number().int().positive().max(4000).optional().describe('Maximum approximate tokens to return across compact hits. Default 700.'),
-  single_best: z.boolean().optional().describe('Return only the highest-confidence answer, useful for identifier-exact lookups.'),
-  context: z.enum(['sig', 'body']).optional().describe('Inline policy: sig=compact signatures/snippets only, body=inline full bodies wherever the budget allows.'),
-  with_usages: z.boolean().optional().describe('Bundle top-N import-resolved/local usage sites for the top definition hit (TS/JS + Python only).')
+  query: z.string().min(1).describe('Concept, behavior, or fuzzy name; not exact literals/regex.'),
+  k: z.number().int().positive().max(50).optional().describe('Max hits. Default 8.'),
+  lang: z.array(z.string().min(1)).optional().describe('Language filter, e.g. ["typescript"].'),
+  path_glob: z.string().min(1).optional().describe('Repo glob, e.g. "src/**".'),
+  kind: kindFilterSchema.optional().describe('Symbol kind filter.'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.'),
+  single_best: z.boolean().optional().describe('Return only best hit.'),
+  context: z.enum(['sig', 'body']).optional().describe('sig=snippets; body=inline bodies within budget.'),
+  with_usages: z.boolean().optional().describe('Add top usage sites for the top definition hit.')
 }
 
 const findSymbolInputSchema = {
-  name: z.string().min(1).describe('Exact or partial symbol name, e.g. TokenVerifier or verifyJwtToken.'),
-  kind: kindFilterSchema.optional().describe('Optional symbol kind filter.'),
-  path_glob: z.string().min(1).optional().describe('Repo-relative glob, e.g. "src/auth/**".'),
-  with_body: z.boolean().optional().describe('Inline the top exact match\'s full definition body so it resolves in one call. Default true; set false for a compact name→location list.')
+  name: z.string().min(1).describe('Exact/partial symbol name.'),
+  kind: kindFilterSchema.optional().describe('Symbol kind filter.'),
+  path_glob: z.string().min(1).optional().describe('Repo glob, e.g. "src/auth/**".'),
+  with_body: z.boolean().optional().describe('Inline top exact body. Default true.'),
+  with_callers: z.boolean().optional().describe('Append bounded caller/ref + same-file relations for the top exact hit.'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.')
+}
+
+const findCallersInputSchema = {
+  name: z.string().min(1).describe('Exact definition name to resolve through the symbol index.'),
+  kind: kindFilterSchema.optional().describe('Target definition kind filter for disambiguation.'),
+  path_glob: z.string().min(1).optional().describe('Target definition path glob for disambiguation, e.g. "src/schema/**".'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.')
+}
+
+const findRefsInputSchema = {
+  name: z.string().min(1).describe('Exact definition name to resolve through the symbol index.'),
+  kind: kindFilterSchema.optional().describe('Target definition kind filter for disambiguation.'),
+  path_glob: z.string().min(1).optional().describe('Target definition path glob for disambiguation, e.g. "src/schema/**".'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.')
+}
+
+const findImportersInputSchema = {
+  file: z.string().min(1).describe('Repo-relative file path to inspect for importing edges, e.g. "src/token.ts".'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.')
+}
+
+const findImplementersInputSchema = {
+  name: z.string().min(1).describe('Exact interface/class name to resolve through the symbol index.'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.')
+}
+
+const impactInputSchema = {
+  name: z.string().min(1).describe('Exact definition name to walk through transitive callers.'),
+  depth: z.number().int().min(0).max(8).optional().describe('Caller depth: 0=direct callers only. Default 2.'),
+  kind: kindFilterSchema.optional().describe('Target definition kind filter for root disambiguation.'),
+  path_glob: z.string().min(1).optional().describe('Target definition path glob for root disambiguation, e.g. "src/schema/**".'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.')
 }
 
 const grepCodeInputSchema = {
-  pattern: z.string().min(1).describe('Literal byte/string by default. Set regex=true for regular expressions.'),
-  regex: z.boolean().optional().describe('Treat pattern as a JavaScript regular expression. Default false for byte-exact literal search.'),
-  ignore_case: z.boolean().optional().describe('Case-insensitive matching, like rg -i.'),
-  whole_word: z.boolean().optional().describe('Match only whole identifier/word occurrences, like rg -w.'),
-  multiline: z.boolean().optional().describe('Allow regex dot to span newlines and report multi-line matches.'),
+  pattern: z.string().min(1).describe('Literal by default; set regex=true for regex.'),
+  regex: z.boolean().optional().describe('Use JavaScript regex. Default false.'),
+  ignore_case: z.boolean().optional().describe('Case-insensitive match.'),
+  whole_word: z.boolean().optional().describe('Whole word/identifier match.'),
+  multiline: z.boolean().optional().describe('Allow multi-line regex matches.'),
   lang: z.array(z.string().min(1)).optional().describe('Language filter, e.g. ["typescript"].'),
-  path_glob: z.string().min(1).optional().describe('Repo-relative glob, e.g. "packages/core/**".'),
-  context_lines: z.number().int().min(0).max(20).optional().describe('Symmetric context lines, like rg -C.'),
-  before_context_lines: z.number().int().min(0).max(20).optional().describe('Lines before each match, like rg -B.'),
-  after_context_lines: z.number().int().min(0).max(20).optional().describe('Lines after each match, like rg -A.'),
-  max_matches: z.number().int().positive().max(1000).optional().describe('Maximum matches to return. Default 1000.')
+  path_glob: z.string().min(1).optional().describe('Repo glob, e.g. "packages/core/**".'),
+  context_lines: z.number().int().min(0).max(20).optional().describe('Lines before/after each match.'),
+  before_context_lines: z.number().int().min(0).max(20).optional().describe('Lines before each match.'),
+  after_context_lines: z.number().int().min(0).max(20).optional().describe('Lines after each match.'),
+  max_matches: z.number().int().positive().max(1000).optional().describe('Max matches. Default 1000.'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.')
 }
 
 const readChunkInputSchema = {
-  id: z.string().min(1).describe('Stable chunk id returned by search_code.'),
-  context_lines: z.number().int().min(0).max(50).optional().describe('Extra lines before/after the chunk.')
+  id: z.string().min(1).describe('Stable search_code hit id.'),
+  context_lines: z.number().int().min(0).max(50).optional().describe('Extra surrounding lines.'),
+  max_tokens: z.number().int().min(MIN_MCP_READ_CHUNK_MAX_TOKENS).max(MAX_MCP_READ_CHUNK_MAX_TOKENS).optional().describe('Approx output tokens. Default 1000.')
 }
 
-const indexStatusInputSchema = {}
+const indexStatusInputSchema = {
+  max_tokens: z.number().int().positive().max(MAX_MCP_INDEX_STATUS_MAX_TOKENS).optional().describe('Approx output tokens. Default 200.')
+}
 
 const searchCodeArgsSchema = z.object(searchCodeInputSchema).strict()
 const findSymbolArgsSchema = z.object(findSymbolInputSchema).strict()
+const findCallersArgsSchema = z.object(findCallersInputSchema).strict()
+const findRefsArgsSchema = z.object(findRefsInputSchema).strict()
+const findImportersArgsSchema = z.object(findImportersInputSchema).strict()
+const findImplementersArgsSchema = z.object(findImplementersInputSchema).strict()
+const impactArgsSchema = z.object(impactInputSchema).strict()
 const grepCodeArgsSchema = z.object(grepCodeInputSchema).strict()
 const readChunkArgsSchema = z.object(readChunkInputSchema).strict()
+const indexStatusArgsSchema = z.object(indexStatusInputSchema).strict()
 const toolCallParamsSchema = z.object({
   name: z.enum(MCP_TOOL_NAMES),
   arguments: z.unknown().optional()
@@ -217,8 +350,8 @@ class StdioMcpServerHandle implements McpServerHandle {
 export function getToolDefinitions(): readonly McpToolDefinition[] {
   const provider = getDefaultEmbeddingProvider()
   const searchDescription = isLearnedEmbeddingProvider(provider)
-    ? 'Concept/behavior search over the current repo using hybrid lexical + semantic retrieval. Returns the complete top result inline (full enclosing symbol body); no follow-up read is normally needed. Use for natural-language questions; prefer grep_code for exact literals/regex and find_symbol for definitions.'
-    : 'Concept/behavior search over the current repo using lexical retrieval. Returns the complete top result inline (full enclosing symbol body); no follow-up read is normally needed. Use for natural-language questions; prefer grep_code for exact literals/regex and find_symbol for definitions.'
+    ? 'Hybrid lexical + semantic search for concepts/unknown names. Top body inline; grep_code literals/regex, find_symbol defs.'
+    : 'Lexical search for concepts/unknown names. Top body inline; grep_code literals/regex, find_symbol defs.'
 
   return [
     {
@@ -230,7 +363,7 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
         lang: { type: 'array', items: { type: 'string' } },
         path_glob: { type: 'string' },
         kind: kindJsonSchema(),
-        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: 700 },
+        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_SEARCH_MAX_TOKENS },
         single_best: { type: 'boolean' },
         context: { type: 'string', enum: ['sig', 'body'] },
         with_usages: { type: 'boolean' }
@@ -238,17 +371,66 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
     },
     {
       name: 'find_symbol',
-      description: 'Exact identifier/definition lookup from the symbols table. Returns the top match\'s full definition body inline (no follow-up read normally needed). Use before search_code for class/function/type names.',
+      description: 'Exact identifier lookup. Top body inline; optional bounded relations.',
       inputSchema: jsonSchema(['name'], {
         name: { type: 'string' },
         kind: kindJsonSchema(),
         path_glob: { type: 'string' },
-        with_body: { type: 'boolean', default: true }
+        with_body: { type: 'boolean', default: true },
+        with_callers: { type: 'boolean' },
+        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS }
+      })
+    },
+    {
+      name: 'find_callers',
+      description: 'Callers (Go/Java/Ruby/Rust approx:name-only).',
+      inputSchema: jsonSchema(['name'], {
+        name: { type: 'string' },
+        kind: kindJsonSchema(),
+        path_glob: { type: 'string' },
+        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_RELATION_MAX_TOKENS }
+      })
+    },
+    {
+      name: 'find_refs',
+      description: 'Refs (Go/Java/Ruby/Rust approx:name-only).',
+      inputSchema: jsonSchema(['name'], {
+        name: { type: 'string' },
+        kind: kindJsonSchema(),
+        path_glob: { type: 'string' },
+        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_RELATION_MAX_TOKENS }
+      })
+    },
+    {
+      name: 'find_importers',
+      description: 'Indexed importers for a repo file.',
+      inputSchema: jsonSchema(['file'], {
+        file: { type: 'string' },
+        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_RELATION_MAX_TOKENS }
+      })
+    },
+    {
+      name: 'who_implements',
+      description: 'Implementers/extends (Go/Java/Ruby/Rust approx:name-only).',
+      inputSchema: jsonSchema(['name'], {
+        name: { type: 'string' },
+        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_RELATION_MAX_TOKENS }
+      })
+    },
+    {
+      name: 'impact',
+      description: 'Transitive callers/impact (Go/Java/Ruby/Rust approx:name-only).',
+      inputSchema: jsonSchema(['name'], {
+        name: { type: 'string' },
+        depth: { type: 'integer', minimum: 0, maximum: 8, default: 2 },
+        kind: kindJsonSchema(),
+        path_glob: { type: 'string' },
+        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_RELATION_MAX_TOKENS }
       })
     },
     {
       name: 'grep_code',
-      description: 'Literal, byte-exact, or regex search over indexed repo files. Use instead of host grep for env vars, error strings, operators, and regex.',
+      description: 'Literal/regex search for env vars, errors, operators, exact text.',
       inputSchema: jsonSchema(['pattern'], {
         pattern: { type: 'string' },
         regex: { type: 'boolean', default: false },
@@ -260,21 +442,25 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
         context_lines: { type: 'integer', minimum: 0, maximum: 20 },
         before_context_lines: { type: 'integer', minimum: 0, maximum: 20 },
         after_context_lines: { type: 'integer', minimum: 0, maximum: 20 },
-        max_matches: { type: 'integer', minimum: 1, maximum: 1000 }
+        max_matches: { type: 'integer', minimum: 1, maximum: 1000 },
+        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: 700 }
       })
     },
     {
       name: 'read_chunk',
-      description: 'Expand an ADDITIONAL search_code hit id into its source chunk, or widen context around one. The top search_code result is already returned inline, so this is rarely needed for the best hit; use it for secondary hits or extra surrounding lines, not as a first step.',
+      description: 'Read non-top/wider context by id. Not needed for top search_code/find_symbol hits returned inline.',
       inputSchema: jsonSchema(['id'], {
         id: { type: 'string' },
-        context_lines: { type: 'integer', minimum: 0, maximum: 50 }
+        context_lines: { type: 'integer', minimum: 0, maximum: 50 },
+        max_tokens: { type: 'integer', minimum: MIN_MCP_READ_CHUNK_MAX_TOKENS, maximum: MAX_MCP_READ_CHUNK_MAX_TOKENS, default: DEFAULT_MCP_READ_CHUNK_MAX_TOKENS }
       })
     },
     {
       name: 'index_status',
-      description: 'Inspect index freshness, sync/crash state, counts, provider, and vector availability before relying on search results.',
-      inputSchema: jsonSchema([], {})
+      description: 'Inspect index health.',
+      inputSchema: jsonSchema([], {
+        max_tokens: { type: 'integer', minimum: 1, maximum: MAX_MCP_INDEX_STATUS_MAX_TOKENS, default: DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS }
+      })
     }
   ]
 }
@@ -298,7 +484,7 @@ export function createRouter(repo: Repo): McpRouter {
         options.kind = args.kind
       }
 
-      options.maxTokens = args.max_tokens ?? 700
+      options.maxTokens = args.max_tokens ?? DEFAULT_MCP_SEARCH_MAX_TOKENS
       if (args.single_best !== undefined) {
         options.singleBest = args.single_best
       }
@@ -326,7 +512,62 @@ export function createRouter(repo: Repo): McpRouter {
         options.withBody = args.with_body
       }
 
+      if (args.with_callers !== undefined) {
+        options.withCallers = args.with_callers
+      }
+
       return repo.findSymbol(args.name, options)
+    },
+    async findCallers(args) {
+      const options: FindEdgeOptions = {}
+
+      if (args.kind) {
+        options.kind = args.kind
+      }
+
+      if (args.path_glob) {
+        options.pathGlob = args.path_glob
+      }
+
+      return repo.findCallers(args.name, options)
+    },
+    async findReferences(args) {
+      const options: FindEdgeOptions = {}
+
+      if (args.kind) {
+        options.kind = args.kind
+      }
+
+      if (args.path_glob) {
+        options.pathGlob = args.path_glob
+      }
+
+      return repo.findReferences(args.name, options)
+    },
+    async findImporters(args) {
+      return repo.findImporters(args.file)
+    },
+    async findImplementers(args) {
+      return repo.findImplementers(args.name)
+    },
+    async impact(args) {
+      const options: ImpactOptions = {
+        maxTokens: args.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS
+      }
+
+      if (args.depth !== undefined) {
+        options.depth = args.depth
+      }
+
+      if (args.kind) {
+        options.kind = args.kind
+      }
+
+      if (args.path_glob) {
+        options.pathGlob = args.path_glob
+      }
+
+      return repo.impact(args.name, options)
     },
     async grepCode(args) {
       const options: GrepOptions = {}
@@ -386,15 +627,55 @@ export async function callMcpTool(repo: Repo, name: McpToolName, args: unknown):
 
   switch (name) {
     case 'search_code':
-      return formatMcpSearchHits(await router.searchCode(searchCodeArgsSchema.parse(args)))
+      {
+        const parsed = searchCodeArgsSchema.parse(args)
+        return formatMcpSearchHits(await router.searchCode(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_SEARCH_MAX_TOKENS })
+      }
     case 'find_symbol':
-      return formatMcpSymbols(await router.findSymbol(findSymbolArgsSchema.parse(args)))
+      {
+        const parsed = findSymbolArgsSchema.parse(args)
+        return formatMcpSymbols(await router.findSymbol(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS })
+      }
+    case 'find_callers':
+      {
+        const parsed = findCallersArgsSchema.parse(args)
+        return formatMcpCallers(await router.findCallers(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS })
+      }
+    case 'find_refs':
+      {
+        const parsed = findRefsArgsSchema.parse(args)
+        return formatMcpReferences(await router.findReferences(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS })
+      }
+    case 'find_importers':
+      {
+        const parsed = findImportersArgsSchema.parse(args)
+        return formatMcpImporters(await router.findImporters(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS })
+      }
+    case 'who_implements':
+      {
+        const parsed = findImplementersArgsSchema.parse(args)
+        return formatMcpImplementers(await router.findImplementers(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS })
+      }
+    case 'impact':
+      {
+        const parsed = impactArgsSchema.parse(args)
+        return formatMcpImpact(await router.impact(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS })
+      }
     case 'grep_code':
-      return formatMcpGrepHits(await router.grepCode(grepCodeArgsSchema.parse(args)))
+      {
+        const parsed = grepCodeArgsSchema.parse(args)
+        return formatMcpGrepHits(await router.grepCode(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_GREP_MAX_TOKENS })
+      }
     case 'read_chunk':
-      return router.readChunk(readChunkArgsSchema.parse(args))
+      {
+        const parsed = readChunkArgsSchema.parse(args)
+        return formatMcpReadChunk(await router.readChunk(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_READ_CHUNK_MAX_TOKENS })
+      }
     case 'index_status':
-      return JSON.stringify(await router.indexStatus())
+      {
+        const parsed = indexStatusArgsSchema.parse(args)
+        return formatMcpIndexStatus(await router.indexStatus(), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS })
+      }
   }
 }
 
@@ -460,19 +741,34 @@ export function createSdkServer(repo: Repo): McpServer {
   )
 
   server.registerTool('search_code', { description: toolDescription('search_code'), inputSchema: searchCodeInputSchema }, async (args) =>
-    textResult(formatMcpSearchHits(await router.searchCode(args)))
+    textResult(formatMcpSearchHits(await router.searchCode(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_SEARCH_MAX_TOKENS }))
   )
   server.registerTool('find_symbol', { description: toolDescription('find_symbol'), inputSchema: findSymbolInputSchema }, async (args) =>
-    textResult(formatMcpSymbols(await router.findSymbol(args)))
+    textResult(formatMcpSymbols(await router.findSymbol(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS }))
+  )
+  server.registerTool('find_callers', { description: toolDescription('find_callers'), inputSchema: findCallersInputSchema }, async (args) =>
+    textResult(formatMcpCallers(await router.findCallers(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS }))
+  )
+  server.registerTool('find_refs', { description: toolDescription('find_refs'), inputSchema: findRefsInputSchema }, async (args) =>
+    textResult(formatMcpReferences(await router.findReferences(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS }))
+  )
+  server.registerTool('find_importers', { description: toolDescription('find_importers'), inputSchema: findImportersInputSchema }, async (args) =>
+    textResult(formatMcpImporters(await router.findImporters(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS }))
+  )
+  server.registerTool('who_implements', { description: toolDescription('who_implements'), inputSchema: findImplementersInputSchema }, async (args) =>
+    textResult(formatMcpImplementers(await router.findImplementers(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS }))
+  )
+  server.registerTool('impact', { description: toolDescription('impact'), inputSchema: impactInputSchema }, async (args) =>
+    textResult(formatMcpImpact(await router.impact(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS }))
   )
   server.registerTool('grep_code', { description: toolDescription('grep_code'), inputSchema: grepCodeInputSchema }, async (args) =>
-    textResult(formatMcpGrepHits(await router.grepCode(args)))
+    textResult(formatMcpGrepHits(await router.grepCode(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_GREP_MAX_TOKENS }))
   )
   server.registerTool('read_chunk', { description: toolDescription('read_chunk'), inputSchema: readChunkInputSchema }, async (args) =>
-    textResult(await router.readChunk(args))
+    textResult(formatMcpReadChunk(await router.readChunk(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_READ_CHUNK_MAX_TOKENS }))
   )
-  server.registerTool('index_status', { description: toolDescription('index_status'), inputSchema: indexStatusInputSchema }, async () =>
-    textResult(JSON.stringify(await router.indexStatus()))
+  server.registerTool('index_status', { description: toolDescription('index_status'), inputSchema: indexStatusInputSchema }, async (args) =>
+    textResult(formatMcpIndexStatus(await router.indexStatus(), { maxTokens: args.max_tokens ?? DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS }))
   )
 
   return server
@@ -518,37 +814,314 @@ function toolDescription(name: McpToolName): string {
   return tool?.description ?? name
 }
 
-export function formatMcpSearchHits(hits: SearchHit[]): string {
+export function formatMcpSearchHits(hits: SearchHit[], options: FormatMcpSearchHitsOptions = {}): string {
   if (hits.length === 0) {
     return 'no_hits'
   }
 
+  const ambiguityHint = formatSearchAmbiguityHint(hits[0])
+  const tokensLine = formatSearchTokensLine(hits)
+  const renderedHits = hits.map((hit) => formatMcpSearchHit(hit))
+  const output = joinSections([ambiguityHint, ...renderedHits, tokensLine])
+  const maxTokens = options.maxTokens
+  if (maxTokens === undefined || output.length <= maxTokens * 4) {
+    return output
+  }
+
+  return fitSearchOutputForBudget(hits, renderedHits, ambiguityHint, tokensLine, maxTokens * 4)
+}
+
+function formatSearchAmbiguityHint(hit: SearchHit | undefined): string {
   // An identifier that collides across multiple definitions is returned as a candidate
   // set, not a single confident answer — lead with the collision count so the caller
   // disambiguates instead of trusting the first row.
-  const ambiguousDefCount = hits[0]?.ambiguousDefCount
-  const ambiguityHint = ambiguousDefCount && ambiguousDefCount >= 2 ? `ambiguous: ${ambiguousDefCount} defs\n` : ''
+  const ambiguousDefCount = hit?.ambiguousDefCount
+  return ambiguousDefCount && ambiguousDefCount >= 2 ? `ambiguous: ${ambiguousDefCount} defs` : ''
+}
 
+function formatSearchTokensLine(hits: SearchHit[]): string {
   const tokensReturned = hits.reduce((sum, hit) => sum + hit.tokensReturned, 0)
-  const body = hits
-    .map((hit) => {
-      const symbol = formatHitSymbol(hit)
-      const generated = hit.generated ? ' [generated]' : ''
-      const stale = hit.stale ? ' [stale]' : ''
-      const header = `${hit.reason} ${formatChunkId(hit.id)}${symbol}${generated}${stale}`
+  return `tokensReturned=${tokensReturned}`
+}
 
-      if (hit.body !== undefined) {
-        const block = `${header}\n${formatBodyBlock(hit.body, hit.range.startLine ?? hit.snippetRange.startLine)}`
-        return hit.usages?.length ? `${block}\n${formatUsageBlock(hit.usages)}` : block
+function formatMcpSearchHit(hit: SearchHit): string {
+  const sections = [formatSearchHitHeader(hit)]
+  const content = formatSearchHitContent(hit)
+  if (content) {
+    sections.push(content)
+  }
+  if (hit.usages?.length) {
+    sections.push(formatUsageBlock(hit.usages))
+  }
+  return joinSections(sections)
+}
+
+function formatSearchHitHeader(hit: SearchHit): string {
+  const symbol = formatHitSymbol(hit)
+  const generated = hit.generated ? ' [generated]' : ''
+  const stale = hit.stale ? ' [stale]' : ''
+  return `${hit.reason} ${formatChunkId(hit.id)}${symbol}${generated}${stale}`
+}
+
+function formatSearchHitContent(hit: SearchHit): string {
+  if (hit.body !== undefined) {
+    return formatBodyBlock(hit.body, hit.range.startLine ?? hit.snippetRange.startLine)
+  }
+
+  return compactHitSnippet(hit.snippet, hit.snippetRange.startLine ?? hit.range.startLine, 4)
+}
+
+function fitSearchOutputForBudget(
+  hits: SearchHit[],
+  renderedHits: string[],
+  ambiguityHint: string,
+  tokensLine: string,
+  maxChars: number
+): string {
+  const leadingSections = ambiguityHint ? [ambiguityHint] : []
+  const hitsOnlyOutput = joinSections([...leadingSections, ...renderedHits])
+  if (hitsOnlyOutput.length <= maxChars) {
+    return appendSearchTokensLineIfFits(hitsOnlyOutput, tokensLine, maxChars)
+  }
+
+  const keptHits: string[] = []
+  for (let index = 0; index < renderedHits.length; index += 1) {
+    const candidateHits = [...keptHits, renderedHits[index]!]
+    const omitted = renderedHits.length - candidateHits.length
+    const marker = omitted > 0
+      ? searchHitOmissionMarker(omitted, remainingCharsForTrailingLine([...leadingSections, ...candidateHits], maxChars))
+      : ''
+    const candidateOutput = joinSections([...leadingSections, ...candidateHits, marker])
+    if (candidateOutput.length <= maxChars) {
+      keptHits.push(renderedHits[index]!)
+      continue
+    }
+
+    if (keptHits.length === 0) {
+      const output = fitSearchSingleHitOutput(hits[0]!, leadingSections, omitted, maxChars)
+      return appendSearchTokensLineIfFits(output, tokensLine, maxChars)
+    }
+
+    break
+  }
+
+  const outputHits = [...keptHits]
+  let omitted = renderedHits.length - outputHits.length
+  let marker = omitted > 0
+    ? searchHitOmissionMarker(omitted, remainingCharsForTrailingLine([...leadingSections, ...outputHits], maxChars))
+    : ''
+
+  while (omitted > 0 && !marker && outputHits.length > 1) {
+    outputHits.pop()
+    omitted += 1
+    marker = searchHitOmissionMarker(omitted, remainingCharsForTrailingLine([...leadingSections, ...outputHits], maxChars))
+  }
+
+  if (omitted > 0 && !marker && outputHits.length === 1) {
+    const output = fitSearchSingleHitOutput(hits[0]!, leadingSections, omitted, maxChars)
+    return appendSearchTokensLineIfFits(output, tokensLine, maxChars)
+  }
+
+  const output = joinSections([...leadingSections, ...outputHits, marker])
+  return appendSearchTokensLineIfFits(output, tokensLine, maxChars)
+}
+
+function fitSearchSingleHitOutput(hit: SearchHit, leadingSections: string[], omittedHits: number, maxChars: number): string {
+  const leadingOnly = joinSections(leadingSections)
+  const header = formatSearchHitHeader(hit)
+  const trailingVariants = omittedHits > 0 ? searchHitOmissionMarkerVariants(omittedHits) : ['']
+
+  for (const trailingLine of trailingVariants) {
+    const reservedHitBudget = maxChars
+      - (leadingOnly ? leadingOnly.length + 1 : 0)
+      - (trailingLine ? trailingLine.length + 1 : 0)
+    if (reservedHitBudget <= 0) {
+      continue
+    }
+
+    const hitOutput = formatSearchHitForBudget(hit, reservedHitBudget)
+    if (hitOutput) {
+      const candidate = joinSections([...leadingSections, hitOutput, trailingLine])
+      if (candidate.length <= maxChars) {
+        return candidate
+      }
+    }
+  }
+
+  const hitBudget = maxChars - (leadingOnly ? leadingOnly.length + 1 : 0)
+  if (omittedHits === 0 && hitBudget > 0 && hitBudget >= header.length) {
+    const hitOnly = formatSearchHitForBudget(hit, hitBudget)
+    if (hitOnly) {
+      const candidate = joinSections([...leadingSections, hitOnly])
+      if (candidate.length <= maxChars) {
+        return candidate
+      }
+    }
+  }
+
+  if (omittedHits > 0) {
+    const markerWithLeading = fitMarkerWithLeadingSections(leadingSections, trailingVariants, maxChars)
+    if (markerWithLeading) {
+      return markerWithLeading
+    }
+
+    return bestEffortOmissionMarker(trailingVariants, maxChars)
+  }
+
+  for (const trailingLine of trailingVariants) {
+    if (trailingLine && trailingLine.length <= maxChars) {
+      return trailingLine
+    }
+  }
+
+  if (leadingOnly && leadingOnly.length <= maxChars) {
+    return leadingOnly
+  }
+
+  return formatSearchHitForBudget(hit, maxChars)
+}
+
+function formatSearchHitForBudget(hit: SearchHit, maxChars: number): string {
+  const full = formatMcpSearchHit(hit)
+  if (full.length <= maxChars) {
+    return full
+  }
+
+  const header = formatSearchHitHeader(hit)
+  const content = formatSearchHitContent(hit)
+  const usageCount = hit.usages?.length ?? 0
+  if (maxChars <= header.length) {
+    if (usageCount > 0) {
+      return reserveUsageMarkerForSearchHit(header, content || undefined, maxChars, usageCount)
+    }
+    return truncateWithEllipsis(header, maxChars)
+  }
+
+  const sections = [header]
+
+  if (content) {
+    const remainingAfterHeader = maxChars - header.length - 1
+    if (content.length + 1 <= remainingAfterHeader) {
+      sections.push(content)
+      if (usageCount > 0) {
+        const usageBlock = formatUsageBlockForBudget(hit.usages!, maxChars - joinSections(sections).length - 1)
+        if (usageBlock) {
+          sections.push(usageBlock)
+          return joinSections(sections)
+        }
+
+        return reserveUsageMarkerForSearchHit(header, content, maxChars, usageCount)
+      }
+      return joinSections(sections)
+    }
+
+    if (usageCount > 0) {
+      return reserveUsageMarkerForSearchHit(header, content, maxChars, usageCount)
+    }
+
+    const truncatedContent = truncateSearchBlock(content, remainingAfterHeader)
+    if (truncatedContent) {
+      sections.push(truncatedContent)
+    }
+    const fallback = joinSections(sections)
+    return fallback.length <= maxChars ? fallback : truncateWithEllipsis(fallback, maxChars)
+  }
+
+  if (usageCount > 0) {
+    const usageBlock = formatUsageBlockForBudget(hit.usages!, maxChars - header.length - 1)
+    if (usageBlock) {
+      return joinSections([header, usageBlock])
+    }
+
+    return reserveUsageMarkerForSearchHit(header, undefined, maxChars, usageCount)
+  }
+
+  return truncateWithEllipsis(header, maxChars)
+}
+
+function reserveUsageMarkerForSearchHit(header: string, content: string | undefined, maxChars: number, omittedUsages: number): string {
+  const markers = usageOmissionMarkerVariants(omittedUsages)
+
+  if (content !== undefined) {
+    for (const marker of markers) {
+      const contentBudget = maxChars - header.length - 1 - marker.length - 1
+      if (contentBudget <= 0) {
+        continue
       }
 
-      const snippet = compactHitSnippet(hit.snippet, hit.range.startLine ?? hit.snippetRange.startLine, 4)
-      const block = snippet ? `${header}\n${snippet}` : header
-      return hit.usages?.length ? `${block}\n${formatUsageBlock(hit.usages)}` : block
-    })
-    .join('\n')
+      const truncatedContent = truncateSearchBlock(content, contentBudget)
+      if (!truncatedContent) {
+        continue
+      }
 
-  return `${ambiguityHint}${body}\ntokensReturned=${tokensReturned}`
+      const candidate = joinSections([header, truncatedContent, marker])
+      if (candidate.length <= maxChars) {
+        return candidate
+      }
+    }
+  }
+
+  const headerWithMarker = fitMarkerWithLeadingSections([header], markers, maxChars)
+  if (headerWithMarker) {
+    return headerWithMarker
+  }
+
+  if (content !== undefined) {
+    for (const marker of markers) {
+      const contentBudget = maxChars - marker.length - 1
+      if (contentBudget <= 0) {
+        continue
+      }
+
+      const truncatedContent = truncateSearchBlock(content, contentBudget)
+      if (!truncatedContent) {
+        continue
+      }
+
+      const candidate = joinSections([truncatedContent, marker])
+      if (candidate.length <= maxChars) {
+        return candidate
+      }
+    }
+  }
+
+  return bestEffortOmissionMarker(markers, maxChars)
+}
+
+function fitMarkerWithLeadingSections(leadingSections: string[], markers: string[], maxChars: number): string {
+  for (const marker of markers) {
+    const markerWithLeading = joinSections([...leadingSections, marker])
+    if (markerWithLeading && markerWithLeading.length <= maxChars) {
+      return markerWithLeading
+    }
+  }
+
+  const leadingOutput = joinSections(leadingSections)
+  const remainingForMarker = maxChars - (leadingOutput ? leadingOutput.length + 1 : 0)
+  if (remainingForMarker > 0) {
+    const truncatedMarker = bestEffortOmissionMarker(markers, remainingForMarker)
+    if (truncatedMarker) {
+      const candidate = joinSections([...leadingSections, truncatedMarker])
+      if (candidate.length <= maxChars) {
+        return candidate
+      }
+    }
+  }
+
+  return ''
+}
+
+function bestEffortOmissionMarker(markers: string[], maxChars: number): string {
+  if (maxChars <= 0 || markers.length === 0) {
+    return ''
+  }
+
+  const fittingMarker = firstMarkerThatFits(markers, maxChars)
+  if (fittingMarker) {
+    return fittingMarker
+  }
+
+  return truncateWithEllipsis(markers[0]!, maxChars)
 }
 
 function formatBodyBlock(body: string, startLine: number): string {
@@ -559,9 +1132,306 @@ function formatBodyBlock(body: string, startLine: number): string {
 function formatUsageBlock(usages: SymbolUsage[]): string {
   const lines = ['usages (import-resolved):']
   for (const usage of usages) {
-    lines.push(`- ${usage.file}:${usage.line} | ${usage.snippet}`)
+    lines.push(formatUsageLineRaw(usage))
   }
   return lines.join('\n')
+}
+
+function formatUsageBlockForBudget(usages: SymbolUsage[], maxChars: number): string {
+  if (maxChars <= 0) {
+    return ''
+  }
+
+  const full = formatUsageBlock(usages)
+  if (full.length <= maxChars) {
+    return full
+  }
+
+  const markerOnly = bestEffortOmissionMarker(usageOmissionMarkerVariants(usages.length), maxChars)
+  const header = 'usages (import-resolved):'
+  if (header.length > maxChars) {
+    return markerOnly
+  }
+
+  const sections = [header]
+  for (let index = 0; index < usages.length; index += 1) {
+    const usage = usages[index]!
+    const fullLine = formatUsageLineForBudget(usage)
+    const omittedAfterLine = usages.length - index - 1
+    const marker = omittedAfterLine > 0
+      ? usageOmissionMarker(omittedAfterLine, remainingCharsForTrailingLine([...sections, fullLine], maxChars))
+      : ''
+    const fullCandidate = joinSections([...sections, fullLine, marker])
+    if (fullCandidate.length <= maxChars) {
+      sections.push(fullLine)
+      continue
+    }
+
+    if (omittedAfterLine > 0) {
+      for (const markerVariant of usageOmissionMarkerVariants(omittedAfterLine)) {
+        const lineBudget = maxChars
+          - joinSections(sections).length
+          - 1
+          - markerVariant.length
+          - 1
+        const truncatedLine = formatUsageLineForBudget(usage, lineBudget)
+        if (!truncatedLine) {
+          continue
+        }
+
+        const truncatedCandidate = joinSections([...sections, truncatedLine, markerVariant])
+        if (truncatedCandidate.length <= maxChars) {
+          return truncatedCandidate
+        }
+      }
+    } else {
+      const truncatedLine = formatUsageLineForBudget(usage, maxChars - joinSections(sections).length - 1)
+      if (truncatedLine) {
+        const truncatedCandidate = joinSections([...sections, truncatedLine])
+        if (truncatedCandidate.length <= maxChars) {
+          return truncatedCandidate
+        }
+      }
+    }
+
+    const omitted = usages.length - (sections.length - 1)
+    for (const fallbackMarker of usageOmissionMarkerVariants(omitted)) {
+      const fallback = joinSections([...sections, fallbackMarker])
+      if (fallback.length <= maxChars) {
+        return fallback
+      }
+    }
+
+    return markerOnly
+  }
+
+  return joinSections(sections)
+}
+
+function formatUsageLineRaw(usage: SymbolUsage): string {
+  return `- ${usage.file}:${usage.line} | ${usage.snippet}`
+}
+
+function formatUsageLineForBudget(usage: SymbolUsage, maxChars?: number): string {
+  const prefix = `- ${usage.file}:${usage.line} | `
+  const snippet = usage.snippet.replace(/\n+/g, ' ').trimEnd()
+  if (maxChars === undefined || prefix.length + snippet.length <= maxChars) {
+    return `${prefix}${snippet}`
+  }
+  if (prefix.length > maxChars) {
+    return ''
+  }
+
+  return `${prefix}${truncateWithEllipsis(snippet, maxChars - prefix.length)}`
+}
+
+export function formatMcpIndexStatus(status: RepoStatus, options: FormatMcpIndexStatusOptions = {}): string {
+  const lines = [
+    formatIndexStatusPrimaryLine(status),
+    ...formatIndexStatusDetailLines(status)
+  ]
+  const action = suggestedIndexStatusAction(status)
+  if (action) {
+    lines.push(`action=${action}`)
+  }
+
+  const output = lines.join('\n')
+  const maxTokens = options.maxTokens
+  if (maxTokens === undefined || output.length <= maxTokens * 4) {
+    return output
+  }
+
+  return fitIndexStatusOutputForBudget(lines[0]!, action ? `action=${action}` : undefined, lines.slice(1, action ? -1 : undefined), maxTokens * 4)
+}
+
+function formatIndexStatusPrimaryLine(status: RepoStatus): string {
+  return [
+    `indexed=${status.indexed ? 'yes' : 'no'}`,
+    `stale=${status.stale ? 'yes' : 'no'}`,
+    `sync=${status.sync.state}`,
+    `chunks=${status.chunkCount}`,
+    `symbols=${status.symbolCount}`,
+    `gen=${status.indexGeneration}`,
+    `generated=${status.generatedFileCount}/${status.generatedChunkCount}`,
+    formatIndexStatusProvider(status),
+    `compat=${status.compatibility.ok ? 'ok' : status.compatibility.code ?? 'mismatch'}`,
+    `vector=${status.vectorSearch.state}`
+  ].filter(Boolean).join(' ')
+}
+
+function formatIndexStatusProvider(status: RepoStatus): string {
+  if (!status.provider) {
+    return 'provider=unconfigured'
+  }
+
+  const parts = [`provider=${compactStatusValue(status.provider.id)}`]
+  if (status.provider.dims !== undefined) {
+    parts.push(`dims=${status.provider.dims}`)
+  }
+  if (status.provider.modelVersion) {
+    parts.push(`model=${compactStatusValue(status.provider.modelVersion, 48)}`)
+  }
+  return parts.join(' ')
+}
+
+function formatIndexStatusDetailLines(status: RepoStatus): string[] {
+  const lines: string[] = []
+
+  for (const reason of status.staleReasons ?? []) {
+    const parts = [`stale_reasons=${reason.code}`]
+    if (reason.count !== undefined) {
+      parts.push(`count=${reason.count}`)
+    }
+    if (reason.files?.length) {
+      parts.push(`files=${formatStatusFileList(reason.files)}`)
+    }
+    if (reason.message) {
+      parts.push(`message=${compactStatusValue(reason.message, 100)}`)
+    }
+    if (reason.indexed) {
+      parts.push(`indexed=${compactStatusValue(reason.indexed, 48)}`)
+    }
+    if (reason.current) {
+      parts.push(`current=${compactStatusValue(reason.current, 48)}`)
+    }
+    lines.push(parts.join(' '))
+  }
+
+  if (status.sync.error) {
+    lines.push(`sync_error=${compactStatusValue(status.sync.error, 140)}`)
+  }
+
+  if (!status.compatibility.ok) {
+    if (status.compatibility.message) {
+      lines.push(`compat_message=${compactStatusValue(status.compatibility.message, 160)}`)
+    } else if (status.compatibility.code) {
+      lines.push(`compat_code=${status.compatibility.code}`)
+    }
+  }
+
+  if (status.vectorSearch.reason) {
+    lines.push(`vector_reason=${status.vectorSearch.reason}`)
+  }
+  if (status.vectorSearch.state === 'unavailable' && status.vectorSearch.message) {
+    lines.push(`vector_message=${compactStatusValue(status.vectorSearch.message, 120)}`)
+  }
+
+  return lines
+}
+
+function suggestedIndexStatusAction(status: RepoStatus): string {
+  if (status.indexed && !status.compatibility.ok) {
+    return 'codesift index --rebuild'
+  }
+  if (!status.indexed) {
+    return 'codesift index'
+  }
+  if (status.sync.state === 'failed' || status.sync.state === 'aborted') {
+    return 'codesift sync'
+  }
+  if (status.stale) {
+    return 'codesift sync'
+  }
+  if (status.sync.state === 'running') {
+    return 'wait for sync'
+  }
+
+  return ''
+}
+
+function fitIndexStatusOutputForBudget(primaryLine: string, actionLine: string | undefined, detailLines: string[], maxChars: number): string {
+  const marker = indexStatusTruncationMarker(Math.max(0, maxChars - 1))
+  const prioritized = actionLine ? [primaryLine, actionLine] : [primaryLine]
+  const output = prioritized.join('\n')
+
+  if (!marker) {
+    return truncateWithEllipsis(output, maxChars)
+  }
+
+  const fitted = [...prioritized]
+  for (const detail of detailLines) {
+    const candidate = [...fitted, detail, marker].join('\n')
+    if (candidate.length <= maxChars) {
+      fitted.push(detail)
+      continue
+    }
+
+    const remainingForDetail = maxChars - fitted.join('\n').length - 1 - marker.length - 1
+    if (remainingForDetail > 0) {
+      const truncatedDetail = truncateWithEllipsis(detail, remainingForDetail)
+      const truncatedCandidate = [...fitted, truncatedDetail, marker].join('\n')
+      if (truncatedCandidate.length <= maxChars) {
+        fitted.push(truncatedDetail)
+      }
+    }
+    break
+  }
+
+  const fittedWithMarker = [...fitted, marker].join('\n')
+  if (fittedWithMarker.length <= maxChars) {
+    return fittedWithMarker
+  }
+
+  const primaryWithMarker = [primaryLine, marker].join('\n')
+  if (primaryWithMarker.length <= maxChars) {
+    return primaryWithMarker
+  }
+
+  let compactPrimaryOnlyFallback = ''
+  for (const compactPrimary of compactIndexStatusPrimaryLineVariants(primaryLine)) {
+    if (compactPrimary === primaryLine) {
+      continue
+    }
+    const compactPrioritized = actionLine ? [compactPrimary, actionLine] : [compactPrimary]
+    const compactWithMarker = [...compactPrioritized, marker].join('\n')
+    if (compactWithMarker.length <= maxChars) {
+      return compactWithMarker
+    }
+
+    const compactPrimaryWithMarker = [compactPrimary, marker].join('\n')
+    if (compactPrimaryWithMarker.length <= maxChars) {
+      compactPrimaryOnlyFallback ||= compactPrimaryWithMarker
+    }
+  }
+
+  if (compactPrimaryOnlyFallback) {
+    return compactPrimaryOnlyFallback
+  }
+
+  return truncateWithEllipsis(primaryLine, maxChars)
+}
+
+function compactIndexStatusPrimaryLineVariants(primaryLine: string): string[] {
+  const fields = primaryLine.split(' ')
+  return [
+    ['indexed=', 'stale=', 'sync=', 'compat=', 'vector='],
+    ['indexed=', 'stale=', 'sync='],
+    ['indexed=', 'sync=']
+  ].map((prefixes) => fields.filter((field) => prefixes.some((prefix) => field.startsWith(prefix))).join(' '))
+}
+
+function indexStatusTruncationMarker(maxChars?: number): string {
+  const full = 'status_truncated=true; raise max_tokens'
+  const bare = 'status_truncated=true'
+  if (maxChars !== undefined && bare.length <= maxChars) {
+    return bare
+  }
+  if (maxChars === undefined || full.length <= maxChars) {
+    return full
+  }
+
+  return bare.length <= maxChars ? bare : ''
+}
+
+function formatStatusFileList(files: string[]): string {
+  const kept = files.slice(0, 2)
+  const omitted = files.length - kept.length
+  return [...kept.map((file) => compactStatusValue(file, 60)), ...(omitted > 0 ? [`+${omitted}`] : [])].join(',')
+}
+
+function compactStatusValue(value: string, maxChars = 80): string {
+  const compact = value.replace(/\s+/g, ' ').trim()
+  return compact.length <= maxChars ? compact : truncateWithEllipsis(compact, maxChars)
 }
 
 function formatHitSymbol(hit: SearchHit): string {
@@ -572,36 +1442,972 @@ function formatHitSymbol(hit: SearchHit): string {
   return ` ${[hit.parent, hit.symbol].filter(Boolean).join(' > ')}`
 }
 
-export function formatMcpSymbols(definitions: SymbolDefinition[]): string {
+export function formatMcpSymbols(definitions: SymbolDefinition[], options: FormatMcpSymbolsOptions = {}): string {
   if (definitions.length === 0) {
     return 'no_symbols'
   }
 
-  return definitions
-    .map((definition, index) => {
-      const header = `#${index + 1} ${definition.kind} ${definition.name} ${definition.file}:${formatRange(definition.range.startLine, definition.range.endLine)}`
-      // The top exact match carries a paste-ready body so the identifier resolves
-      // in a single call; render it with the same line-numbered block as search.
-      if (definition.body !== undefined) {
-        return `${header}\n${formatBodyBlock(definition.body, definition.range.startLine)}`
-      }
-      return header
-    })
-    .join('\n')
+  const rendered = definitions.map(formatMcpSymbolDefinition)
+  const output = rendered.join('\n')
+  const maxTokens = options.maxTokens
+  if (maxTokens === undefined || output.length <= maxTokens * 4) {
+    return output
+  }
+
+  return fitSymbolOutputForBudget(definitions, rendered, maxTokens * 4)
 }
 
-export function formatMcpGrepHits(hits: GrepHit[]): string {
+function formatMcpSymbolDefinition(definition: SymbolDefinition, index: number): string {
+  const sections = [formatMcpSymbolHeader(definition, index)]
+  // The top exact match carries a paste-ready body so the identifier resolves
+  // in a single call; render it with the same line-numbered block as search.
+  if (definition.body !== undefined) {
+    sections.push(formatBodyBlock(definition.body, definition.range.startLine))
+  }
+
+  const relations = formatMcpSymbolRelations(definition.relations)
+  if (relations) {
+    sections.push(relations)
+  }
+
+  return sections.join('\n')
+}
+
+function formatMcpSymbolHeader(definition: SymbolDefinition, index: number): string {
+  return `#${index + 1} ${definition.kind} ${definition.name} ${definition.file}:${formatRange(definition.range.startLine, definition.range.endLine)}`
+}
+
+function formatMcpSymbolRelations(relations: SymbolDefinition['relations']): string {
+  if (!relations) {
+    return ''
+  }
+
+  const itemLines = buildSymbolRelationLines(relations)
+  const sections = ['relations:', ...itemLines]
+  if (relations.omitted && relations.omitted > 0) {
+    sections.push(symbolRelationOmissionMarker(relations.omitted))
+  }
+
+  return itemLines.length > 0 || (relations.omitted ?? 0) > 0 ? joinSections(sections) : ''
+}
+
+function buildSymbolRelationLines(relations: NonNullable<SymbolDefinition['relations']>): string[] {
+  return [
+    ...relations.sites.map((site) => formatMcpSymbolRelationSite(site)),
+    ...relations.neighbors.map((neighbor) => formatMcpSymbolNeighborLine(neighbor))
+  ]
+}
+
+function formatMcpSymbolRelationSite(site: NonNullable<SymbolDefinition['relations']>['sites'][number]): string {
+  const context = site.srcSymbol ?? 'top-level'
+  const resolution = site.resolution === 'name-only' ? 'approx:name-only' : site.resolution
+  return `- ${site.edgeKind} ${site.file}:${site.line} ${context} ${resolution}`
+}
+
+function formatMcpSymbolNeighborLine(neighbor: NonNullable<SymbolDefinition['relations']>['neighbors'][number]): string {
+  const symbolPath = [neighbor.parent, neighbor.name].filter(Boolean).join(' > ')
+  return `- neighbor ${neighbor.kind} ${symbolPath} ${formatRange(neighbor.range.startLine, neighbor.range.endLine)}`
+}
+
+function countSymbolRelationItems(relations: SymbolDefinition['relations']): number {
+  if (!relations) {
+    return 0
+  }
+
+  return relations.sites.length + relations.neighbors.length + (relations.omitted ?? 0)
+}
+
+function fitSymbolOutputForBudget(definitions: SymbolDefinition[], rendered: string[], maxChars: number): string {
+  const omittedAfterFirst = definitions.length - 1
+  const firstHasRelations = countSymbolRelationItems(definitions[0]?.relations) > 0
+  const firstOnlyMarker = omittedAfterFirst > 0
+    ? symbolOmissionMarker(omittedAfterFirst, Math.max(0, maxChars - 2))
+    : firstHasRelations
+      ? undefined
+      : symbolBodyTruncationMarker(Math.max(0, maxChars - 2))
+  const firstOnlyBudget = maxCharsForFirstHit(maxChars, firstOnlyMarker)
+  if (rendered[0]!.length > firstOnlyBudget) {
+    const first = formatMcpSymbolDefinitionForBudget(definitions[0]!, 0, firstOnlyBudget)
+    return firstOnlyMarker ? [first, firstOnlyMarker].filter(Boolean).join('\n') : first
+  }
+
+  const parts = [rendered[0]!]
+  for (let index = 1; index < rendered.length; index += 1) {
+    const candidate = [...parts, rendered[index]!]
+    const omitted = definitions.length - 1 - (candidate.length - 1)
+    const marker = omitted > 0 ? symbolOmissionMarker(omitted, Math.max(0, maxChars - 2)) : undefined
+    const candidateOutput = marker ? [...candidate, marker].join('\n') : candidate.join('\n')
+    if (candidateOutput.length <= maxChars) {
+      parts.push(rendered[index]!)
+      continue
+    }
+    break
+  }
+
+  const omitted = definitions.length - parts.length
+  const marker = omitted > 0 ? symbolOmissionMarker(omitted, Math.max(0, maxChars - 2)) : undefined
+  const outputParts = marker ? [...parts, marker] : parts
+
+  const output = outputParts.join('\n')
+  return output.length <= maxChars ? output : truncateWithEllipsis(output, maxChars)
+}
+
+function formatMcpSymbolDefinitionForBudget(definition: SymbolDefinition, index: number, maxChars: number): string {
+  const header = formatMcpSymbolHeader(definition, index)
+  if (maxChars <= header.length) {
+    return truncateWithEllipsis(header, maxChars)
+  }
+
+  const sections = [header]
+  const relationItemCount = countSymbolRelationItems(definition.relations)
+  if (definition.body !== undefined) {
+    const relationReserve = relationItemCount > 0 ? minimumSymbolRelationBudget(definition.relations) + 1 : 0
+    const bodyBudget = Math.max(0, maxChars - header.length - 1 - relationReserve)
+    const body = truncateSymbolBodyBlock(formatBodyBlock(definition.body, definition.range.startLine), bodyBudget)
+    if (body) {
+      sections.push(body)
+    }
+  }
+
+  if (relationItemCount > 0 && definition.relations) {
+    const remainingForRelations = Math.max(0, maxChars - joinSections(sections).length - 1)
+    const relations = formatMcpSymbolRelationsForBudget(definition.relations, remainingForRelations)
+    if (relations) {
+      sections.push(relations)
+    }
+  }
+
+  const output = joinSections(sections)
+  return output.length <= maxChars ? output : truncateWithEllipsis(output, maxChars)
+}
+
+function minimumSymbolRelationBudget(relations: SymbolDefinition['relations']): number {
+  const count = countSymbolRelationItems(relations)
+  return count > 0 ? symbolRelationOmissionMarker(count).length : 0
+}
+
+function formatMcpSymbolRelationsForBudget(relations: NonNullable<SymbolDefinition['relations']>, maxChars: number): string {
+  if (maxChars <= 0) {
+    return ''
+  }
+
+  const itemLines = buildSymbolRelationLines(relations)
+  const baseOmitted = relations.omitted ?? 0
+  const full = joinSections([
+    'relations:',
+    ...itemLines,
+    baseOmitted > 0 ? symbolRelationOmissionMarker(baseOmitted) : ''
+  ])
+  if (full && full.length <= maxChars) {
+    return full
+  }
+
+  if (itemLines.length === 0) {
+    return bestEffortOmissionMarker(symbolRelationOmissionMarkerVariants(baseOmitted), maxChars)
+  }
+
+  const header = 'relations:'
+  if (header.length > maxChars) {
+    return bestEffortOmissionMarker(symbolRelationOmissionMarkerVariants(baseOmitted + itemLines.length), maxChars)
+  }
+
+  const kept = [header]
+  let keptItems = 0
+  for (let index = 0; index < itemLines.length; index += 1) {
+    const line = itemLines[index]!
+    const omittedAfter = baseOmitted + itemLines.length - (keptItems + 1)
+    const marker = omittedAfter > 0
+      ? symbolRelationOmissionMarker(omittedAfter, remainingCharsForTrailingLine([...kept, line], maxChars))
+      : ''
+    const candidate = joinSections([...kept, line, marker])
+    if (candidate.length <= maxChars) {
+      kept.push(line)
+      keptItems += 1
+      continue
+    }
+    break
+  }
+
+  const omitted = baseOmitted + itemLines.length - keptItems
+  if (omitted <= 0) {
+    return joinSections(kept)
+  }
+
+  let marker = symbolRelationOmissionMarker(omitted, remainingCharsForTrailingLine(kept, maxChars))
+  while (!marker && kept.length > 1) {
+    kept.pop()
+    keptItems -= 1
+    marker = symbolRelationOmissionMarker(baseOmitted + itemLines.length - keptItems, remainingCharsForTrailingLine(kept, maxChars))
+  }
+
+  if (!marker) {
+    return bestEffortOmissionMarker(symbolRelationOmissionMarkerVariants(baseOmitted + itemLines.length), maxChars)
+  }
+
+  return joinSections([...kept, marker])
+}
+
+function truncateSymbolBodyBlock(body: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return ''
+  }
+  if (body.length <= maxChars) {
+    return body
+  }
+
+  return truncateWithEllipsis(body, maxChars).replace(/\n+$/g, '')
+}
+
+function symbolOmissionMarker(omitted: number, maxChars?: number): string {
+  const full = `symbols_omitted=${omitted}; refine name/kind/path_glob or raise max_tokens.`
+  if (maxChars === undefined || full.length <= maxChars) {
+    return full
+  }
+
+  const compact = `symbols_omitted=${omitted}; raise max_tokens`
+  if (compact.length <= maxChars) {
+    return compact
+  }
+
+  const bare = `symbols_omitted=${omitted}`
+  return bare.length <= maxChars ? bare : ''
+}
+
+function symbolRelationOmissionMarker(omitted: number, maxChars?: number): string {
+  return firstMarkerThatFits(symbolRelationOmissionMarkerVariants(omitted), maxChars)
+}
+
+function symbolRelationOmissionMarkerVariants(omitted: number): string[] {
+  return [
+    `relations_omitted=${omitted}; raise max_tokens`,
+    `relations_omitted=${omitted}`
+  ]
+}
+
+function symbolBodyTruncationMarker(maxChars?: number): string {
+  const full = 'symbol_body_truncated=true; refine name/kind/path_glob or raise max_tokens.'
+  if (maxChars === undefined || full.length <= maxChars) {
+    return full
+  }
+
+  const compact = 'symbol_body_truncated=true; raise max_tokens'
+  if (compact.length <= maxChars) {
+    return compact
+  }
+
+  const bare = 'symbol_body_truncated=true'
+  return bare.length <= maxChars ? bare : ''
+}
+
+export function formatMcpCallers(results: EdgeResult[], options: FormatMcpEdgeResultsOptions = {}): string {
+  return formatMcpEdgeResults(results, 'no_callers', 'callers', options)
+}
+
+export function formatMcpReferences(results: EdgeResult[], options: FormatMcpEdgeResultsOptions = {}): string {
+  return formatMcpEdgeResults(results, 'no_refs', 'refs', options)
+}
+
+export function formatMcpImporters(results: EdgeResult[], options: FormatMcpEdgeResultsOptions = {}): string {
+  return formatMcpEdgeResults(results, 'no_importers', 'importers', options)
+}
+
+export function formatMcpImplementers(results: EdgeResult[], options: FormatMcpEdgeResultsOptions = {}): string {
+  return formatMcpEdgeResults(results, 'no_implementers', 'implementers', options)
+}
+
+export function formatMcpImpact(result: ImpactResult, options: FormatMcpImpactOptions = {}): string {
+  if (result.nodes.length === 0) {
+    return 'no_impact'
+  }
+
+  const rendered = result.nodes.map((node) => formatMcpImpactNode(node))
+  const notes = buildImpactNoteLines(result)
+  const output = joinSections([...rendered, ...notes])
+  const maxTokens = options.maxTokens
+  if (maxTokens === undefined || output.length <= maxTokens * 4) {
+    return output
+  }
+
+  return fitImpactOutputForBudget(rendered, notes, maxTokens * 4)
+}
+
+function buildImpactNoteLines(result: ImpactResult): string[] {
+  const notes: string[] = []
+  if (result.depthCapped) {
+    notes.push(`depth_capped=${result.depthLimit}`)
+  }
+  if (result.nodesCapped) {
+    notes.push(`nodes_capped=${result.maxNodes}`)
+  }
+  if (result.impactTruncated) {
+    notes.push('impact_truncated=true')
+  }
+  return notes
+}
+
+function formatMcpImpactNode(node: ImpactResult['nodes'][number], maxChars?: number): string {
+  const context = node.srcSymbol ?? node.name
+  const resolution = node.resolution === 'name-only' ? 'approx:name-only' : node.resolution
+  const prefix = `${node.file}:${node.line} ${context} d${node.depth} ${node.edgeKind} ${resolution} | `
+  const snippet = compactStatusValue(node.snippet, 240)
+
+  if (maxChars === undefined || prefix.length + snippet.length <= maxChars) {
+    return `${prefix}${snippet}`
+  }
+
+  if (prefix.length >= maxChars) {
+    return truncateWithEllipsis(prefix.trimEnd(), maxChars)
+  }
+
+  return `${prefix}${truncateWithEllipsis(snippet, maxChars - prefix.length)}`
+}
+
+function fitImpactOutputForBudget(rendered: string[], notes: string[], maxChars: number): string {
+  const kept: string[] = []
+  const requiredNotes = notes.includes('impact_truncated=true') ? notes : [...notes, 'impact_truncated=true']
+  const requiredNoteText = joinSections(requiredNotes)
+
+  for (let index = 0; index < rendered.length; index += 1) {
+    const line = rendered[index]!
+    const candidate = joinSections([...kept, line, requiredNoteText])
+    if (candidate.length <= maxChars) {
+      kept.push(line)
+      continue
+    }
+
+    if (kept.length === 0) {
+      const lineBudget = Math.max(0, maxChars - requiredNoteText.length - 1)
+      const fittedLine = lineBudget > 0 ? formatMcpImpactNodeLineForBudget(line, lineBudget) : ''
+      return joinSections([fittedLine, requiredNoteText]) || bestEffortOmissionMarker(['impact_truncated=true'], maxChars)
+    }
+
+    break
+  }
+
+  return fitImpactNotesWithLeadingSections(kept, requiredNotes, maxChars)
+}
+
+function fitImpactNotesWithLeadingSections(leadingSections: string[], notes: string[], maxChars: number): string {
+  const leading = joinSections(leadingSections)
+  for (let count = notes.length; count >= 1; count -= 1) {
+    const candidate = joinSections([...leadingSections, ...notes.slice(0, count)])
+    if (candidate.length <= maxChars) {
+      return candidate
+    }
+  }
+
+  const remaining = maxChars - (leading ? leading.length + 1 : 0)
+  if (remaining > 0) {
+    const note = bestEffortOmissionMarker(['impact_truncated=true'], remaining)
+    if (note) {
+      return joinSections([...leadingSections, note])
+    }
+  }
+
+  return leading ? truncateWithEllipsis(leading, maxChars) : bestEffortOmissionMarker(['impact_truncated=true'], maxChars)
+}
+
+function formatMcpImpactNodeLineForBudget(line: string, maxChars: number): string {
+  const separator = ' | '
+  const separatorIndex = line.indexOf(separator)
+  if (separatorIndex < 0 || line.length <= maxChars) {
+    return truncateWithEllipsis(line, maxChars)
+  }
+
+  const prefix = line.slice(0, separatorIndex + separator.length)
+  const snippet = line.slice(separatorIndex + separator.length)
+  if (prefix.length >= maxChars) {
+    return truncateWithEllipsis(prefix.trimEnd(), maxChars)
+  }
+
+  return `${prefix}${truncateWithEllipsis(snippet, maxChars - prefix.length)}`
+}
+
+function formatMcpEdgeResults(
+  results: EdgeResult[],
+  emptyMarker: string,
+  omissionLabel: 'callers' | 'refs' | 'importers' | 'implementers',
+  options: FormatMcpEdgeResultsOptions
+): string {
+  if (results.length === 0) {
+    return emptyMarker
+  }
+
+  const rendered = results.map((result) => formatMcpEdgeResult(result))
+  const output = rendered.join('\n')
+  const maxTokens = options.maxTokens
+  if (maxTokens === undefined || output.length <= maxTokens * 4) {
+    return output
+  }
+
+  return fitEdgeResultOutputForBudget(rendered, omissionLabel, maxTokens * 4)
+}
+
+function formatMcpEdgeResult(result: EdgeResult, maxChars?: number): string {
+  const context = result.srcSymbol ?? 'top-level'
+  const resolution = result.resolution === 'name-only' ? 'approx:name-only' : result.resolution
+  const prefix = `${result.file}:${result.line} ${context} ${result.edgeKind} ${resolution} | `
+  const snippet = compactStatusValue(result.snippet, 240)
+
+  if (maxChars === undefined || prefix.length + snippet.length <= maxChars) {
+    return `${prefix}${snippet}`
+  }
+
+  if (prefix.length >= maxChars) {
+    return truncateWithEllipsis(prefix.trimEnd(), maxChars)
+  }
+
+  return `${prefix}${truncateWithEllipsis(snippet, maxChars - prefix.length)}`
+}
+
+function fitEdgeResultOutputForBudget(
+  rendered: string[],
+  omissionLabel: 'callers' | 'refs' | 'importers' | 'implementers',
+  maxChars: number
+): string {
+  const kept: string[] = []
+
+  for (let index = 0; index < rendered.length; index += 1) {
+    const line = rendered[index]!
+    const omittedAfter = rendered.length - index - 1
+    const marker = omittedAfter > 0
+      ? edgeResultOmissionMarker(omissionLabel, omittedAfter, remainingCharsForTrailingLine([...kept, line], maxChars))
+      : ''
+    const candidate = joinSections([...kept, line, marker])
+    if (candidate.length <= maxChars) {
+      kept.push(line)
+      continue
+    }
+
+    if (kept.length === 0) {
+      return formatSingleEdgeResultForBudget(line, omissionLabel, omittedAfter, maxChars)
+    }
+
+    break
+  }
+
+  const omitted = rendered.length - kept.length
+  if (omitted <= 0) {
+    return joinSections(kept)
+  }
+
+  let marker = edgeResultOmissionMarker(omissionLabel, omitted, remainingCharsForTrailingLine(kept, maxChars))
+  while (!marker && kept.length > 0) {
+    kept.pop()
+    marker = edgeResultOmissionMarker(omissionLabel, rendered.length - kept.length, remainingCharsForTrailingLine(kept, maxChars))
+  }
+
+  if (!marker) {
+    return bestEffortOmissionMarker(edgeResultOmissionMarkerVariants(omissionLabel, omitted), maxChars)
+  }
+
+  return joinSections([...kept, marker])
+}
+
+function formatSingleEdgeResultForBudget(
+  line: string,
+  omissionLabel: 'callers' | 'refs' | 'importers' | 'implementers',
+  omittedAfter: number,
+  maxChars: number
+): string {
+  if (omittedAfter <= 0) {
+    return formatMcpEdgeResultLineForBudget(line, maxChars)
+  }
+
+  for (const marker of edgeResultOmissionMarkerVariants(omissionLabel, omittedAfter)) {
+    const lineBudget = maxChars - marker.length - 1
+    if (lineBudget <= 0) {
+      continue
+    }
+
+    const truncatedLine = formatMcpEdgeResultLineForBudget(line, lineBudget)
+    const candidate = joinSections([truncatedLine, marker])
+    if (candidate.length <= maxChars) {
+      return candidate
+    }
+  }
+
+  return bestEffortOmissionMarker(edgeResultOmissionMarkerVariants(omissionLabel, omittedAfter), maxChars)
+}
+
+function formatMcpEdgeResultLineForBudget(line: string, maxChars: number): string {
+  const separator = ' | '
+  const separatorIndex = line.indexOf(separator)
+  if (separatorIndex < 0 || line.length <= maxChars) {
+    return truncateWithEllipsis(line, maxChars)
+  }
+
+  const prefix = line.slice(0, separatorIndex + separator.length)
+  const snippet = line.slice(separatorIndex + separator.length)
+  if (prefix.length >= maxChars) {
+    return truncateWithEllipsis(prefix.trimEnd(), maxChars)
+  }
+
+  return `${prefix}${truncateWithEllipsis(snippet, maxChars - prefix.length)}`
+}
+
+export function formatMcpGrepHits(hits: GrepHit[], options: FormatMcpGrepHitsOptions = {}): string {
   if (hits.length === 0) {
     return 'no_matches'
   }
 
-  return hits
-    .map((hit) => {
-      const range = formatRange(hit.range.startLine, hit.range.endLine)
-      const snippet = compactSnippet(hit.snippet, 5).split('\n').join(' ↩ ')
-      return `${hit.file}:${range}:${hit.column} | ${snippet}`
-    })
+  const entries = buildMcpGrepEntries(hits)
+  const maxTokens = options.maxTokens
+  if (maxTokens === undefined) {
+    return entries.map((entry) => entry.text).join('\n')
+  }
+
+  const maxChars = maxTokens * 4
+  const rendered: McpRenderedGrepEntry[] = []
+  let usedChars = 0
+
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]!
+    const line = entry.text
+    const separatorChars = rendered.length === 0 ? 0 : 1
+    if (usedChars + separatorChars + line.length <= maxChars) {
+      rendered.push({ text: line, hits: entry.hits, matchCount: entry.hits.length })
+      usedChars += separatorChars + line.length
+      continue
+    }
+
+    if (rendered.length === 0) {
+      return formatMcpGrepEntryForBudget(entry, hits.length - entry.hits.length, maxChars)
+    }
+
+    return fitGrepOutputWithMarker(rendered, countGrepEntryMatches(entries, index), maxChars)
+  }
+
+  return rendered.map((entry) => entry.text).join('\n')
+}
+
+export function formatMcpReadChunk(content: string, options: FormatMcpReadChunkOptions = {}): string {
+  const maxTokens = options.maxTokens
+  if (maxTokens === undefined) {
+    return content
+  }
+
+  const maxChars = maxTokens * 4
+  if (content.length <= maxChars) {
+    return content
+  }
+
+  const marker = readChunkTruncationMarker(Math.max(0, maxChars - 1))
+  if (!marker) {
+    return truncateWithEllipsis('content_truncated=true', maxChars)
+  }
+
+  const contentBudget = Math.max(0, maxChars - marker.length - 1)
+  const truncatedContent = truncateReadChunkContent(content, contentBudget)
+  if (!truncatedContent) {
+    return marker.length <= maxChars ? marker : truncateWithEllipsis(marker, maxChars)
+  }
+
+  return `${truncatedContent}\n${marker}`
+}
+
+function truncateReadChunkContent(content: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return ''
+  }
+  if (content.length <= maxChars) {
+    return content
+  }
+
+  const truncated = truncateWithEllipsis(content, maxChars)
+  return truncated.replace(/\n+$/g, '')
+}
+
+function readChunkTruncationMarker(maxChars?: number): string {
+  const full = 'content_truncated=true; raise max_tokens or narrow the chunk/range.'
+  if (maxChars === undefined || full.length <= maxChars) {
+    return full
+  }
+
+  const compact = 'content_truncated=true; raise max_tokens'
+  if (compact.length <= maxChars) {
+    return compact
+  }
+
+  const bare = 'content_truncated=true'
+  return bare.length <= maxChars ? bare : ''
+}
+
+function formatMcpGrepHit(hit: GrepHit, maxChars?: number): string {
+  const range = formatRange(hit.range.startLine, hit.range.endLine)
+  const suffix = `:${range}:${hit.column} | `
+  const prefix = maxChars === undefined ? `${hit.file}${suffix}` : formatGrepPrefix(hit.file, suffix, maxChars)
+  const snippet = compactSnippet(hit.snippet, 5).split('\n').join(' ↩ ')
+
+  if (maxChars === undefined || prefix.length + snippet.length <= maxChars) {
+    return `${prefix}${snippet}`
+  }
+
+  return `${prefix}${truncateWithEllipsis(snippet, maxChars - prefix.length)}`
+}
+
+interface McpGrepEntry {
+  hits: GrepHit[]
+  text: string
+}
+
+interface McpRenderedGrepEntry {
+  text: string
+  hits: GrepHit[]
+  matchCount: number
+}
+
+function buildMcpGrepEntries(hits: GrepHit[]): McpGrepEntry[] {
+  const entries: McpGrepEntry[] = []
+
+  for (let index = 0; index < hits.length;) {
+    const group = collectOverlappingGrepHits(hits, index)
+    if (group.length > 1) {
+      entries.push({ hits: group, text: formatMcpGrepGroup(group) })
+      index += group.length
+      continue
+    }
+
+    const hit = hits[index]!
+    entries.push({ hits: [hit], text: formatMcpGrepHit(hit) })
+    index += 1
+  }
+
+  return entries
+}
+
+function collectOverlappingGrepHits(hits: GrepHit[], startIndex: number): GrepHit[] {
+  const first = hits[startIndex]!
+  if (!isGroupableGrepHit(first)) {
+    return [first]
+  }
+
+  const group = [first]
+  let mergedEndLine = first.snippetRange.endLine
+
+  for (let index = startIndex + 1; index < hits.length; index += 1) {
+    const hit = hits[index]!
+    if (!isGroupableGrepHit(hit) || hit.file !== first.file || hit.snippetRange.startLine > mergedEndLine + 1) {
+      break
+    }
+
+    group.push(hit)
+    mergedEndLine = Math.max(mergedEndLine, hit.snippetRange.endLine)
+  }
+
+  return group
+}
+
+function isGroupableGrepHit(hit: GrepHit): hit is GrepHit & { snippetRange: NonNullable<GrepHit['snippetRange']> } {
+  return hit.snippetRange !== undefined &&
+    (hit.snippetRange.startLine < hit.range.startLine || hit.snippetRange.endLine > hit.range.endLine)
+}
+
+function formatMcpGrepGroup(hits: GrepHit[]): string {
+  return [
+    ...hits.map((hit) => formatMcpGrepLocator(hit)),
+    formatMcpGrepMergedSnippet(hits)
+  ].join('\n')
+}
+
+function formatMcpGrepLocator(hit: GrepHit): string {
+  return `${hit.file}:${formatRange(hit.range.startLine, hit.range.endLine)}:${hit.column}`
+}
+
+function formatMcpGrepMergedSnippet(hits: GrepHit[]): string {
+  const sourceLines = new Map<number, string>()
+
+  for (const hit of hits) {
+    if (!hit.snippetRange) {
+      continue
+    }
+
+    const lines = hit.snippet.split('\n')
+    for (let offset = 0; offset < lines.length; offset += 1) {
+      const lineNumber = hit.snippetRange.startLine + offset
+      if (lineNumber <= hit.snippetRange.endLine && !sourceLines.has(lineNumber)) {
+        sourceLines.set(lineNumber, lines[offset]!)
+      }
+    }
+  }
+
+  return [...sourceLines.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([lineNumber, line]) => `${lineNumber} | ${line}`)
     .join('\n')
+}
+
+function countGrepEntryMatches(entries: McpGrepEntry[], startIndex: number): number {
+  let count = 0
+  for (let index = startIndex; index < entries.length; index += 1) {
+    count += entries[index]!.hits.length
+  }
+  return count
+}
+
+function formatMcpGrepEntryForBudget(entry: McpGrepEntry, omittedAfter: number, maxChars: number): string {
+  if (entry.hits.length === 1) {
+    const marker = omittedAfter > 0 ? grepOmissionMarker(omittedAfter, Math.max(0, maxChars - 2)) : undefined
+    const firstHit = formatMcpGrepHit(entry.hits[0]!, maxCharsForFirstHit(maxChars, marker))
+    return marker ? withGrepOmissionMarker([firstHit], marker) : firstHit
+  }
+
+  return formatMcpGrepGroupForBudget(entry.hits, omittedAfter, maxChars)
+}
+
+function formatMcpGrepGroupForBudget(hits: GrepHit[], omittedAfter: number, maxChars: number): string {
+  for (let locatorCount = hits.length; locatorCount >= 1; locatorCount -= 1) {
+    const omitted = omittedAfter + hits.length - locatorCount
+    const marker = omitted > 0 ? grepOmissionMarker(omitted, Math.max(0, maxChars - 2)) : undefined
+    const locators = hits.slice(0, locatorCount).map((hit) => formatMcpGrepLocator(hit))
+    const locatorText = locators.join('\n')
+    const locatorOutput = marker ? withGrepOmissionMarker(locators, marker) : locatorText
+
+    if (locatorOutput.length > maxChars) {
+      continue
+    }
+
+    const snippetBudget = marker === undefined
+      ? maxChars - locatorText.length - 1
+      : maxChars - locatorText.length - marker.length - 2
+    if (snippetBudget <= 0) {
+      return locatorOutput
+    }
+
+    const snippet = truncateGrepGroupSnippet(formatMcpGrepMergedSnippet(hits.slice(0, locatorCount)), snippetBudget)
+    if (!snippet) {
+      return locatorOutput
+    }
+
+    const withSnippet = marker
+      ? withGrepOmissionMarker([...locators, snippet], marker)
+      : `${locatorText}\n${snippet}`
+    if (withSnippet.length <= maxChars) {
+      return withSnippet
+    }
+  }
+
+  const marker = grepOmissionMarker(Math.max(0, omittedAfter + hits.length - 1), Math.max(0, maxChars - 2))
+  const firstHit = formatMcpGrepHit(hits[0]!, maxCharsForFirstHit(maxChars, marker))
+  return marker ? withGrepOmissionMarker([firstHit], marker) : firstHit
+}
+
+function truncateGrepGroupSnippet(snippet: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return ''
+  }
+  if (snippet.length <= maxChars) {
+    return snippet
+  }
+  return truncateWithEllipsis(snippet, maxChars).replace(/\n+$/g, '')
+}
+
+function formatGrepPrefix(file: string, suffix: string, maxChars: number): string {
+  const prefix = `${file}${suffix}`
+  if (prefix.length <= maxChars) {
+    return prefix
+  }
+
+  const fileChars = Math.max(0, maxChars - suffix.length - 1)
+  if (fileChars > 0) {
+    return `…${file.slice(-fileChars)}${suffix}`
+  }
+
+  return suffix.length <= maxChars ? suffix : suffix.slice(-maxChars)
+}
+
+function fitGrepOutputWithMarker(rendered: McpRenderedGrepEntry[], omitted: number, maxChars: number): string {
+  const kept = [...rendered]
+  let omittedCount = omitted
+  let marker = grepOmissionMarker(omittedCount, Math.max(0, maxChars - 2))
+
+  while (kept.length > 1 && joinedLength(kept.map((entry) => entry.text), marker) > maxChars) {
+    omittedCount += kept.pop()!.matchCount
+    marker = grepOmissionMarker(omittedCount, Math.max(0, maxChars - 2))
+  }
+
+  if (!marker) {
+    return formatMcpGrepLineForBudget(kept[0]!.text, maxChars)
+  }
+
+  const keptText = kept.map((entry) => entry.text)
+  if (joinedLength(keptText, marker) <= maxChars) {
+    return withGrepOmissionMarker(keptText, marker)
+  }
+
+  const firstEntry = kept[0]!
+  if (firstEntry.matchCount > 1) {
+    return formatMcpGrepEntryForBudget({ hits: firstEntry.hits, text: firstEntry.text }, omittedCount, maxChars)
+  }
+
+  const line = formatMcpGrepLineForBudget(firstEntry.text, maxCharsForFirstHit(maxChars, marker))
+  return marker ? withGrepOmissionMarker([line], marker) : line
+}
+
+function formatMcpGrepLineForBudget(line: string, maxChars: number): string {
+  const separator = ' | '
+  const separatorIndex = line.indexOf(separator)
+  if (separatorIndex < 0 || line.length <= maxChars) {
+    return line
+  }
+
+  let prefix = line.slice(0, separatorIndex + separator.length)
+  const snippet = line.slice(separatorIndex + separator.length)
+  if (prefix.length > maxChars) {
+    prefix = `…${prefix.slice(-(Math.max(0, maxChars - 1)))}`
+  }
+  return `${prefix}${truncateWithEllipsis(snippet, maxChars - prefix.length)}`
+}
+
+function maxCharsForFirstHit(maxChars: number, marker: string | undefined): number {
+  return marker === undefined ? maxChars : Math.max(0, maxChars - marker.length - 1)
+}
+
+function joinedLength(rendered: string[], marker: string): number {
+  return rendered.join('\n').length + 1 + marker.length
+}
+
+function searchHitOmissionMarker(omitted: number, maxChars?: number): string {
+  return firstMarkerThatFits(searchHitOmissionMarkerVariants(omitted), maxChars)
+}
+
+function usageOmissionMarker(omitted: number, maxChars?: number): string {
+  return firstMarkerThatFits(usageOmissionMarkerVariants(omitted), maxChars)
+}
+
+function grepOmissionMarker(omitted: number, maxChars?: number): string {
+  const full = `matches_omitted=${omitted}; refine path_glob/max_matches or raise max_tokens.`
+  if (maxChars === undefined || full.length <= maxChars) {
+    return full
+  }
+
+  const compact = `matches_omitted=${omitted}; raise max_tokens`
+  if (compact.length <= maxChars) {
+    return compact
+  }
+
+  const bare = `matches_omitted=${omitted}`
+  return bare.length <= maxChars ? bare : ''
+}
+
+function withGrepOmissionMarker(rendered: string[], marker: string): string {
+  return `${rendered.join('\n')}\n${marker}`
+}
+
+function searchHitOmissionMarkerVariants(omitted: number): string[] {
+  return [
+    `hits_omitted=${omitted}; refine query/path_glob/k or raise max_tokens.`,
+    `hits_omitted=${omitted}; raise max_tokens`,
+    `hits_omitted=${omitted}`
+  ]
+}
+
+function usageOmissionMarkerVariants(omitted: number): string[] {
+  return [
+    `usages_omitted=${omitted}; raise max_tokens`,
+    `usages_omitted=${omitted}`
+  ]
+}
+
+function edgeResultOmissionMarker(
+  label: 'callers' | 'refs' | 'importers' | 'implementers',
+  omitted: number,
+  maxChars?: number
+): string {
+  return firstMarkerThatFits(edgeResultOmissionMarkerVariants(label, omitted), maxChars)
+}
+
+function edgeResultOmissionMarkerVariants(
+  label: 'callers' | 'refs' | 'importers' | 'implementers',
+  omitted: number
+): string[] {
+  return [
+    `${label}_omitted=${omitted}; raise max_tokens`,
+    `${label}_omitted=${omitted}`
+  ]
+}
+
+function firstMarkerThatFits(markers: string[], maxChars?: number): string {
+  if (maxChars === undefined) {
+    return markers[0] ?? ''
+  }
+
+  for (const marker of markers) {
+    if (marker.length <= maxChars) {
+      return marker
+    }
+  }
+
+  return ''
+}
+
+function joinSections(sections: Array<string | undefined>): string {
+  return sections.filter((section): section is string => Boolean(section)).join('\n')
+}
+
+function remainingCharsForTrailingLine(sections: string[], maxChars: number): number {
+  const output = joinSections(sections)
+  return Math.max(0, maxChars - output.length - 1)
+}
+
+function appendSearchTokensLineIfFits(output: string, tokensLine: string, maxChars: number): string {
+  if (!output) {
+    return tokensLine.length <= maxChars ? tokensLine : truncateWithEllipsis(tokensLine, maxChars)
+  }
+
+  const withTokens = `${output}\n${tokensLine}`
+  return withTokens.length <= maxChars ? withTokens : output
+}
+
+function truncateSearchBlock(block: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return ''
+  }
+  if (block.length <= maxChars) {
+    return block
+  }
+
+  const lines = block.split('\n')
+  const kept: string[] = []
+  let used = 0
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!
+    const separator = kept.length === 0 ? 0 : 1
+    if (used + separator + line.length <= maxChars) {
+      kept.push(line)
+      used += separator + line.length
+      continue
+    }
+
+    const lineBudget = maxChars - used - separator
+    if (lineBudget > 0) {
+      const truncatedLine = truncateWithEllipsis(line, lineBudget)
+      if (truncatedLine) {
+        kept.push(truncatedLine)
+      }
+    }
+    break
+  }
+
+  if (kept.length === 0) {
+    return truncateWithEllipsis(block, maxChars)
+  }
+
+  return kept.join('\n').replace(/\n+$/g, '')
+}
+
+function truncateWithEllipsis(text: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return ''
+  }
+  if (text.length <= maxChars) {
+    return text
+  }
+  if (maxChars === 1) {
+    return '…'
+  }
+  return `${text.slice(0, maxChars - 1).trimEnd()}…`
 }
 
 function formatChunkId(id: string): string {
@@ -618,8 +2424,8 @@ function compactSnippet(snippet: string, maxLines: number): string {
 }
 
 // Structure-preserving renderer for compact (no-body) search hits: keeps
-// original indentation and emits `NN | code` line-number prefixes, matching the
-// inlined-body block. Only trailing whitespace and a trailing newline are dropped.
+// original indentation and emits `NN | code` prefixes from the centered snippet
+// range. Only trailing whitespace and a trailing newline are dropped.
 function compactHitSnippet(snippet: string, startLine: number, maxLines: number): string {
   const lines = snippet.replace(/\n$/, '').split('\n').slice(0, maxLines)
   if (lines.length === 0) {

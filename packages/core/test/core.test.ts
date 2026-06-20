@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3'
-import { mkdtemp, mkdir, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import { cp, mkdtemp, mkdir, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -104,6 +104,14 @@ TokenVerifier is the main entry point described in docs. TokenVerifier appears h
 
   await writeFile(join(repoRoot, 'pnpm-lock.yaml'), 'lockfileVersion: 9\n', 'utf8')
 
+  return repoRoot
+}
+
+async function copyFixtureRepository(fixtureName: string, prefix: string): Promise<string> {
+  const parentDirectory = await mkdtemp(join(tmpdir(), prefix))
+  const repoRoot = join(parentDirectory, 'repo')
+  temporaryDirectories.push(parentDirectory)
+  await cp(join(process.cwd(), 'packages', 'eval', 'fixtures', fixtureName), repoRoot, { recursive: true })
   return repoRoot
 }
 
@@ -609,8 +617,11 @@ describe('@codesift/core search body inlining', () => {
     const hits = await repo.search('huge retry backoff handler', { k: 1 })
 
     expect(hits[0]?.body).toBeDefined()
-    const body = hits[0]!.body!
-    expect(body).toContain('… (truncated — read_chunk <id> for full)')
+    const hit = hits[0]!
+    const body = hit.body!
+    const locator = `${hit.file}:${hit.range.startLine}-${hit.range.endLine}`
+    expect(body).toContain(`… (truncated — read_chunk ${locator} for full)`)
+    await expect(repo.readChunk(locator)).resolves.toContain('const huge79 = computeHugeRetryBackoff(79)')
     // Cap is whichever of ~50 lines / ~400 tokens is smaller; the body must be
     // shorter than the full 80+ line source on disk.
     expect(body.split('\n').length).toBeLessThanOrEqual(51)
@@ -713,9 +724,221 @@ describe('@codesift/core find_symbol body inlining', () => {
     expect(body).not.toMatch(/\n[ \t]*\n[ \t]*\n/)
     expect(body).toContain('return base + 2')
   })
+
+  it('truncates oversized bodies with an actionable read_chunk marker', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-findsymbol-truncate-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    const longBody = Array.from({ length: 80 }, (_, index) => `  const huge${index} = computeHugeRetryBackoff(${index})`).join('\n')
+    await writeFile(
+      join(repoRoot, 'src', 'huge.ts'),
+      `export function hugeRetryBackoffHandler(): number {\n${longBody}\n  return 0\n}\n`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const [def] = await repo.findSymbol('hugeRetryBackoffHandler')
+    expect(def?.body).toBeDefined()
+    const locator = `${def!.file}:${def!.range.startLine}-${def!.range.endLine}`
+    expect(def!.body!).toContain(`… (truncated — read_chunk ${locator} for full)`)
+    await expect(repo.readChunk(locator)).resolves.toContain('const huge79 = computeHugeRetryBackoff(79)')
+  })
+})
+
+describe('@codesift/core relational find_symbol + impact', () => {
+  it('bundles caller/ref sites and same-file neighbors for the top exact definition when withCallers:true', async () => {
+    const repoRoot = await copyFixtureRepository('usages-ts', 'codesift-findsymbol-relations-')
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+
+    const [definition] = await repo.findSymbol('parseToken', { withCallers: true })
+
+    expect(definition?.file).toBe('src/token.ts')
+    expect(definition?.body).toContain('export function parseToken')
+    expect(definition?.relations?.sites.map((site) => `${site.file}:${site.line}:${site.srcSymbol}:${site.edgeKind}:${site.resolution}`)).toEqual([
+      'src/api.ts:4:readSubject:call:import-resolved',
+      'src/worker.ts:4:enqueueToken:call:import-resolved'
+    ])
+    expect(definition?.relations?.neighbors).toMatchObject([
+      {
+        name: 'ParsedToken',
+        file: 'src/token.ts',
+        kind: 'interface',
+        range: { startLine: 1, endLine: 4 }
+      }
+    ])
+  })
+
+  it('walks bounded transitive callers and reports depth/node caps without exploding', async () => {
+    const repoRoot = await copyFixtureRepository('usages-ts', 'codesift-impact-')
+    await writeFile(
+      join(repoRoot, 'src', 'service.ts'),
+      `import { readSubject } from './api'
+
+export function handleToken(header: string): string {
+  return readSubject(header)
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'app.ts'),
+      `import { handleToken } from './service'
+
+export function runApp(header: string): string {
+  return handleToken(header)
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'cli.ts'),
+      `import { runApp } from './app'
+
+export function main(header: string): string {
+  return runApp(header)
+}
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const impact = await repo.impact('parseToken', { depth: 2 })
+    expect(impact.nodes.map((node) => `${node.depth}:${node.file}:${node.line}:${node.srcSymbol}:${node.edgeKind}:${node.resolution}`)).toEqual([
+      '0:src/api.ts:4:readSubject:call:import-resolved',
+      '0:src/worker.ts:4:enqueueToken:call:import-resolved',
+      '1:src/service.ts:4:handleToken:call:import-resolved',
+      '2:src/app.ts:4:runApp:call:import-resolved'
+    ])
+    expect(impact.depthCapped).toBe(true)
+    expect(impact.nodesCapped).not.toBe(true)
+    expect(impact.impactTruncated).not.toBe(true)
+
+    const capped = await repo.impact('parseToken', { depth: 3, maxNodes: 2 })
+    expect(capped.nodes).toHaveLength(2)
+    expect(capped.nodesCapped).toBe(true)
+    expect(capped.impactTruncated).toBe(true)
+  })
+
+  it('guards impact traversal against caller cycles', async () => {
+    const repoRoot = await copyFixtureRepository('usages-ts', 'codesift-impact-cycle-')
+    await writeFile(
+      join(repoRoot, 'src', 'a.ts'),
+      `import { parseToken } from './token'
+import { c } from './c'
+
+export function a(raw: string): string {
+  return raw.length > 0 ? parseToken(raw).subject : c(raw)
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'b.ts'),
+      `import { a } from './a'
+
+export function b(raw: string): string {
+  return a(raw)
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'c.ts'),
+      `import { b } from './b'
+
+export function c(raw: string): string {
+  return b(raw)
+}
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const impact = await repo.impact('parseToken', { depth: 10, maxNodes: 50 })
+    expect(impact.nodes.map((node) => `${node.depth}:${node.file}:${node.line}:${node.srcSymbol}:${node.edgeKind}`)).toEqual([
+      '0:src/a.ts:5:a:call',
+      '0:src/api.ts:4:readSubject:call',
+      '0:src/worker.ts:4:enqueueToken:call',
+      '1:src/b.ts:4:b:call',
+      '2:src/c.ts:4:c:call',
+      '3:src/a.ts:5:a:call'
+    ])
+    expect(impact.depthCapped).not.toBe(true)
+    expect(impact.nodesCapped).not.toBe(true)
+    expect(impact.impactTruncated).not.toBe(true)
+    expect(impact.maxNodes).toBe(50)
+
+    const hardCapped = await repo.impact('parseToken', { depth: 999, maxNodes: 1_000_000 })
+    expect(hardCapped.depthLimit).toBe(50)
+    expect(hardCapped.maxNodes).toBe(50)
+  })
 })
 
 describe('@codesift/core import-resolved usages', () => {
+  it('writes TS edges at index time and serves fixture usages from the persisted index', async () => {
+    const repoRoot = await copyFixtureRepository('usages-ts', 'codesift-fixture-usages-ts-')
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+
+    const db = new Database(join(repoRoot, '.codesift', 'index.db'))
+    const rows = db
+      .prepare<
+        [string],
+        {
+          src_file: string
+          src_line: number
+          src_symbol: string | null
+          dst_file: string | null
+          edge_kind: string
+          resolution: string
+        }
+      >(
+        `
+          select src_file, src_line, src_symbol, dst_file, edge_kind, resolution
+          from edges
+          where dst_name = ?
+          order by src_file asc, src_line asc, edge_kind asc
+        `
+      )
+      .all('parseToken')
+    db.close()
+
+    expect(rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          src_file: 'src/api.ts',
+          src_line: 4,
+          src_symbol: 'readSubject',
+          dst_file: 'src/token.ts',
+          edge_kind: 'call',
+          resolution: 'import-resolved'
+        }),
+        expect.objectContaining({
+          src_file: 'src/worker.ts',
+          src_line: 4,
+          src_symbol: 'enqueueToken',
+          dst_file: 'src/token.ts',
+          edge_kind: 'call',
+          resolution: 'import-resolved'
+        })
+      ])
+    )
+
+    const hits = await repo.search('parseToken', { k: 1, withUsages: true })
+    expect(hits[0]?.symbol).toBe('parseToken')
+    expect(hits[0]?.usages?.map((usage) => `${usage.file}:${usage.line}`)).toEqual(['src/api.ts:4', 'src/worker.ts:4'])
+  })
+
   it('bundles TS/JS import-resolved and same-file usages for the top definition hit', async () => {
     const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-usages-ts-'))
     temporaryDirectories.push(repoRoot)
@@ -766,6 +989,449 @@ export const ok = auth.verifyJwtToken('eyJ-demo')
     expect(hits[0]?.usages?.every((usage) => usage.resolution === 'import-resolved')).toBe(true)
   })
 
+  it('keys persisted usages by definition file for colliding TS definitions', async () => {
+    const repoRoot = await copyFixtureRepository('collision-ts', 'codesift-fixture-collision-ts-')
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+
+    const hits = await repo.search('name must be a non-empty string', { k: 1, withUsages: true })
+    expect(hits[0]?.file).toBe('src/schema/validator.ts')
+    expect(hits[0]?.symbol).toBe('validate')
+    expect(hits[0]?.usages?.map((usage) => `${usage.file}:${usage.line}`)).toEqual(['src/api/handler.ts:6'])
+
+    const db = new Database(join(repoRoot, '.codesift', 'index.db'))
+    const rows = db
+      .prepare<[string, string], { src_file: string; src_line: number; dst_file: string | null; edge_kind: string }>(
+        `
+          select src_file, src_line, dst_file, edge_kind
+          from edges
+          where dst_name = ? and dst_file = ? and edge_kind in ('call', 'ref')
+          order by src_file asc, src_line asc
+        `
+      )
+      .all('validate', 'src/schema/validator.ts')
+    db.close()
+
+    expect(rows).toEqual([
+      {
+        src_file: 'src/api/handler.ts',
+        src_line: 6,
+        dst_file: 'src/schema/validator.ts',
+        edge_kind: 'call'
+      }
+    ])
+  })
+
+  it('finds callers, references, and importers from persisted edges', async () => {
+    const repoRoot = await copyFixtureRepository('usages-ts', 'codesift-fixture-graph-usages-ts-')
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+
+    const callers = await repo.findCallers('parseToken')
+    const references = await repo.findReferences('parseToken')
+    const importers = await repo.findImporters('src/token.ts')
+
+    expect(callers).toMatchObject([
+      {
+        file: 'src/api.ts',
+        line: 4,
+        range: { startLine: 4, endLine: 4 },
+        srcSymbol: 'readSubject',
+        edgeKind: 'call',
+        resolution: 'import-resolved',
+        snippet: "  const claims = parseToken(header.replace('Bearer ', ''))",
+        language: 'typescript'
+      },
+      {
+        file: 'src/worker.ts',
+        line: 4,
+        range: { startLine: 4, endLine: 4 },
+        srcSymbol: 'enqueueToken',
+        edgeKind: 'call',
+        resolution: 'import-resolved',
+        snippet: '  const claims = parseToken(raw)',
+        language: 'typescript'
+      }
+    ])
+
+    expect(references).toMatchObject([
+      {
+        file: 'src/api.ts',
+        line: 4,
+        srcSymbol: 'readSubject',
+        edgeKind: 'call',
+        resolution: 'import-resolved'
+      },
+      {
+        file: 'src/worker.ts',
+        line: 4,
+        srcSymbol: 'enqueueToken',
+        edgeKind: 'call',
+        resolution: 'import-resolved'
+      }
+    ])
+
+    expect(importers).toMatchObject([
+      {
+        file: 'src/api.ts',
+        line: 1,
+        range: { startLine: 1, endLine: 1 },
+        edgeKind: 'import',
+        resolution: 'import-resolved',
+        snippet: "import { parseToken } from './token'",
+        language: 'typescript'
+      },
+      {
+        file: 'src/worker.ts',
+        line: 1,
+        range: { startLine: 1, endLine: 1 },
+        edgeKind: 'import',
+        resolution: 'import-resolved',
+        snippet: "import { parseToken } from './token'",
+        language: 'typescript'
+      }
+    ])
+  })
+
+  it('distinguishes callers from non-call references', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-graph-call-vs-ref-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    await writeFile(
+      join(repoRoot, 'src', 'token.ts'),
+      `export function parseToken(token: string): string {
+  return token.trim()
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'api.ts'),
+      `import { parseToken } from './token'
+
+export function readSubject(header: string): string {
+  return parseToken(header)
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'ref.ts'),
+      `import { parseToken } from './token'
+
+export function keepParser(token: string): string {
+  const parser = parseToken
+  return parser(token)
+}
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    expect((await repo.findCallers('parseToken')).map((result) => `${result.file}:${result.line}:${result.srcSymbol}:${result.edgeKind}`)).toEqual([
+      'src/api.ts:4:readSubject:call'
+    ])
+    expect((await repo.findReferences('parseToken')).map((result) => `${result.file}:${result.line}:${result.srcSymbol}:${result.edgeKind}`)).toEqual([
+      'src/api.ts:4:readSubject:call',
+      'src/ref.ts:4:keepParser:ref'
+    ])
+  })
+
+  it('resolves default-import callers, refs, impact, and usages to the real default-exported symbol name', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-default-import-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    await writeFile(
+      join(repoRoot, 'src', 'token.ts'),
+      `export default function parseToken(token: string): string {
+  return token.trim()
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'api.ts'),
+      `import parseToken from './token'
+
+export function readSubject(header: string): string {
+  return parseToken(header)
+}
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    expect((await repo.findCallers('parseToken')).map((result) => `${result.file}:${result.line}:${result.srcSymbol}:${result.edgeKind}`)).toEqual([
+      'src/api.ts:4:readSubject:call'
+    ])
+    expect((await repo.findReferences('parseToken')).map((result) => `${result.file}:${result.line}:${result.srcSymbol}:${result.edgeKind}`)).toEqual([
+      'src/api.ts:4:readSubject:call'
+    ])
+    expect((await repo.impact('parseToken', { depth: 1 })).nodes.map((node) => `${node.depth}:${node.file}:${node.line}:${node.srcSymbol}:${node.edgeKind}`)).toEqual([
+      '0:src/api.ts:4:readSubject:call'
+    ])
+    expect((await repo.search('parseToken', { k: 1, withUsages: true }))[0]?.usages?.map((usage) => `${usage.file}:${usage.line}`)).toEqual([
+      'src/api.ts:4'
+    ])
+  })
+
+  it('disambiguates callers and references by destination file for colliding definitions', async () => {
+    const repoRoot = await copyFixtureRepository('collision-ts', 'codesift-fixture-graph-collision-ts-')
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+
+    const callers = await repo.findCallers('validate', { kind: 'function', pathGlob: 'src/schema/**' })
+    const references = await repo.findReferences('validate', { kind: 'function', pathGlob: 'src/schema/**' })
+
+    expect(callers).toMatchObject([
+      {
+        file: 'src/api/handler.ts',
+        line: 6,
+        srcSymbol: 'handleRequest',
+        edgeKind: 'call',
+        resolution: 'import-resolved'
+      }
+    ])
+    expect(references).toMatchObject([
+      {
+        file: 'src/api/handler.ts',
+        line: 6,
+        srcSymbol: 'handleRequest',
+        edgeKind: 'call',
+        resolution: 'import-resolved'
+      }
+    ])
+  })
+
+  it('writes TS implements/extends edges and finds implementers from persisted heritage clauses', async () => {
+    const repoRoot = await copyFixtureRepository('heritage-ts', 'codesift-fixture-heritage-ts-')
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+
+    const db = new Database(join(repoRoot, '.codesift', 'index.db'))
+    const rows = db
+      .prepare<
+        [string],
+        {
+          src_file: string
+          src_line: number
+          src_symbol: string | null
+          dst_file: string | null
+          edge_kind: string
+          resolution: string
+        }
+      >(
+        `
+          select src_file, src_line, src_symbol, dst_file, edge_kind, resolution
+          from edges
+          where dst_name = ? and edge_kind in ('implements', 'extends')
+          order by src_file asc, src_line asc, edge_kind asc
+        `
+      )
+      .all('AuthStrategy')
+    db.close()
+
+    expect(rows).toEqual([
+      {
+        src_file: 'src/impl.ts',
+        src_line: 3,
+        src_symbol: 'JwtVerifier',
+        dst_file: 'src/contract.ts',
+        edge_kind: 'implements',
+        resolution: 'import-resolved'
+      },
+      {
+        src_file: 'src/impl.ts',
+        src_line: 9,
+        src_symbol: 'StrictStrategy',
+        dst_file: 'src/contract.ts',
+        edge_kind: 'extends',
+        resolution: 'import-resolved'
+      }
+    ])
+
+    const authImplementers = await repo.findImplementers('AuthStrategy')
+    const baseImplementers = await repo.findImplementers('BaseVerifier')
+
+    expect(authImplementers).toMatchObject([
+      {
+        file: 'src/impl.ts',
+        line: 3,
+        srcSymbol: 'JwtVerifier',
+        edgeKind: 'implements',
+        resolution: 'import-resolved'
+      },
+      {
+        file: 'src/impl.ts',
+        line: 9,
+        srcSymbol: 'StrictStrategy',
+        edgeKind: 'extends',
+        resolution: 'import-resolved'
+      }
+    ])
+    expect(baseImplementers).toMatchObject([
+      {
+        file: 'src/impl.ts',
+        line: 3,
+        srcSymbol: 'JwtVerifier',
+        edgeKind: 'extends',
+        resolution: 'import-resolved'
+      }
+    ])
+  })
+
+  it('matches caller, ref, implementer, and impact lookups case-insensitively', async () => {
+    const usagesRepoRoot = await copyFixtureRepository('usages-ts', 'codesift-graph-case-usages-')
+    const usagesRepo = await openRepo(usagesRepoRoot)
+    await usagesRepo.sync()
+
+    expect((await usagesRepo.findCallers('ParseToken')).map((result) => `${result.file}:${result.line}:${result.srcSymbol}:${result.edgeKind}`)).toEqual([
+      'src/api.ts:4:readSubject:call',
+      'src/worker.ts:4:enqueueToken:call'
+    ])
+    expect((await usagesRepo.findReferences('ParseToken')).map((result) => `${result.file}:${result.line}:${result.srcSymbol}:${result.edgeKind}`)).toEqual([
+      'src/api.ts:4:readSubject:call',
+      'src/worker.ts:4:enqueueToken:call'
+    ])
+    expect((await usagesRepo.impact('ParseToken', { depth: 0 })).nodes.map((node) => `${node.depth}:${node.file}:${node.line}:${node.srcSymbol}:${node.edgeKind}`)).toEqual([
+      '0:src/api.ts:4:readSubject:call',
+      '0:src/worker.ts:4:enqueueToken:call'
+    ])
+
+    const heritageRepoRoot = await copyFixtureRepository('heritage-ts', 'codesift-graph-case-heritage-')
+    const heritageRepo = await openRepo(heritageRepoRoot)
+    await heritageRepo.sync()
+
+    expect((await heritageRepo.findImplementers('authstrategy')).map((result) => `${result.file}:${result.line}:${result.srcSymbol}:${result.edgeKind}`)).toEqual([
+      'src/impl.ts:3:JwtVerifier:implements',
+      'src/impl.ts:9:StrictStrategy:extends'
+    ])
+  })
+
+  it('does not mix name-only callers into a disambiguated import-resolved query', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-graph-name-only-disambiguation-'))
+    temporaryDirectories.push(repoRoot)
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    await mkdir(join(repoRoot, 'auth'), { recursive: true })
+
+    await writeFile(
+      join(repoRoot, 'src', 'token.ts'),
+      `export function parseToken(token: string): string {
+  return token.trim()
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'src', 'api.ts'),
+      `import { parseToken } from './token'
+
+export function readSubject(header: string): string {
+  return parseToken(header)
+}
+`,
+      'utf8'
+    )
+    await writeFile(
+      join(repoRoot, 'auth', 'token.go'),
+      `package auth
+
+func parseToken(token string) string {
+  return token
+}
+
+func handleToken(token string) string {
+  return parseToken(token)
+}
+`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    expect((await repo.findCallers('parseToken', { kind: 'function', pathGlob: 'src/**' })).map((result) => `${result.file}:${result.line}:${result.srcSymbol}:${result.resolution}`)).toEqual([
+      'src/api.ts:4:readSubject:import-resolved'
+    ])
+    expect((await repo.findCallers('parseToken', { kind: 'function', pathGlob: 'auth/**' })).map((result) => `${result.file}:${result.line}:${result.srcSymbol}:${result.resolution}`)).toEqual([
+      'auth/token.go:8:handleToken:name-only'
+    ])
+  })
+
+  it('writes name-only Go call edges and serves callers from persisted edges', async () => {
+    const repoRoot = await copyFixtureRepository('m3-go', 'codesift-fixture-graph-m3-go-')
+    await writeFile(
+      join(repoRoot, 'auth', 'consumer.go'),
+      `package auth
+
+func ValidateBearer(token string) bool {
+  verifier := NewTokenVerifier()
+  return verifier.VerifyToken(token)
+}
+`,
+      'utf8'
+    )
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+
+    const db = new Database(join(repoRoot, '.codesift', 'index.db'))
+    const rows = db
+      .prepare<
+        [string],
+        {
+          src_file: string
+          src_line: number
+          src_symbol: string | null
+          dst_file: string | null
+          edge_kind: string
+          resolution: string
+        }
+      >(
+        `
+          select src_file, src_line, src_symbol, dst_file, edge_kind, resolution
+          from edges
+          where dst_name = ? and edge_kind = 'call'
+          order by src_file asc, src_line asc
+        `
+      )
+      .all('VerifyToken')
+    db.close()
+
+    expect(rows).toEqual([
+      {
+        src_file: 'auth/consumer.go',
+        src_line: 5,
+        src_symbol: 'ValidateBearer',
+        dst_file: null,
+        edge_kind: 'call',
+        resolution: 'name-only'
+      }
+    ])
+
+    const callers = await repo.findCallers('VerifyToken', { kind: 'method', pathGlob: 'auth/**' })
+    expect(callers).toMatchObject([
+      {
+        file: 'auth/consumer.go',
+        line: 5,
+        srcSymbol: 'ValidateBearer',
+        edgeKind: 'call',
+        resolution: 'name-only',
+        language: 'go'
+      }
+    ])
+  })
+
   it('bundles Python import-resolved usages for the top definition hit', async () => {
     const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-usages-py-'))
     temporaryDirectories.push(repoRoot)
@@ -792,10 +1458,153 @@ def handle(token: str) -> bool:
 
     const repo = await openRepo(repoRoot)
     await repo.sync()
-    const hits = await repo.search('verify_token', { k: 1, withUsages: true, pathGlob: 'pkg/**' })
 
+    const db = new Database(join(repoRoot, '.codesift', 'index.db'))
+    const rows = db
+      .prepare<
+        [string],
+        {
+          src_file: string
+          src_line: number
+          src_symbol: string | null
+          dst_file: string | null
+          edge_kind: string
+          resolution: string
+        }
+      >(
+        `
+          select src_file, src_line, src_symbol, dst_file, edge_kind, resolution
+          from edges
+          where dst_name = ? and edge_kind in ('call', 'ref')
+          order by src_file asc, src_line asc
+        `
+      )
+      .all('verify_token')
+    db.close()
+
+    expect(rows).toEqual([
+      {
+        src_file: 'pkg/consumer.py',
+        src_line: 5,
+        src_symbol: 'handle',
+        dst_file: 'pkg/token.py',
+        edge_kind: 'call',
+        resolution: 'import-resolved'
+      }
+    ])
+
+    const hits = await repo.search('verify_token', { k: 1, withUsages: true, pathGlob: 'pkg/**' })
     expect(hits[0]?.symbol).toBe('verify_token')
     expect(hits[0]?.usages?.map((usage) => `${usage.file}:${usage.line}`)).toEqual(['pkg/consumer.py:5'])
+  })
+
+  it('skips shadowed TS same-file matches and Python member-access matches under import-resolved labels', async () => {
+    const tsRepoRoot = await mkdtemp(join(tmpdir(), 'codesift-graph-shadowed-ts-'))
+    temporaryDirectories.push(tsRepoRoot)
+    await mkdir(join(tsRepoRoot, 'src'), { recursive: true })
+    await writeFile(
+      join(tsRepoRoot, 'src', 'token.ts'),
+      `export function parseToken(token: string): string {
+  return token.trim()
+}
+
+export function wrapToken(raw: string): string {
+  const parseToken = (value: string): string => value.toUpperCase()
+  return parseToken(raw)
+}
+`,
+      'utf8'
+    )
+
+    const tsRepo = await openRepo(tsRepoRoot)
+    await tsRepo.sync()
+    expect(await tsRepo.findReferences('parseToken')).toEqual([])
+
+    const pyRepoRoot = await mkdtemp(join(tmpdir(), 'codesift-graph-member-access-py-'))
+    temporaryDirectories.push(pyRepoRoot)
+    await mkdir(join(pyRepoRoot, 'pkg'), { recursive: true })
+    await writeFile(join(pyRepoRoot, 'pkg', '__init__.py'), '', 'utf8')
+    await writeFile(
+      join(pyRepoRoot, 'pkg', 'token.py'),
+      `def validate(token: str) -> str:
+    return token
+
+class Service:
+    def validate(self, token: str) -> str:
+        return token
+
+    def run(self, token: str) -> str:
+        return self.validate(token)
+`,
+      'utf8'
+    )
+
+    const pyRepo = await openRepo(pyRepoRoot)
+    await pyRepo.sync()
+    expect(await pyRepo.findReferences('validate', { kind: 'function', pathGlob: 'pkg/token.py' })).toEqual([])
+  })
+
+  it('replaces persisted edges on incremental re-sync when a source file changes', async () => {
+    const repoRoot = await copyFixtureRepository('usages-ts', 'codesift-fixture-usages-ts-resync-')
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+    await writeFile(
+      join(repoRoot, 'src', 'api.ts'),
+      `export function readSubject(header: string): string {
+  return header.replace('Bearer ', '')
+}
+`,
+      'utf8'
+    )
+    await repo.sync()
+
+    const db = new Database(join(repoRoot, '.codesift', 'index.db'))
+    const apiEdgeCount = db
+      .prepare<[string, string], { value: number }>('select count(*) as value from edges where src_file = ? and dst_name = ?')
+      .get('src/api.ts', 'parseToken')
+    const workerRows = db
+      .prepare<[string, string], { src_file: string; src_line: number; edge_kind: string }>(
+        `
+          select src_file, src_line, edge_kind
+          from edges
+          where src_file = ? and dst_name = ? and edge_kind in ('call', 'ref')
+          order by src_line asc
+        `
+      )
+      .all('src/worker.ts', 'parseToken')
+    db.close()
+
+    expect(apiEdgeCount?.value).toBe(0)
+    expect(workerRows).toEqual([{ src_file: 'src/worker.ts', src_line: 4, edge_kind: 'call' }])
+  })
+
+  it('clears both outbound and inbound edges when a file is removed', async () => {
+    const repoRoot = await copyFixtureRepository('usages-ts', 'codesift-fixture-usages-ts-remove-')
+    await writeFile(
+      join(repoRoot, 'src', 'service.ts'),
+      `import { readSubject } from './api'
+
+export function handleToken(header: string): string {
+  return readSubject(header)
+}
+`,
+      'utf8'
+    )
+    const repo = await openRepo(repoRoot)
+
+    await repo.sync()
+    await unlink(join(repoRoot, 'src', 'api.ts'))
+    await repo.sync()
+
+    const db = new Database(join(repoRoot, '.codesift', 'index.db'))
+    const outboundCount = db.prepare<[string], { value: number }>('select count(*) as value from edges where src_file = ?').get('src/api.ts')
+    const inboundCount = db.prepare<[string], { value: number }>('select count(*) as value from edges where dst_file = ?').get('src/api.ts')
+    db.close()
+
+    expect(outboundCount?.value).toBe(0)
+    expect(inboundCount?.value).toBe(0)
+    expect(await repo.findImporters('src/api.ts')).toEqual([])
   })
 })
 

@@ -1,12 +1,21 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { DEFAULT_MANIFEST_PATH, candidateFromRipgrep, candidateMatchesExpected, createEmptyManifest, diffLossBudgets, evaluateManifest, formatSummary, isRerankEvalEnabled, loadManifest, proveRoutingPolicy, runRipgrep, summarizeEmptyRun, type GoldenQuery, type RipgrepHit } from '../src/index.js'
+import { DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS, DEFAULT_MCP_READ_CHUNK_MAX_TOKENS } from '@codesift/mcp'
+
+import { DEFAULT_MANIFEST_PATH, candidateFromRipgrep, candidateMatchesExpected, createEmptyManifest, diffLossBudgets, evaluateManifest, formatSummary, isRerankEvalEnabled, loadManifest, proveRoutingPolicy, runRipgrep, summarizeEmptyRun, type GoldenQuery, type GoldenQueryType, type RipgrepHit } from '../src/index.js'
 
 const temporaryDirectories: string[] = []
+const stableLocalTokenCeilings: Partial<Record<GoldenQueryType, number>> = {
+  'nl-concept': 180,
+  'symbol-def': 125,
+  'exact-identifier': 75,
+  'string-literal': 40,
+  'error-trace': 40
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -77,6 +86,103 @@ describe('@codesift/eval', () => {
     )
   }, 30_000)
 
+  it('keeps stable local codesift runs at one-call rank-1 resolution with low token envelopes', async () => {
+    const manifest = await loadManifest(DEFAULT_MANIFEST_PATH)
+    const stableLocalManifest = {
+      repos: manifest.repos.filter((repo) => repo.id.startsWith('m3-') || repo.id === 'collision-ts' || repo.id === 'usages-ts'),
+      queries: manifest.queries.filter((query) => query.repoId.startsWith('m3-') || query.repoId === 'collision-ts' || query.repoId === 'usages-ts')
+    }
+    const summary = await evaluateManifest(stableLocalManifest, { resultLimit: 10, inspectionLimit: 5, latencyToleranceMs: Number.POSITIVE_INFINITY })
+    const codesiftRuns = summary.runs.filter((run) => run.tool === 'codesift')
+
+    expect(codesiftRuns).toHaveLength(stableLocalManifest.queries.length)
+    for (const run of codesiftRuns) {
+      expect(run.taskSuccess).toBe(true)
+      expect(run.callsToResolution).toBe(1)
+      expect(run.meanReciprocalRank).toBe(1)
+
+      const tokenCeiling = stableLocalTokenCeilings[run.queryType]
+      expect(tokenCeiling).toBeDefined()
+      expect(run.tokensToResolution).toBeLessThanOrEqual(tokenCeiling!)
+    }
+  }, 30_000)
+
+  it('accounts string-literal grep results with the MCP default token budget', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-eval-grep-budget-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    await writeFile(
+      join(repoRoot, 'src', 'noisy.ts'),
+      Array.from({ length: 160 }, (_, index) => `export const noisy${index} = 'LOUD_LITERAL_${index}_${'x'.repeat(80)}'`).join('\n'),
+      'utf8'
+    )
+
+    const summary = await evaluateManifest({
+      repos: [{ id: 'noisy-grep', language: 'typescript', repoPath: repoRoot }],
+      queries: [
+        {
+          id: 'noisy-literal',
+          repoId: 'noisy-grep',
+          queryType: 'string-literal',
+          query: 'LOUD_LITERAL',
+          grepPattern: 'LOUD_LITERAL',
+          expected: [{ file: 'src/noisy.ts' }],
+          expectedLineRange: { startLine: 1, endLine: 1 }
+        }
+      ]
+    }, { resultLimit: 160, inspectionLimit: 5, latencyToleranceMs: Number.POSITIVE_INFINITY })
+
+    const codesiftRun = summary.runs.find((run) => run.tool === 'codesift')
+    expect(codesiftRun?.taskSuccess).toBe(true)
+    expect(codesiftRun?.meanReciprocalRank).toBe(1)
+    expect(codesiftRun?.tokensToResolution).toBeLessThanOrEqual(730)
+  }, 30_000)
+
+  it('accounts body-less symbol follow-ups through the read_chunk MCP budget', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-eval-symbol-followup-budget-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+
+    const makeFunction = (returnValue: string) => [
+      'export function inflateTarget() {',
+      ...Array.from({ length: 140 }, (_, index) => `  const noisy${index} = '${returnValue}_${index}_${'x'.repeat(180)}'`),
+      `  return '${returnValue}'`,
+      '}',
+      ''
+    ].join('\n')
+
+    await Promise.all([
+      writeFile(join(repoRoot, 'src', 'a.ts'), makeFunction('target'), 'utf8'),
+      writeFile(join(repoRoot, 'src', 'b.ts'), makeFunction('otherB'), 'utf8'),
+      writeFile(join(repoRoot, 'src', 'c.ts'), makeFunction('otherC'), 'utf8'),
+      writeFile(join(repoRoot, 'src', 'd.ts'), makeFunction('otherD'), 'utf8')
+    ])
+
+    const summary = await evaluateManifest({
+      repos: [{ id: 'symbol-followup-budget', language: 'typescript', repoPath: repoRoot }],
+      queries: [
+        {
+          id: 'symbol-followup-budget',
+          repoId: 'symbol-followup-budget',
+          queryType: 'symbol-def',
+          query: 'inflateTarget',
+          expected: [{ file: 'src/a.ts', symbol: 'inflateTarget' }],
+          expectedLineRange: { startLine: 1, endLine: 143 }
+        }
+      ]
+    }, { resultLimit: 10, inspectionLimit: 5, latencyToleranceMs: Number.POSITIVE_INFINITY })
+
+    const codesiftRun = summary.runs.find((run) => run.tool === 'codesift')
+
+    expect(codesiftRun?.taskSuccess).toBe(true)
+    expect(codesiftRun?.callsToResolution).toBe(2)
+    expect(codesiftRun?.tokensToResolution).toBeLessThanOrEqual(
+      DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS + DEFAULT_MCP_READ_CHUNK_MAX_TOKENS
+    )
+  }, 30_000)
+
   it('measures end-to-end calls-to-resolution truthfully across both tools', async () => {
     const manifest = await loadManifest(DEFAULT_MANIFEST_PATH)
     const m3Manifest = {
@@ -144,10 +250,12 @@ describe('@codesift/eval', () => {
       missingUsageFiles: []
     })
     expect(summary.usagesReport[0]?.withUsagesCallsDelta).toBeGreaterThanOrEqual(1)
+    expect(summary.usagesReport[0]?.withUsagesTokensToResolution).toBeGreaterThan(0)
     expect(summary.usagesReport[0]?.withUsagesCallsToResolution).toBeLessThan(summary.usagesReport[0]?.withoutUsagesCallsToResolution ?? 0)
 
     const rendered = formatSummary(summary)
     expect(rendered).toContain('with_usages report-only')
+    expect(rendered).toContain('bundledTokens=')
     expect(rendered).toContain('usageRecall=1.00')
   }, 30_000)
 

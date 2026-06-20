@@ -43,6 +43,12 @@ const MAX_STRUCTURAL_CHUNK_TOKENS = 1_200
 const SPLIT_WINDOW_LINES = 90
 const SPLIT_OVERLAP_LINES = 12
 
+const typeScriptSourceFileCache = new WeakMap<ScannedFile, ts.SourceFile>()
+
+export function getCachedTypeScriptSourceFile(file: ScannedFile): ts.SourceFile | undefined {
+  return typeScriptSourceFileCache.get(file)
+}
+
 export function buildChunks(file: ScannedFile): ChunkRecord[] {
   let chunks: ChunkRecord[] = []
 
@@ -76,6 +82,7 @@ function buildTypeScriptChunks(file: ScannedFile): ChunkRecord[] {
     true,
     scriptKindFromPath(file.relativePath)
   )
+  typeScriptSourceFileCache.set(file, sourceFile)
 
   const chunks: ChunkRecord[] = []
 
@@ -1195,7 +1202,7 @@ function countRubyClosers(line: string): number {
   return /^end\b/.test(line.trim()) ? 1 : 0
 }
 
-function maskCStyleSyntax(lines: string[]): string[] {
+export function maskCStyleSyntax(lines: string[]): string[] {
   const maskedLines: string[] = []
   let inBlockComment = false
   let stringQuote: '"' | "'" | '`' | null = null
