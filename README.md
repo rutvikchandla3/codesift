@@ -84,6 +84,9 @@ packages/
 
 ## Quickstart
 
+Use Node 22 locally (`.nvmrc`) on macOS arm64 so `better-sqlite3` can use its published prebuilds.
+If you normally run with `ignore-scripts=true`, this repo overrides it via `.npmrc` because the native SQLite deps must run their install hooks.
+
 ```bash
 pnpm install
 pnpm build

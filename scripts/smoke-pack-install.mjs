@@ -15,6 +15,11 @@ function run(command, args, options = {}) {
     cwd: repoRoot,
     encoding: 'utf8',
     stdio: 'pipe',
+    env: {
+      ...process.env,
+      npm_config_ignore_scripts: 'false',
+      ...options.env
+    },
     ...options
   })
 
@@ -101,7 +106,7 @@ async function main() {
     run(npmBin, ['init', '-y'], { cwd: installDirectory })
     const installLog = run(
       npmBin,
-      ['install', '--foreground-scripts', '--loglevel', 'verbose', coreTarball, mcpTarball, cliTarball],
+      ['install', '--ignore-scripts=false', '--foreground-scripts', '--loglevel', 'verbose', coreTarball, mcpTarball, cliTarball],
       { cwd: installDirectory }
     )
 
