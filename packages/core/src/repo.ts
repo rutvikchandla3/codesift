@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import ts from 'typescript'
 import { existsSync, watch as watchFs, type FSWatcher } from 'node:fs'
 import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
-import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, posix as pathPosix, resolve } from 'node:path'
 
 import Database from 'better-sqlite3'
 import { minimatch } from 'minimatch'
@@ -3608,8 +3608,8 @@ function resolveTypeScriptModuleTarget(file: ScannedFile, moduleSpecifier: strin
 }
 
 function buildTypeScriptModuleCandidates(importerFile: string, moduleSpecifier: string): string[] {
-  const importerDirectory = dirname(importerFile)
-  const base = normalizeRelativeRepoPath(resolve('/', importerDirectory, moduleSpecifier))
+  const importerDirectory = pathPosix.dirname(normalizeRelativeRepoPath(importerFile))
+  const base = normalizeRelativeRepoPath(pathPosix.resolve('/', importerDirectory, moduleSpecifier))
   return [
     base,
     `${base}.ts`,
@@ -3638,17 +3638,17 @@ function resolvePythonModuleTarget(file: ScannedFile, moduleSpecifier: string): 
 }
 
 function buildPythonModuleCandidates(importerFile: string, moduleSpecifier: string): string[] {
-  const importerDirectory = dirname(importerFile)
+  const importerDirectory = pathPosix.dirname(normalizeRelativeRepoPath(importerFile))
   const relativeMatch = moduleSpecifier.match(/^(\.+)(.*)$/)
 
   let base: string
   if (relativeMatch) {
     const dots = relativeMatch[1]!.length
     const rest = relativeMatch[2] ?? ''
-    const parentDirectory = dots > 1 ? resolve('/', importerDirectory, ...Array.from({ length: dots - 1 }, () => '..')) : resolve('/', importerDirectory)
-    base = normalizeRelativeRepoPath(resolve(parentDirectory, rest.replace(/\./g, '/')))
+    const parentDirectory = dots > 1 ? pathPosix.resolve('/', importerDirectory, ...Array.from({ length: dots - 1 }, () => '..')) : pathPosix.resolve('/', importerDirectory)
+    base = normalizeRelativeRepoPath(pathPosix.resolve(parentDirectory, rest.replace(/\./g, '/')))
   } else {
-    base = normalizeRelativeRepoPath(resolve('/', moduleSpecifier.replace(/\./g, '/')))
+    base = normalizeRelativeRepoPath(pathPosix.resolve('/', moduleSpecifier.replace(/\./g, '/')))
   }
 
   return [base, `${base}.py`, `${base}/__init__.py`]
