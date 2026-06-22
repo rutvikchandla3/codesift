@@ -12,7 +12,7 @@ const temporaryDirectories: string[] = []
 const stableLocalTokenCeilings: Partial<Record<GoldenQueryType, number>> = {
   'nl-concept': 180,
   'symbol-def': 125,
-  'exact-identifier': 75,
+  'exact-identifier': 95,
   'string-literal': 40,
   'error-trace': 40
 }

@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { openRepo } from '@codesift/core'
 
-import { HttpMcpServerHandle, createHttpServer } from '../src/index.js'
+import { HttpMcpServerHandle, NOT_INDEXED_SENTINEL, createHttpServer } from '../src/index.js'
 
 const PROTOCOL_VERSION = '2025-06-18'
 const temporaryDirectories: string[] = []
@@ -110,6 +110,41 @@ describe('@codesift/mcp http transport', () => {
       const ok = await mcpCall(base, `Bearer ${token}`, initialize)
       expect(ok.status).toBe(200)
       expect(JSON.stringify(ok.message.result)).toContain('codesift')
+    } finally {
+      await handle.stop()
+    }
+  }, 15_000)
+
+  it('returns the not-indexed sentinel through the SDK server path', async () => {
+    const repoRoot = await createDemoRepo()
+    const repo = await openRepo(repoRoot)
+    const handle = createHttpServer(repo, { port: 0 }) as HttpMcpServerHandle
+    await handle.start()
+
+    try {
+      const base = `http://127.0.0.1:${handle.port}/`
+      const initialize = await mcpCall(base, undefined, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: PROTOCOL_VERSION,
+          capabilities: {},
+          clientInfo: { name: 'codesift-vitest-http', version: '0.0.0' }
+        }
+      })
+      expect(initialize.status).toBe(200)
+
+      const call = await mcpCall(base, undefined, {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'tools/call',
+        params: { name: 'read_chunk', arguments: { id: 'src/demo.ts:1-2@missing' } }
+      })
+
+      expect(call.status).toBe(200)
+      expect(JSON.stringify(call.message.result)).toContain(NOT_INDEXED_SENTINEL)
+      expect(JSON.stringify(call.message.result)).not.toContain('isError')
     } finally {
       await handle.stop()
     }

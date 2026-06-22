@@ -8,7 +8,19 @@ const repoRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const pnpmBin = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
 const npmBin = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 const npxBin = process.platform === 'win32' ? 'npx.cmd' : 'npx'
-const supportedNodeMajors = new Set([20, 22])
+const supportedNodeMajors = new Set(await readSupportedNodeMajors())
+
+async function readSupportedNodeMajors() {
+  const source = await readFile(join(repoRoot, 'packages/cli/src/supported-node-majors.ts'), 'utf8')
+  const match = /supportedNodeMajors\s*=\s*\[([^\]]+)\]/.exec(source)
+  if (!match) {
+    throw new Error('could not read supported Node majors')
+  }
+  return match[1]
+    .split(',')
+    .map((value) => Number.parseInt(value.trim(), 10))
+    .filter((value) => Number.isFinite(value))
+}
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -114,6 +126,11 @@ async function main() {
     await writeFile(join(workDirectory, 'install.log'), installLog, 'utf8')
 
     await createFixtureRepo(fixtureDirectory)
+
+    const initOutput = run(npxBin, ['--no-install', 'codesift', 'init', fixtureDirectory, '--print'], { cwd: installDirectory })
+    if (!initOutput.includes(`codesift@`)) {
+      throw new Error(`smoke init --print did not emit a pinned codesift command\n${initOutput}`)
+    }
 
     run(npxBin, ['--no-install', 'codesift', 'index', fixtureDirectory], { cwd: installDirectory })
     const searchOutput = run(

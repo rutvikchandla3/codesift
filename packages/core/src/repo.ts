@@ -17,6 +17,9 @@ import { scanRepository, scanRepositoryManifest, type ScannedFile } from './scan
 import { prepareForCloud } from './secret-scan.js'
 import {
   DEFAULT_SEARCH_K,
+  type ChangesetContextOptions,
+  type ChangesetContextResult,
+  type ChangesetFileContext,
   type Edge,
   type EdgeResult,
   type EmbeddingProvider,
@@ -37,6 +40,8 @@ import {
   type RepoStaleReason,
   type RepoStatus,
   type RepoSyncStatus,
+  type ResultList,
+  type ResultMetadata,
   type RerankResult,
   type SearchHit,
   type SearchOptions,
@@ -148,6 +153,16 @@ interface DefinitionEdgeTarget {
   file?: string
 }
 
+interface DefinitionEdgeQueryStats {
+  nameOnlyUnscoped?: number
+}
+
+interface DefinitionEdgeSelectOptions {
+  limit?: number
+  nameOnlyLimit?: number
+  stats?: DefinitionEdgeQueryStats
+}
+
 interface ReadRowsResult<T> {
   items: T[]
   tokenTruncated: boolean
@@ -241,6 +256,11 @@ const MIN_RELAXATION_ROWS = 3
 const FIND_SYMBOL_INLINE_MAX_EXACT_ROWS = 3
 const FIND_SYMBOL_RELATION_MAX_SITES = 5
 const FIND_SYMBOL_RELATION_MAX_NEIGHBORS = 4
+const FIND_SYMBOL_RELATION_MIN_BUDGET = 180
+const SEARCH_RELATION_MIN_BUDGET = 220
+const NAME_ONLY_EDGE_DEFAULT_LIMIT = 25
+const DEFAULT_CHANGESET_MAX_FILES = 40
+const DEFAULT_CHANGESET_MAX_EDGES_PER_FILE = 12
 const DEFAULT_IMPACT_DEPTH = 2
 const DEFAULT_IMPACT_MAX_NODES = 50
 const HARD_MAX_IMPACT_BOUND = 50
@@ -407,8 +427,14 @@ export class SqliteRepo implements Repo {
     try {
       const previousGeneration = readMetaNumber(db, 'index_generation') ?? 0
       const previousGitSnapshot = readIndexedGitSnapshot(db)
-      const { files, skippedFiles, skippedSymlinks } = await scanRepository(this.root)
-      const diff = diffScannedFiles(files, selectIndexedFileRows(db))
+      const indexedFiles = selectIndexedFileRows(db)
+      const gitSnapshot = await readGitSnapshot(this.root)
+      const gitSnapshotChanged = !gitSnapshotsEqual(previousGitSnapshot, gitSnapshot)
+      const knownByPath = gitSnapshotChanged
+        ? undefined
+        : new Map(indexedFiles.map((file) => [file.path, file]))
+      const { files, skippedFiles, skippedSymlinks } = await scanRepository(this.root, knownByPath)
+      const diff = diffScannedFiles(files, indexedFiles)
 
       const chunkRows: IndexedChunkRecord[] = diff.changedFiles.flatMap((file) =>
         buildChunks(file).map((chunk) => ({
@@ -427,6 +453,7 @@ export class SqliteRepo implements Repo {
       const chunksToEmbed: IndexedChunkRecord[] = []
       const embeddedChunks: EmbeddedChunkRecord[] = []
       let completedChunks = 0
+      const totalChunks = chunkRows.length
 
       for (const chunk of chunkRows) {
         const contentHash = contentHashForChunk(chunk)
@@ -448,6 +475,7 @@ export class SqliteRepo implements Repo {
       }
 
       const batches = buildEmbeddingBatches(chunksToEmbed, provider.maxBatch, provider.maxBatchTokens)
+      writeSyncStatus(db, { state: 'running', startedAt: syncStartedAt, completedChunks, totalChunks })
 
       for (let index = 0; index < batches.length; index += 1) {
         throwIfAborted(options?.signal)
@@ -481,12 +509,11 @@ export class SqliteRepo implements Repo {
           batch: index + 1,
           totalBatches: batches.length,
           completedChunks,
-          totalChunks: chunkRows.length
+          totalChunks
         })
+        writeSyncStatus(db, { state: 'running', startedAt: syncStartedAt, completedChunks, totalChunks })
       }
 
-      const gitSnapshot = await readGitSnapshot(this.root)
-      const gitSnapshotChanged = !gitSnapshotsEqual(previousGitSnapshot, gitSnapshot)
       const metadataMissing = readMeta(db, 'schema_version') !== SCHEMA_VERSION
       const hasDatabaseChanges =
         diff.changedFiles.length > 0 ||
@@ -557,9 +584,12 @@ export class SqliteRepo implements Repo {
     }
   }
 
-  async search(query: string, options?: SearchOptions): Promise<SearchHit[]> {
-    if (!query.trim() || !existsSync(this.indexPath)) {
+  async search(query: string, options?: SearchOptions): Promise<ResultList<SearchHit>> {
+    if (!query.trim()) {
       return []
+    }
+    if (!existsSync(this.indexPath)) {
+      return withResultMetadata([], { notIndexed: true, emptyReason: 'not_indexed' })
     }
 
     const releaseDatabase = await this.enterDatabaseUser()
@@ -644,15 +674,23 @@ export class SqliteRepo implements Repo {
       if (options?.withUsages) {
         await attachUsagesToTopDefinitionHit(db, this.root, staleHits, options)
       }
+      if (shouldAttachSearchRelations(options, autoSingleBest)) {
+        await attachRelationsToTopDefinitionHit(db, this.root, staleHits, options, (definition) =>
+          this.readFindSymbolRelations(db, definition)
+        )
+      }
       return staleHits
     } finally {
       releaseDatabase()
     }
   }
 
-  async grep(pattern: string, options?: GrepOptions): Promise<GrepHit[]> {
-    if (!pattern || !existsSync(this.indexPath)) {
+  async grep(pattern: string, options?: GrepOptions): Promise<ResultList<GrepHit>> {
+    if (!pattern) {
       return []
+    }
+    if (!existsSync(this.indexPath)) {
+      return withResultMetadata([], { notIndexed: true, emptyReason: 'not_indexed' })
     }
 
     const releaseDatabase = await this.enterDatabaseUser()
@@ -731,9 +769,12 @@ export class SqliteRepo implements Repo {
     return hits
   }
 
-  async findSymbol(name: string, options?: FindSymbolOptions): Promise<SymbolDefinition[]> {
-    if (!name.trim() || !existsSync(this.indexPath)) {
+  async findSymbol(name: string, options?: FindSymbolOptions): Promise<ResultList<SymbolDefinition>> {
+    if (!name.trim()) {
       return []
+    }
+    if (!existsSync(this.indexPath)) {
+      return withResultMetadata([], { notIndexed: true, emptyReason: 'not_indexed' })
     }
 
     const releaseDatabase = await this.enterDatabaseUser()
@@ -772,12 +813,13 @@ export class SqliteRepo implements Repo {
       const rows = [...exactRows, ...partialRows]
 
       const canEnrichTopExactRow = exactRows.length > 0 && exactRows.length <= FIND_SYMBOL_INLINE_MAX_EXACT_ROWS
+      const ambiguousDefCount = countDistinctDefinitionSites(exactRows)
 
       // One-call moat: inline the verbatim enclosing-symbol body for the top exact
       // match when the lookup is unambiguous, so an identifier query resolves
       // without a mandatory follow-up read. Disk-fresh, capped, never throws.
       let topBody: string | undefined
-      if (options?.withBody !== false && canEnrichTopExactRow) {
+      if (options?.withBody !== false && options?.detail !== 'sig' && canEnrichTopExactRow) {
         const top = exactRows[0]!
         try {
           const source = await this.readRange(top.file_path, top.start_line, top.end_line)
@@ -791,15 +833,22 @@ export class SqliteRepo implements Repo {
       }
 
       let topRelations: SymbolRelations | undefined
-      if (options?.withCallers === true && canEnrichTopExactRow) {
+      if (shouldAttachFindSymbolRelations(options, canEnrichTopExactRow)) {
         try {
-          topRelations = await this.readFindSymbolRelations(db, exactRows[0]!)
+          const candidateRelations = await this.readFindSymbolRelations(db, exactRows[0]!)
+          if (
+            options?.withCallers === true ||
+            relationsFitBudget(candidateRelations, options?.maxTokens, estimateSymbolBodyTokens(topBody))
+          ) {
+            topRelations = candidateRelations
+          }
         } catch {
           // Relation bundling is best-effort and must never fail the base lookup.
         }
       }
 
-      return rows.map((row, index) => {
+      const definitions = rows.map((row, index) => {
+        const exact = index < exactRows.length
         const definition: SymbolDefinition = {
           id: String(row.id),
           name: row.name,
@@ -808,7 +857,8 @@ export class SqliteRepo implements Repo {
             startLine: row.start_line,
             endLine: row.end_line
           },
-          kind: row.kind
+          kind: row.kind,
+          matchQuality: exact ? 'exact' : 'partial'
         }
 
         if (row.signature) {
@@ -823,6 +873,10 @@ export class SqliteRepo implements Repo {
           definition.language = row.language
         }
 
+        if (index === 0 && ambiguousDefCount >= 2) {
+          definition.ambiguousDefCount = ambiguousDefCount
+        }
+
         // Only the top exact row (rows[0] when exactRows is non-empty) carries
         // the optional single-call enrichments.
         if (index === 0 && topBody !== undefined) {
@@ -834,6 +888,11 @@ export class SqliteRepo implements Repo {
         }
 
         return definition
+      })
+      return withResultMetadata(definitions, {
+        definitionCount: exactRows.length,
+        ...(ambiguousDefCount >= 2 ? { ambiguousDefCount } : {}),
+        ...(partialRows.length > 0 ? { partialMatchCount: partialRows.length } : {})
       })
     } finally {
       releaseDatabase()
@@ -852,9 +911,12 @@ export class SqliteRepo implements Repo {
     return this.findDefinitionEdges(name, options, ['implements', 'extends'], false)
   }
 
-  async findImporters(file: string, options?: FindImportersOptions): Promise<EdgeResult[]> {
-    if (!file.trim() || !existsSync(this.indexPath)) {
+  async findImporters(file: string, options?: FindImportersOptions): Promise<ResultList<EdgeResult>> {
+    if (!file.trim()) {
       return []
+    }
+    if (!existsSync(this.indexPath)) {
+      return withResultMetadata([], { notIndexed: true, emptyReason: 'not_indexed' })
     }
 
     const releaseDatabase = await this.enterDatabaseUser()
@@ -873,8 +935,11 @@ export class SqliteRepo implements Repo {
   async impact(name: string, options?: ImpactOptions): Promise<ImpactResult> {
     const depthLimit = normalizeImpactDepth(options?.depth)
     const maxNodes = normalizeImpactMaxNodes(options?.maxNodes)
-    if (!name.trim() || !existsSync(this.indexPath)) {
+    if (!name.trim()) {
       return { nodes: [], depthLimit, maxNodes }
+    }
+    if (!existsSync(this.indexPath)) {
+      return { nodes: [], depthLimit, maxNodes, notIndexed: true, emptyReason: 'not_indexed' }
     }
 
     const releaseDatabase = await this.enterDatabaseUser()
@@ -887,7 +952,7 @@ export class SqliteRepo implements Repo {
 
       const initialDefinitions = selectExactDefinitionRows(db, name, normalizeKinds(options?.kind), options?.pathGlob)
       if (initialDefinitions.length === 0) {
-        return { nodes: [], depthLimit, maxNodes }
+        return { nodes: [], depthLimit, maxNodes, emptyReason: 'no_definition' }
       }
 
       const defaultExportCache = new Map<string, Promise<Set<string>>>()
@@ -967,6 +1032,63 @@ export class SqliteRepo implements Repo {
     }
   }
 
+  async changesetContext(files: string[], options?: ChangesetContextOptions): Promise<ChangesetContextResult> {
+    const requestedFiles = normalizeChangesetFiles(files)
+    const maxFiles = normalizeChangesetMaxFiles(options?.maxFiles)
+    const maxEdgesPerFile = normalizeChangesetMaxEdges(options?.maxEdgesPerFile)
+    if (requestedFiles.length === 0) {
+      return { files: [] }
+    }
+    if (!existsSync(this.indexPath)) {
+      return { files: [], notIndexed: true }
+    }
+
+    const selectedFiles = requestedFiles.slice(0, maxFiles)
+    const releaseDatabase = await this.enterDatabaseUser()
+    const contexts: ChangesetFileContext[] = []
+    let stale = false
+    let truncated = requestedFiles.length > selectedFiles.length
+    try {
+      const db = this.openDatabase()
+      this.ensureIndexCompatibleForQueries(db)
+      stale = (await this.getFreshness(db)).stale
+
+      for (const file of selectedFiles) {
+        const symbolRows = selectSymbolRowsByFile(db, file)
+        const symbols = symbolRows.map((row) => buildSymbolDefinition(row, 'exact'))
+        const targets = await resolveDefinitionEdgeTargets(this.root, symbolRows)
+        const callerRows = selectDefinitionEdgeRows(db, targets, ['call', 'ref'], true, {
+          limit: maxEdgesPerFile + 1,
+          nameOnlyLimit: Math.min(NAME_ONLY_EDGE_DEFAULT_LIMIT, maxEdgesPerFile + 1)
+        })
+        const importerRows = selectImporterEdgeRows(db, file).slice(0, maxEdgesPerFile + 1)
+        const callerRead = await readEdgeResultsFromRows(this.root, callerRows.slice(0, maxEdgesPerFile), options?.maxTokens)
+        const importerRead = await readEdgeResultsFromRows(this.root, importerRows.slice(0, maxEdgesPerFile), options?.maxTokens)
+        const omitted = Math.max(0, callerRows.length - callerRead.items.length) + Math.max(0, importerRows.length - importerRead.items.length)
+        const omittedLowerBound = callerRows.length > maxEdgesPerFile || importerRows.length > maxEdgesPerFile
+        if (omitted > 0 || omittedLowerBound) {
+          truncated = true
+        }
+        contexts.push({
+          file,
+          symbols,
+          callers: callerRead.items,
+          importers: importerRead.items,
+          ...(omitted > 0 ? { omitted } : {}),
+          ...(omittedLowerBound ? { omittedLowerBound } : {})
+        })
+      }
+    } finally {
+      releaseDatabase()
+    }
+
+    return {
+      files: contexts,
+      ...(stale ? { stale } : {}),
+      ...(truncated ? { truncated } : {})
+    }
+  }
+
   private async readFindSymbolRelations(db: Database.Database, definition: SymbolRow): Promise<SymbolRelations | undefined> {
     const targets = await resolveDefinitionEdgeTargets(this.root, [definition])
     const siteRows = selectDefinitionEdgeRows(db, targets, ['call', 'ref'], true, FIND_SYMBOL_RELATION_MAX_SITES)
@@ -1001,32 +1123,55 @@ export class SqliteRepo implements Repo {
     options: FindEdgeOptions | undefined,
     edgeKinds: ReadonlyArray<Edge['edgeKind']>,
     preferCallsFirst: boolean
-  ): Promise<EdgeResult[]> {
-    if (!name.trim() || !existsSync(this.indexPath)) {
+  ): Promise<ResultList<EdgeResult>> {
+    if (!name.trim()) {
       return []
+    }
+    if (!existsSync(this.indexPath)) {
+      return withResultMetadata([], { notIndexed: true, emptyReason: 'not_indexed' })
     }
 
     const releaseDatabase = await this.enterDatabaseUser()
     let rows: EdgeResultRow[] = []
+    let metadata: ResultMetadata = {}
     try {
       const db = this.openDatabase()
       this.ensureIndexCompatibleForQueries(db)
 
       const definitions = selectExactDefinitionRows(db, name, normalizeKinds(options?.kind), options?.pathGlob)
       if (definitions.length === 0) {
-        return []
+        return withResultMetadata([], { emptyReason: 'no_definition' })
       }
 
       const targets = await resolveDefinitionEdgeTargets(this.root, definitions)
-      rows = selectDefinitionEdgeRows(db, targets, edgeKinds, preferCallsFirst)
+      const stats: DefinitionEdgeQueryStats = {}
+      const selectOptions: DefinitionEdgeSelectOptions = {
+        nameOnlyLimit: NAME_ONLY_EDGE_DEFAULT_LIMIT,
+        stats
+      }
+      if (options?.maxResults !== undefined) {
+        selectOptions.limit = options.maxResults
+      }
+      rows = selectDefinitionEdgeRows(db, targets, edgeKinds, preferCallsFirst, selectOptions)
+      const ambiguousDefCount = countDistinctDefinitionSites(definitions)
+      metadata = {
+        definitionCount: definitions.length,
+        ...(ambiguousDefCount >= 2 ? { ambiguousDefCount } : {}),
+        ...(rows.length === 0 ? { emptyReason: 'no_edges' as const } : {}),
+        ...(stats.nameOnlyUnscoped !== undefined ? { nameOnlyUnscoped: stats.nameOnlyUnscoped, nameOnlyLimit: NAME_ONLY_EDGE_DEFAULT_LIMIT } : {})
+      }
     } finally {
       releaseDatabase()
     }
 
-    return (await readEdgeResultsFromRows(this.root, rows, options?.maxTokens)).items
+    return withResultMetadata((await readEdgeResultsFromRows(this.root, rows, options?.maxTokens)).items, metadata)
   }
 
   async readChunk(id: string, options?: ReadChunkOptions): Promise<string> {
+    if (!existsSync(this.indexPath)) {
+      throw new Error('not_indexed; run: codesift index')
+    }
+
     const releaseDatabase = await this.enterDatabaseUser()
     let parsedChunkId: { file: string; startLine: number; endLine: number } | null
     try {
@@ -1070,6 +1215,7 @@ export class SqliteRepo implements Repo {
       return {
         root: this.root,
         indexPath: this.indexPath,
+        indexExists: false,
         indexed: false,
         stale: false,
         sync: { state: 'idle' },
@@ -1119,6 +1265,7 @@ export class SqliteRepo implements Repo {
       return {
         root: this.root,
         indexPath: this.indexPath,
+        indexExists: true,
         indexed,
         stale: freshness.stale,
         ...(freshness.reasons.length > 0 ? { staleReasons: freshness.reasons } : {}),
@@ -1230,7 +1377,7 @@ export class SqliteRepo implements Repo {
       try {
         if (onlyIfStale) {
           const status = await this.status()
-          if (!status.stale) {
+          if (status.indexed && !status.stale) {
             return
           }
         }
@@ -1264,6 +1411,7 @@ export class SqliteRepo implements Repo {
     }
 
     await refreshWatchers()
+    void runSync(true)
 
     safetyInterval = setInterval(() => {
       void runSync(true)
@@ -1349,7 +1497,17 @@ export class SqliteRepo implements Repo {
     }
 
     const db = new Database(this.indexPath)
-    this.configureDatabase(db, 'WAL')
+    try {
+      this.configureDatabase(db, 'WAL')
+    } catch (error) {
+      try {
+        db.close()
+      } catch {
+        // Preserve the schema/open error; this close is only to avoid leaking
+        // handles for corrupt databases, especially on Windows.
+      }
+      throw error
+    }
     this.vectorExtensionLoaded = false
     this.db = db
     return db
@@ -1951,12 +2109,16 @@ function readSyncStatus(db: Database.Database): RepoSyncStatus {
   const startedAt = readMeta(db, 'last_sync_started_at')
   const completedAt = readMeta(db, 'last_sync_completed_at')
   const error = readMeta(db, 'last_sync_error')
+  const completedChunks = readMetaNumber(db, 'last_sync_completed_chunks')
+  const totalChunks = readMetaNumber(db, 'last_sync_total_chunks')
 
   return {
     state,
     ...(startedAt ? { startedAt } : {}),
     ...(completedAt ? { completedAt } : {}),
-    ...(error ? { error } : {})
+    ...(error ? { error } : {}),
+    ...(completedChunks !== undefined ? { completedChunks } : {}),
+    ...(totalChunks !== undefined ? { totalChunks } : {})
   }
 }
 
@@ -1996,6 +2158,18 @@ function writeSyncStatusWithStatements(
     setMeta.run('last_sync_error', status.error)
   } else {
     deleteMeta.run('last_sync_error')
+  }
+
+  if (status.completedChunks !== undefined) {
+    setMeta.run('last_sync_completed_chunks', String(status.completedChunks))
+  } else {
+    deleteMeta.run('last_sync_completed_chunks')
+  }
+
+  if (status.totalChunks !== undefined) {
+    setMeta.run('last_sync_total_chunks', String(status.totalChunks))
+  } else {
+    deleteMeta.run('last_sync_total_chunks')
   }
 }
 
@@ -2107,6 +2281,24 @@ async function readGitSnapshot(root: string): Promise<GitSnapshot | null> {
   const head = looseRef?.trim() ?? (await readPackedRef(gitDirectory, ref))
 
   return head ? { branch, head } : null
+}
+
+export async function findRepoRoot(startPath = process.cwd()): Promise<string> {
+  let current = resolve(startPath)
+
+  while (true) {
+    const dotGit = join(current, '.git')
+    if (existsSync(dotGit)) {
+      return current
+    }
+
+    const parent = dirname(current)
+    if (parent === current) {
+      return resolve(startPath)
+    }
+
+    current = parent
+  }
 }
 
 async function findGitDirectory(root: string): Promise<string | null> {
@@ -2239,6 +2431,158 @@ function normalizeKinds(kind: SearchOptions['kind'] | FindSymbolOptions['kind'] 
   return Array.isArray(kind) ? kind : [kind]
 }
 
+function withResultMetadata<T>(items: T[], metadata: ResultMetadata): ResultList<T> {
+  if (Object.keys(metadata).length === 0) {
+    return items as ResultList<T>
+  }
+
+  Object.defineProperty(items, 'meta', {
+    value: metadata,
+    enumerable: false,
+    configurable: true
+  })
+  return items as ResultList<T>
+}
+
+function countDistinctDefinitionSites(rows: SymbolRow[]): number {
+  return new Set(rows.map((row) => `${row.file_path}\u0000${row.kind}`)).size
+}
+
+function shouldAttachFindSymbolRelations(options: FindSymbolOptions | undefined, canEnrichTopExactRow: boolean): boolean {
+  if (!canEnrichTopExactRow || options?.withCallers === false) {
+    return false
+  }
+
+  if (options?.withCallers === true) {
+    return true
+  }
+
+  return options?.maxTokens === undefined || options.maxTokens >= FIND_SYMBOL_RELATION_MIN_BUDGET
+}
+
+function shouldAttachSearchRelations(options: SearchOptions | undefined, autoSingleBest: boolean): boolean {
+  if (options?.withRelations === false) {
+    return false
+  }
+
+  if (options?.withRelations === true || options?.context === 'graph') {
+    return true
+  }
+
+  if (options?.context === 'min' || options?.context === 'sig') {
+    return false
+  }
+
+  return autoSingleBest
+}
+
+async function attachRelationsToTopDefinitionHit(
+  db: Database.Database,
+  _root: string,
+  hits: SearchHit[],
+  options: SearchOptions | undefined,
+  readRelations: (definition: SymbolRow) => Promise<SymbolRelations | undefined>
+): Promise<void> {
+  const topHit = hits[0]
+  if (!topHit?.symbol || !topHit.kind || topHit.kind === 'file') {
+    return
+  }
+
+  if (options?.maxTokens !== undefined && options.maxTokens < SEARCH_RELATION_MIN_BUDGET) {
+    return
+  }
+
+  const definition = selectDefinitionRowForSearchHit(db, topHit)
+  if (!definition) {
+    return
+  }
+
+  const relations = await readRelations(definition)
+  if (!relations || !relationsFitBudget(relations, options?.maxTokens, hits.reduce((sum, hit) => sum + hit.tokensReturned, 0))) {
+    return
+  }
+
+  topHit.relations = relations
+  topHit.tokensReturned += estimateSymbolRelationsTokens(relations)
+}
+
+function relationsFitBudget(relations: SymbolRelations | undefined, maxTokens: number | undefined, tokensUsed: number): relations is SymbolRelations {
+  if (!relations) {
+    return false
+  }
+
+  if (maxTokens === undefined) {
+    return true
+  }
+
+  return tokensUsed + estimateSymbolRelationsTokens(relations) <= maxTokens
+}
+
+function estimateSymbolBodyTokens(body: string | undefined): number {
+  return body ? estimateTokenCount(body) : 0
+}
+
+function estimateSymbolRelationsTokens(relations: SymbolRelations): number {
+  const siteTokens = relations.sites.reduce((sum, site) => sum + estimateEdgeResultTokens(site), 0)
+  const neighborTokens = relations.neighbors.reduce((sum, neighbor) => {
+    const header = `${neighbor.file}:${neighbor.range.startLine}-${neighbor.range.endLine} ${neighbor.name} ${neighbor.kind}`
+    return sum + SEARCH_HIT_TOKEN_OVERHEAD + estimateTokenCount(header)
+  }, 0)
+  const omittedTokens = relations.omitted ? estimateTokenCount(`relations_omitted=${relations.omitted}`) : 0
+  return siteTokens + neighborTokens + omittedTokens
+}
+
+function selectDefinitionRowForSearchHit(db: Database.Database, hit: SearchHit): SymbolRow | undefined {
+  if (!hit.symbol || !hit.kind) {
+    return undefined
+  }
+
+  return db
+    .prepare<unknown[], SymbolRow>(
+      `
+        select id, name, file_path, start_line, end_line, kind, signature, parent, language
+        from symbols
+        where file_path = ?
+          and lower(name) = lower(?)
+          and kind = ?
+        order by
+          case when start_line = ? and end_line = ? then 0 else 1 end,
+          abs(start_line - ?) asc,
+          id asc
+        limit 1
+      `
+    )
+    .get(hit.file, hit.symbol, hit.kind, hit.range.startLine, hit.range.endLine, hit.range.startLine)
+}
+
+function normalizeChangesetFiles(files: string[]): string[] {
+  const normalized = new Set<string>()
+  for (const file of files) {
+    const candidate = normalizeRelativeRepoPath(file.trim())
+    if (!candidate || candidate === '.' || candidate.startsWith('../') || candidate === '..') {
+      continue
+    }
+    normalized.add(candidate)
+  }
+  return [...normalized]
+}
+
+function normalizeChangesetMaxFiles(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_CHANGESET_MAX_FILES
+  }
+
+  return Math.min(Math.floor(value), DEFAULT_CHANGESET_MAX_FILES)
+}
+
+function normalizeChangesetMaxEdges(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_CHANGESET_MAX_EDGES_PER_FILE
+  }
+
+  return Math.min(Math.floor(value), NAME_ONLY_EDGE_DEFAULT_LIMIT)
+}
+
 type RangeReader = (file: string, startLine: number, endLine: number) => Promise<string>
 
 async function buildBudgetedSearchHits(
@@ -2309,6 +2653,10 @@ function shouldInlineHit(
   topScore: number
 ): boolean {
   if (context === 'sig') {
+    return false
+  }
+
+  if (context === 'min' || context === 'graph') {
     return false
   }
 
@@ -4073,6 +4421,47 @@ function selectPartialSymbolRows(db: Database.Database, name: string, kinds: Sym
     .all(...params, name)
 }
 
+function selectSymbolRowsByFile(db: Database.Database, file: string): SymbolRow[] {
+  return db
+    .prepare<[string], SymbolRow>(
+      `
+        select id, name, file_path, start_line, end_line, kind, signature, parent, language
+        from symbols
+        where file_path = ?
+        order by start_line asc, id asc
+      `
+    )
+    .all(file)
+}
+
+function buildSymbolDefinition(row: SymbolRow, matchQuality: 'exact' | 'partial'): SymbolDefinition {
+  const definition: SymbolDefinition = {
+    id: String(row.id),
+    name: row.name,
+    file: row.file_path,
+    range: {
+      startLine: row.start_line,
+      endLine: row.end_line
+    },
+    kind: row.kind,
+    matchQuality
+  }
+
+  if (row.signature) {
+    definition.signature = row.signature
+  }
+
+  if (row.parent) {
+    definition.parent = row.parent
+  }
+
+  if (row.language) {
+    definition.language = row.language
+  }
+
+  return definition
+}
+
 function selectExactDefinitionRows(
   db: Database.Database,
   name: string,
@@ -4250,12 +4639,13 @@ function selectDefinitionEdgeRows(
   targets: ReadonlyArray<DefinitionEdgeTarget>,
   edgeKinds: ReadonlyArray<Edge['edgeKind']>,
   preferCallsFirst: boolean,
-  limit?: number
+  options?: number | DefinitionEdgeSelectOptions
 ): EdgeResultRow[] {
   if (targets.length === 0 || edgeKinds.length === 0) {
     return []
   }
 
+  const selectOptions = typeof options === 'number' ? { limit: options, nameOnlyLimit: options } : options ?? {}
   const edgeKindPlaceholders = edgeKinds.map(() => '?').join(', ')
   const rowsById = new Map<number, EdgeResultRow>()
 
@@ -4273,15 +4663,34 @@ function selectDefinitionEdgeRows(
     }
     params.push(...edgeKinds)
 
+    const nameOnlyLimit = target.resolutionMode === 'name-only' ? selectOptions.nameOnlyLimit : undefined
+    if (nameOnlyLimit !== undefined) {
+      const total = db
+        .prepare<unknown[], { count: number }>(
+          `
+            select count(*) as count
+            from edges
+            where ${whereClause}
+          `
+        )
+        .get(...params)?.count ?? 0
+      if (total > nameOnlyLimit && selectOptions.stats) {
+        selectOptions.stats.nameOnlyUnscoped = (selectOptions.stats.nameOnlyUnscoped ?? 0) + total
+      }
+    }
+
+    const orderBy = `${preferCallsFirst ? "case when edge_kind = 'call' then 0 else 1 end asc, " : ''}src_file asc, src_line asc, id asc`
     const targetRows = db
       .prepare<unknown[], EdgeResultRow>(
         `
           select id, src_file, src_line, src_symbol, edge_kind, resolution, language
           from edges
           where ${whereClause}
+          order by ${orderBy}
+          ${nameOnlyLimit !== undefined ? 'limit ?' : ''}
         `
       )
-      .all(...params)
+      .all(...(nameOnlyLimit !== undefined ? [...params, nameOnlyLimit] : params))
 
     for (const row of targetRows) {
       rowsById.set(row.id, row)
@@ -4289,7 +4698,7 @@ function selectDefinitionEdgeRows(
   }
 
   const rows = [...rowsById.values()].sort((left, right) => compareEdgeResultRows(left, right, preferCallsFirst))
-  return limit === undefined ? rows : rows.slice(0, limit)
+  return selectOptions.limit === undefined ? rows : rows.slice(0, selectOptions.limit)
 }
 
 function compareEdgeResultRows(left: EdgeResultRow, right: EdgeResultRow, preferCallsFirst: boolean): number {

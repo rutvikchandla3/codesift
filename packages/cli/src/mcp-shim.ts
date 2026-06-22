@@ -2,6 +2,9 @@ import { spawn } from 'node:child_process'
 import { createConnection } from 'node:net'
 import { resolve } from 'node:path'
 
+import { findRepoRoot } from '@codesift/core'
+import { MCP_TOOL_NAMES } from '@codesift/mcp'
+
 import { getDefaultDaemonSocketPath } from './daemon-path.js'
 
 interface DaemonReply {
@@ -9,11 +12,11 @@ interface DaemonReply {
   error?: string
 }
 
-const MCP_TOOL_NAMES = ['search_code', 'find_symbol', 'grep_code', 'read_chunk', 'index_status']
 const DAEMON_CONNECT_TIMEOUT_MS = 3000
 
 export async function runMcpShim(argv = process.argv): Promise<void> {
-  const repoRoot = resolve(readPathArgument(argv) ?? process.cwd())
+  const explicitPath = readPathArgument(argv)
+  const repoRoot = explicitPath ? resolve(explicitPath) : await findRepoRoot(process.cwd())
   const socketPath = process.env.CODESIFT_DAEMON_SOCKET ?? getDefaultDaemonSocketPath()
 
   await ensureDaemon(socketPath)
