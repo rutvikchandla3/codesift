@@ -5,7 +5,7 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { openRepo, registerEmbeddingProvider, type EdgeResult, type GrepHit, type ImpactResult, type RepoStatus, type SearchHit, type SymbolDefinition } from '@codesift/core'
+import { openRepo, registerEmbeddingProvider, type EdgeResult, type GrepHit, type ImpactResult, type Repo, type RepoStatus, type SearchHit, type SymbolDefinition } from '@codesift/core'
 
 import {
   DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS,
@@ -16,11 +16,13 @@ import {
   DEFAULT_SEARCH_K,
   MIN_MCP_READ_CHUNK_MAX_TOKENS,
   MCP_SERVER_INSTRUCTIONS,
+  NOT_INDEXED_SENTINEL,
   createHttpServer,
   createRouter,
   createStdioServer,
   callMcpTool,
   formatMcpCallers,
+  formatMcpChangesetContext,
   formatMcpGrepHits,
   formatMcpImpact,
   formatMcpImplementers,
@@ -68,6 +70,7 @@ describe('@codesift/mcp server', () => {
       'find_importers',
       'who_implements',
       'impact',
+      'changeset_context',
       'grep_code',
       'read_chunk',
       'index_status'
@@ -78,6 +81,7 @@ describe('@codesift/mcp server', () => {
     })
     expect(getToolDefinitions().find((tool) => tool.name === 'find_symbol')?.inputSchema.properties).toMatchObject({
       with_callers: { type: 'boolean' },
+      detail: { type: 'string', enum: ['sig', 'body'] },
       max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS }
     })
     expect(getToolDefinitions().find((tool) => tool.name === 'find_callers')?.inputSchema.required).toEqual(['name'])
@@ -93,11 +97,16 @@ describe('@codesift/mcp server', () => {
     })
     expect(getToolDefinitions().find((tool) => tool.name === 'search_code')?.inputSchema.properties).toMatchObject({
       max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_SEARCH_MAX_TOKENS },
-      context: { type: 'string', enum: ['sig', 'body'] },
-      with_usages: { type: 'boolean' }
+      context: { type: 'string', enum: ['auto', 'min', 'sig', 'body', 'graph'] },
+      with_usages: { type: 'boolean' },
+      with_relations: { type: 'boolean' }
     })
     expect(getToolDefinitions().find((tool) => tool.name === 'index_status')?.inputSchema.properties).toMatchObject({
       max_tokens: { type: 'integer', minimum: 1, maximum: 1000, default: DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS }
+    })
+    expect(getToolDefinitions().find((tool) => tool.name === 'changeset_context')?.inputSchema.properties).toMatchObject({
+      max_files: { type: 'integer', minimum: 1, maximum: 40, default: 40 },
+      max_edges_per_file: { type: 'integer', minimum: 1, maximum: 25, default: 12 }
     })
     expect(MCP_SERVER_INSTRUCTIONS).toContain('breakage/transitive callers->impact')
     expect(MCP_SERVER_INSTRUCTIONS).toContain('approx:name-only')
@@ -141,7 +150,7 @@ describe('@codesift/mcp server', () => {
     expect(MCP_SERVER_INSTRUCTIONS).toContain('breakage/transitive callers->impact')
     expect(MCP_SERVER_INSTRUCTIONS).toContain('concepts/fuzzy names->search_code')
     expect(MCP_SERVER_INSTRUCTIONS).toContain('Broad search k=5-8')
-    expect(MCP_SERVER_INSTRUCTIONS).toContain('Check index_status')
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('Health is inline')
   })
 
   it('keeps control-plane metadata under the MCP budget', () => {
@@ -155,14 +164,15 @@ describe('@codesift/mcp server', () => {
       ['find_importers', 90],
       ['who_implements', 125],
       ['impact', 110],
+      ['changeset_context', 90],
       ['grep_code', 120],
       ['read_chunk', 120],
       ['index_status', 90]
     ])
 
-    expect(payload.length).toBeLessThanOrEqual(6000)
-    expect(Math.ceil(payload.length / 4)).toBeLessThanOrEqual(1500)
-    expect(MCP_SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(430)
+    expect(payload.length).toBeLessThanOrEqual(7000)
+    expect(Math.ceil(payload.length / 4)).toBeLessThanOrEqual(1750)
+    expect(MCP_SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(560)
     for (const tool of tools) {
       expect(tool.description.length).toBeLessThanOrEqual(toolDescriptionCeilings.get(tool.name) ?? 120)
     }
@@ -187,6 +197,27 @@ describe('@codesift/mcp server', () => {
 
     expect(getToolDefinitions()[0]?.description.toLowerCase()).toContain('semantic')
     expect(getToolDefinitions()[0]?.description.toLowerCase()).toContain('hybrid')
+  })
+
+  it('returns indexing status instead of empty search output during first sync', async () => {
+    const repo = {
+      async status() {
+        return makeStatus({
+          indexExists: true,
+          indexed: false,
+          sync: { state: 'running', completedChunks: 2, totalChunks: 7 },
+          chunkCount: 0,
+          symbolCount: 0,
+          indexGeneration: 0,
+          provider: null
+        })
+      },
+      async search() {
+        throw new Error('search should not run while the first index is still building')
+      }
+    } as unknown as Repo
+
+    await expect(callMcpTool(repo, 'search_code', { query: 'demoValue' })).resolves.toBe('indexing; sync=running chunks=2/7; retry shortly or use index_status')
   })
 
   it('routes tool calls through the core repo contract', async () => {
@@ -224,6 +255,16 @@ describe('@codesift/mcp server', () => {
     const compactSymbols = await router.findSymbol({ name: 'demoValue', with_body: false })
     expect(compactSymbols[0]?.body).toBeUndefined()
     expect(formatMcpSymbols(compactSymbols)).not.toContain("return 'demo'")
+
+    const signatureSymbols = await router.findSymbol({ name: 'demoValue', detail: 'sig' })
+    expect(signatureSymbols[0]?.body).toBeUndefined()
+    const signatureOutput = await callMcpTool(repo, 'find_symbol', { name: 'demoValue', detail: 'sig' })
+    expect(signatureOutput).toContain('#1 function demoValue src/demo.ts:')
+    expect(signatureOutput).not.toContain("return 'demo'")
+
+    const partialOutput = await callMcpTool(repo, 'find_symbol', { name: 'demo', max_tokens: 80 })
+    expect(partialOutput).toContain('exact_miss; partial_matches=1')
+    expect(partialOutput).toContain('#1 partial function demoValue src/demo.ts:')
 
     expect(grepHits[0]?.file).toBe('src/demo.ts')
     expect(await router.readChunk({ id: hits[0]!.id })).toContain("return 'demo'")
@@ -350,6 +391,12 @@ export function main(header: string): string {
     expect(refsOutput).not.toContain('src/auth/token.ts')
     expect(refsOutput).not.toContain('src/forms/checkout.ts')
 
+    const ambiguousRefsOutput = await callMcpTool(collisionRepo, 'find_refs', {
+      name: 'validate',
+      max_tokens: 120
+    })
+    expect(ambiguousRefsOutput).toContain('ambiguous: 3 defs')
+
     const heritageRepoRoot = await copyFixtureRepository('heritage-ts', 'codesift-mcp-graph-heritage-')
     const heritageRepo = await openRepo(heritageRepoRoot)
     await heritageRepo.sync()
@@ -360,6 +407,49 @@ export function main(header: string): string {
     })
     expect(implementersOutput).toContain('src/impl.ts:3 JwtVerifier implements import-resolved | export class JwtVerifier extends BaseVerifier implements AuthStrategy {')
     expect(implementersOutput).toContain('src/impl.ts:9 StrictStrategy extends import-resolved | export interface StrictStrategy extends AuthStrategy {}')
+  })
+
+  it('emits a name-only lead line from real capped graph lookups', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-mcp-name-only-cap-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'auth'), { recursive: true })
+    await writeFile(
+      join(repoRoot, 'auth', 'token.go'),
+      `package auth
+
+type TokenVerifier struct{}
+
+func (v TokenVerifier) VerifyToken(token string) bool {
+  return token != ""
+}
+`,
+      'utf8'
+    )
+    await Promise.all(Array.from({ length: 30 }, async (_, index) => {
+      await writeFile(
+        join(repoRoot, 'auth', `caller${index}.go`),
+        `package auth
+
+func ValidateBearer${index}(token string) bool {
+  verifier := TokenVerifier{}
+  return verifier.VerifyToken(token)
+}
+`,
+        'utf8'
+      )
+    }))
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const output = await callMcpTool(repo, 'find_callers', {
+      name: 'VerifyToken',
+      kind: 'method',
+      max_tokens: 600
+    })
+    expect(output).toContain('name_only_unscoped=30; narrow with path_glob/kind')
+    expect(output).toContain('approx:name-only')
   })
 
   it('formats one-call find_symbol relations and bounded impact output', async () => {
@@ -673,6 +763,7 @@ function makeStatus(overrides: Partial<RepoStatus> = {}): RepoStatus {
   return {
     root: '/tmp/repo',
     indexPath: '/tmp/repo/.codesift/index.db',
+    indexExists: true,
     indexed: true,
     stale: false,
     sync: { state: 'completed', completedAt: '2026-06-20T00:00:00.000Z' },
@@ -805,6 +896,37 @@ describe('formatMcpIndexStatus compact output', () => {
     expect(output).toContain('indexed=yes')
     expect(output).not.toContain('indexPath')
     expect(output).not.toContain('{')
+  })
+})
+
+describe('formatMcpChangesetContext output', () => {
+  it('labels capped omissions as lower bounds and marks symbol clipping', () => {
+    const output = formatMcpChangesetContext({
+      files: [
+        {
+          file: 'src/auth.ts',
+          symbols: Array.from({ length: 10 }, (_, index) => ({
+            id: `symbol-${index}`,
+            name: `symbol${index}`,
+            kind: 'function',
+            file: 'src/auth.ts',
+            range: { startLine: index + 1, endLine: index + 1 }
+          })),
+          callers: [],
+          importers: [],
+          omitted: 1,
+          omittedLowerBound: true
+        }
+      ],
+      truncated: true
+    })
+
+    expect(output).toContain('file src/auth.ts')
+    expect(output).toContain('- symbol function symbol7 8')
+    expect(output).not.toContain('symbol8')
+    expect(output).toContain('symbols_omitted=2; narrow files')
+    expect(output).toContain('omitted>=1; raise max_edges_per_file or narrow files')
+    expect(output).toContain('changeset_truncated=true')
   })
 })
 
@@ -1232,6 +1354,15 @@ describe('formatMcpGrepHits keeps its single-line ↩-joined format', () => {
 
   it('returns no_matches for an empty result set', () => {
     expect(formatMcpGrepHits([])).toBe('no_matches')
+  })
+
+  it('preserves not-indexed metadata on empty grep results', () => {
+    const hits = [] as GrepHit[] & { meta?: { notIndexed: boolean } }
+    Object.defineProperty(hits, 'meta', {
+      value: { notIndexed: true },
+      enumerable: false
+    })
+    expect(formatMcpGrepHits(hits)).toBe(NOT_INDEXED_SENTINEL)
   })
 
   it('leaves grep formatting unchanged when the rendered hits fit under the token budget', () => {

@@ -59,6 +59,8 @@ const GENERATED_MARKERS = [
   /this file was generated/i
 ]
 
+const MTIME_TOLERANCE_MS = 2
+
 interface IgnoreMatcher {
   basePath: string
   matcher: ReturnType<typeof ignore>
@@ -78,6 +80,15 @@ export interface ScannedFile extends ScannedFileMetadata {
   generated: boolean
 }
 
+export interface KnownScannedFile {
+  path: string
+  language: string
+  hash: string
+  size: number
+  mtime: number
+  generated: number
+}
+
 export interface ScanResult {
   files: ScannedFile[]
   skippedFiles: number
@@ -90,8 +101,8 @@ export interface ScanManifestResult {
   skippedSymlinks: number
 }
 
-export async function scanRepository(root: string): Promise<ScanResult> {
-  const result = await scanRepositoryInternal(root, true)
+export async function scanRepository(root: string, knownByPath?: ReadonlyMap<string, KnownScannedFile>): Promise<ScanResult> {
+  const result = await scanRepositoryInternal(root, true, knownByPath)
   return {
     files: result.files as ScannedFile[],
     skippedFiles: result.skippedFiles,
@@ -108,7 +119,11 @@ export async function scanRepositoryManifest(root: string): Promise<ScanManifest
   }
 }
 
-async function scanRepositoryInternal(root: string, includeContent: boolean): Promise<{ files: Array<ScannedFile | ScannedFileMetadata>; skippedFiles: number; skippedSymlinks: number }> {
+async function scanRepositoryInternal(
+  root: string,
+  includeContent: boolean,
+  knownByPath?: ReadonlyMap<string, KnownScannedFile>
+): Promise<{ files: Array<ScannedFile | ScannedFileMetadata>; skippedFiles: number; skippedSymlinks: number }> {
   const files: Array<ScannedFile | ScannedFileMetadata> = []
   let skippedFiles = 0
   let skippedSymlinks = 0
@@ -146,6 +161,26 @@ async function scanRepositoryInternal(root: string, includeContent: boolean): Pr
         language,
         size: fileStat.size,
         mtime: fileStat.mtimeMs
+      })
+      return
+    }
+
+    const known = knownByPath?.get(relativePath)
+    if (
+      known &&
+      known.language === language &&
+      known.size === fileStat.size &&
+      mtimeEqual(known.mtime, fileStat.mtimeMs)
+    ) {
+      files.push({
+        absolutePath,
+        relativePath,
+        language,
+        content: '',
+        hash: known.hash,
+        size: fileStat.size,
+        mtime: fileStat.mtimeMs,
+        generated: known.generated === 1
       })
       return
     }
@@ -247,6 +282,10 @@ async function scanRepositoryInternal(root: string, includeContent: boolean): Pr
 
   files.sort((left, right) => left.relativePath.localeCompare(right.relativePath))
   return { files, skippedFiles, skippedSymlinks }
+}
+
+function mtimeEqual(left: number, right: number): boolean {
+  return Math.abs(left - right) <= MTIME_TOLERANCE_MS
 }
 
 async function createDirectoryMatcher(directory: string, basePath: string, defaults: string[] = []): Promise<IgnoreMatcher> {

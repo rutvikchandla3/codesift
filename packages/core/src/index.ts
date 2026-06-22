@@ -3,6 +3,9 @@ export type {
   EmbeddingBatchOptions,
   EmbeddingProvider,
   EmbeddingRole,
+  ChangesetContextOptions,
+  ChangesetContextResult,
+  ChangesetFileContext,
   FindEdgeOptions,
   FindImportersOptions,
   FindSymbolOptions,
@@ -27,6 +30,8 @@ export type {
   RepoStatusProvider,
   RepoSyncState,
   RepoSyncStatus,
+  ResultList,
+  ResultMetadata,
   SearchHit,
   SearchOptions,
   SearchReasonTag,
@@ -93,7 +98,7 @@ export {
   type CodesiftConfigKey
 } from './config.js'
 
-export { IndexCompatibilityError, SqliteRepo, setVectorExtensionLoaderForTests } from './repo.js'
+export { IndexCompatibilityError, SqliteRepo, findRepoRoot, setVectorExtensionLoaderForTests } from './repo.js'
 
 import { SqliteRepo } from './repo.js'
 import type { Repo, RepoOptions } from './types.js'

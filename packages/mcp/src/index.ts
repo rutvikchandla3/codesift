@@ -6,6 +6,8 @@ import {
   DEFAULT_SEARCH_K as CORE_DEFAULT_SEARCH_K,
   getDefaultEmbeddingProvider,
   isLearnedEmbeddingProvider,
+  type ChangesetContextResult,
+  type ChangesetFileContext,
   type EdgeResult,
   type FindEdgeOptions,
   type FindSymbolOptions,
@@ -15,6 +17,7 @@ import {
   type ImpactResult,
   type Repo,
   type RepoStatus,
+  type ResultMetadata,
   type SearchHit,
   type SearchOptions,
   type SymbolDefinition,
@@ -36,6 +39,7 @@ export const DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS = 200
 export const MIN_MCP_READ_CHUNK_MAX_TOKENS = 6
 export const MAX_MCP_READ_CHUNK_MAX_TOKENS = 4000
 export const MAX_MCP_INDEX_STATUS_MAX_TOKENS = 1000
+export const NOT_INDEXED_SENTINEL = 'not_indexed; run: codesift index'
 
 const SYMBOL_KINDS = [
   'class',
@@ -51,6 +55,11 @@ const SYMBOL_KINDS = [
   'variable'
 ] as const satisfies readonly SymbolKind[]
 
+const MAX_CHANGESET_FILES = 40
+const MAX_CHANGESET_EDGES_PER_FILE = 25
+const DEFAULT_CHANGESET_MAX_FILES = 40
+const DEFAULT_CHANGESET_MAX_EDGES_PER_FILE = 12
+
 export const MCP_TOOL_NAMES = [
   'search_code',
   'find_symbol',
@@ -59,6 +68,7 @@ export const MCP_TOOL_NAMES = [
   'find_importers',
   'who_implements',
   'impact',
+  'changeset_context',
   'grep_code',
   'read_chunk',
   'index_status'
@@ -76,6 +86,7 @@ export interface SearchCodeArgs {
   single_best?: boolean | undefined
   context?: SearchOptions['context'] | undefined
   with_usages?: boolean | undefined
+  with_relations?: boolean | undefined
 }
 
 export interface FindSymbolArgs {
@@ -84,6 +95,7 @@ export interface FindSymbolArgs {
   path_glob?: string | undefined
   with_body?: boolean | undefined
   with_callers?: boolean | undefined
+  detail?: FindSymbolOptions['detail'] | undefined
   max_tokens?: number | undefined
 }
 
@@ -116,6 +128,13 @@ export interface ImpactArgs {
   depth?: number | undefined
   kind?: ImpactOptions['kind'] | undefined
   path_glob?: string | undefined
+  max_tokens?: number | undefined
+}
+
+export interface ChangesetContextArgs {
+  files: string[]
+  max_files?: number | undefined
+  max_edges_per_file?: number | undefined
   max_tokens?: number | undefined
 }
 
@@ -155,6 +174,10 @@ export interface FormatMcpEdgeResultsOptions {
 }
 
 export interface FormatMcpImpactOptions {
+  maxTokens?: number | undefined
+}
+
+export interface FormatMcpChangesetContextOptions {
   maxTokens?: number | undefined
 }
 
@@ -204,6 +227,7 @@ export interface McpRouter {
   findImporters(args: FindImportersArgs): Promise<EdgeResult[]>
   findImplementers(args: FindImplementersArgs): Promise<EdgeResult[]>
   impact(args: ImpactArgs): Promise<ImpactResult>
+  changesetContext(args: ChangesetContextArgs): Promise<ChangesetContextResult>
   grepCode(args: GrepCodeArgs): Promise<GrepHit[]>
   readChunk(args: ReadChunkArgs): Promise<string>
   indexStatus(): Promise<RepoStatus>
@@ -221,9 +245,9 @@ export type McpJsonRpcResponse =
   | { jsonrpc: '2.0'; id: string | number | null; error: { code: number; message: string; data?: unknown } }
 
 export const MCP_SERVER_INSTRUCTIONS = [
-  'codesift;identifiers->find_symbol;callers/uses->find_callers/find_refs;breakage/transitive callers->impact;importers->find_importers;implements/extends->who_implements;G/J/Rb/Rs approx:name-only;literals/regex/errors/env/operators->grep_code;concepts/fuzzy names->search_code',
-  'Top search_code body inline;read_chunk only for non-top/wider context;Broad search k=5-8.',
-  'Check index_status;warn+sync if missing/stale/running/failed.'
+  'codesift;identifiers->find_symbol;callers/uses->find_callers/find_refs;diff file lists->changeset_context;breakage/transitive callers->impact;importers->find_importers;implements/extends->who_implements;G/J/Rb/Rs approx:name-only;literals/regex/errors/env/operators->grep_code;concepts/fuzzy names->search_code',
+  'Top search_code body inline;find_symbol body/relations when budget fits;read_chunk only for non-top/wider context;Broad search k=5-8.',
+  'Health is inline: not_indexed/stale/running/failed hints; use index_status only when troubleshooting.'
 ].join('\n')
 
 const symbolKindSchema = z.enum(SYMBOL_KINDS)
@@ -237,8 +261,9 @@ const searchCodeInputSchema = {
   kind: kindFilterSchema.optional().describe('Symbol kind filter.'),
   max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.'),
   single_best: z.boolean().optional().describe('Return only best hit.'),
-  context: z.enum(['sig', 'body']).optional().describe('sig=snippets; body=inline bodies within budget.'),
-  with_usages: z.boolean().optional().describe('Add top usage sites for the top definition hit.')
+  context: z.enum(['auto', 'min', 'sig', 'body', 'graph']).optional().describe('auto=default; min/sig=compact; body=inline body; graph=relations.'),
+  with_usages: z.boolean().optional().describe('Add top usage sites for the top definition hit.'),
+  with_relations: z.boolean().optional().describe('Add bounded callers/refs + neighbors for a confident top definition.')
 }
 
 const findSymbolInputSchema = {
@@ -247,6 +272,7 @@ const findSymbolInputSchema = {
   path_glob: z.string().min(1).optional().describe('Repo glob, e.g. "src/auth/**".'),
   with_body: z.boolean().optional().describe('Inline top exact body. Default true.'),
   with_callers: z.boolean().optional().describe('Append bounded caller/ref + same-file relations for the top exact hit.'),
+  detail: z.enum(['sig', 'body']).optional().describe('sig=signature/location only; body=inline top body.'),
   max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.')
 }
 
@@ -282,6 +308,13 @@ const impactInputSchema = {
   max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.')
 }
 
+const changesetContextInputSchema = {
+  files: z.array(z.string().min(1)).min(1).max(200).describe('Explicit repo-relative file list to summarize.'),
+  max_files: z.number().int().positive().max(MAX_CHANGESET_FILES).optional().describe('Max files to inspect. Default 40.'),
+  max_edges_per_file: z.number().int().positive().max(MAX_CHANGESET_EDGES_PER_FILE).optional().describe('Max callers/importers per file. Default 12.'),
+  max_tokens: z.number().int().positive().max(4000).optional().describe('Approx output tokens. Default 700.')
+}
+
 const grepCodeInputSchema = {
   pattern: z.string().min(1).describe('Literal by default; set regex=true for regex.'),
   regex: z.boolean().optional().describe('Use JavaScript regex. Default false.'),
@@ -314,6 +347,7 @@ const findRefsArgsSchema = z.object(findRefsInputSchema).strict()
 const findImportersArgsSchema = z.object(findImportersInputSchema).strict()
 const findImplementersArgsSchema = z.object(findImplementersInputSchema).strict()
 const impactArgsSchema = z.object(impactInputSchema).strict()
+const changesetContextArgsSchema = z.object(changesetContextInputSchema).strict()
 const grepCodeArgsSchema = z.object(grepCodeInputSchema).strict()
 const readChunkArgsSchema = z.object(readChunkInputSchema).strict()
 const indexStatusArgsSchema = z.object(indexStatusInputSchema).strict()
@@ -365,8 +399,9 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
         kind: kindJsonSchema(),
         max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_SEARCH_MAX_TOKENS },
         single_best: { type: 'boolean' },
-        context: { type: 'string', enum: ['sig', 'body'] },
-        with_usages: { type: 'boolean' }
+        context: { type: 'string', enum: ['auto', 'min', 'sig', 'body', 'graph'] },
+        with_usages: { type: 'boolean' },
+        with_relations: { type: 'boolean' }
       })
     },
     {
@@ -378,6 +413,7 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
         path_glob: { type: 'string' },
         with_body: { type: 'boolean', default: true },
         with_callers: { type: 'boolean' },
+        detail: { type: 'string', enum: ['sig', 'body'] },
         max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS }
       })
     },
@@ -425,6 +461,16 @@ export function getToolDefinitions(): readonly McpToolDefinition[] {
         depth: { type: 'integer', minimum: 0, maximum: 8, default: 2 },
         kind: kindJsonSchema(),
         path_glob: { type: 'string' },
+        max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_RELATION_MAX_TOKENS }
+      })
+    },
+    {
+      name: 'changeset_context',
+      description: 'Symbols plus direct callers/importers for an explicit file list.',
+      inputSchema: jsonSchema(['files'], {
+        files: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 200 },
+        max_files: { type: 'integer', minimum: 1, maximum: MAX_CHANGESET_FILES, default: DEFAULT_CHANGESET_MAX_FILES },
+        max_edges_per_file: { type: 'integer', minimum: 1, maximum: MAX_CHANGESET_EDGES_PER_FILE, default: DEFAULT_CHANGESET_MAX_EDGES_PER_FILE },
         max_tokens: { type: 'integer', minimum: 1, maximum: 4000, default: DEFAULT_MCP_RELATION_MAX_TOKENS }
       })
     },
@@ -494,6 +540,9 @@ export function createRouter(repo: Repo): McpRouter {
       if (args.with_usages !== undefined) {
         options.withUsages = args.with_usages
       }
+      if (args.with_relations !== undefined) {
+        options.withRelations = args.with_relations
+      }
 
       return repo.search(args.query, options)
     },
@@ -515,6 +564,10 @@ export function createRouter(repo: Repo): McpRouter {
       if (args.with_callers !== undefined) {
         options.withCallers = args.with_callers
       }
+      if (args.detail !== undefined) {
+        options.detail = args.detail
+      }
+      options.maxTokens = args.max_tokens ?? DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS
 
       return repo.findSymbol(args.name, options)
     },
@@ -568,6 +621,13 @@ export function createRouter(repo: Repo): McpRouter {
       }
 
       return repo.impact(args.name, options)
+    },
+    async changesetContext(args) {
+      return repo.changesetContext(args.files, {
+        ...(args.max_files !== undefined ? { maxFiles: args.max_files } : {}),
+        ...(args.max_edges_per_file !== undefined ? { maxEdgesPerFile: args.max_edges_per_file } : {}),
+        maxTokens: args.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS
+      })
     },
     async grepCode(args) {
       const options: GrepOptions = {}
@@ -629,46 +689,91 @@ export async function callMcpTool(repo: Repo, name: McpToolName, args: unknown):
     case 'search_code':
       {
         const parsed = searchCodeArgsSchema.parse(args)
+        const unavailable = await formatQueryUnavailableIfNotReady(repo)
+        if (unavailable) {
+          return unavailable
+        }
         return formatMcpSearchHits(await router.searchCode(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_SEARCH_MAX_TOKENS })
       }
     case 'find_symbol':
       {
         const parsed = findSymbolArgsSchema.parse(args)
+        const unavailable = await formatQueryUnavailableIfNotReady(repo)
+        if (unavailable) {
+          return unavailable
+        }
         return formatMcpSymbols(await router.findSymbol(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS })
       }
     case 'find_callers':
       {
         const parsed = findCallersArgsSchema.parse(args)
+        const unavailable = await formatQueryUnavailableIfNotReady(repo)
+        if (unavailable) {
+          return unavailable
+        }
         return formatMcpCallers(await router.findCallers(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS })
       }
     case 'find_refs':
       {
         const parsed = findRefsArgsSchema.parse(args)
+        const unavailable = await formatQueryUnavailableIfNotReady(repo)
+        if (unavailable) {
+          return unavailable
+        }
         return formatMcpReferences(await router.findReferences(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS })
       }
     case 'find_importers':
       {
         const parsed = findImportersArgsSchema.parse(args)
+        const unavailable = await formatQueryUnavailableIfNotReady(repo)
+        if (unavailable) {
+          return unavailable
+        }
         return formatMcpImporters(await router.findImporters(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS })
       }
     case 'who_implements':
       {
         const parsed = findImplementersArgsSchema.parse(args)
+        const unavailable = await formatQueryUnavailableIfNotReady(repo)
+        if (unavailable) {
+          return unavailable
+        }
         return formatMcpImplementers(await router.findImplementers(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS })
       }
     case 'impact':
       {
         const parsed = impactArgsSchema.parse(args)
+        const unavailable = await formatQueryUnavailableIfNotReady(repo)
+        if (unavailable) {
+          return unavailable
+        }
         return formatMcpImpact(await router.impact(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS })
+      }
+    case 'changeset_context':
+      {
+        const parsed = changesetContextArgsSchema.parse(args)
+        const unavailable = await formatQueryUnavailableIfNotReady(repo)
+        if (unavailable) {
+          return unavailable
+        }
+        return formatMcpChangesetContext(await router.changesetContext(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS })
       }
     case 'grep_code':
       {
         const parsed = grepCodeArgsSchema.parse(args)
+        const unavailable = await formatQueryUnavailableIfNotReady(repo)
+        if (unavailable) {
+          return unavailable
+        }
         return formatMcpGrepHits(await router.grepCode(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_GREP_MAX_TOKENS })
       }
     case 'read_chunk':
       {
         const parsed = readChunkArgsSchema.parse(args)
+        const unavailable = await formatQueryUnavailableIfNotReady(repo)
+        if (unavailable) {
+          return unavailable
+        }
         return formatMcpReadChunk(await router.readChunk(parsed), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_READ_CHUNK_MAX_TOKENS })
       }
     case 'index_status':
@@ -677,6 +782,34 @@ export async function callMcpTool(repo: Repo, name: McpToolName, args: unknown):
         return formatMcpIndexStatus(await router.indexStatus(), { maxTokens: parsed.max_tokens ?? DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS })
       }
   }
+}
+
+async function formatQueryUnavailableIfNotReady(repo: Repo): Promise<string> {
+  const status = await repo.status()
+  if (!status.indexExists) {
+    return NOT_INDEXED_SENTINEL
+  }
+  if (status.indexed) {
+    return ''
+  }
+  if (status.sync.state === 'running') {
+    const progress = formatSyncProgress(status)
+    return `indexing; sync=running${progress}; retry shortly or use index_status`
+  }
+  if (status.sync.state === 'failed' || status.sync.state === 'aborted') {
+    return `not_indexed; sync=${status.sync.state}; use index_status`
+  }
+  return ''
+}
+
+function formatSyncProgress(status: RepoStatus): string {
+  if (status.sync.completedChunks !== undefined && status.sync.totalChunks !== undefined) {
+    return ` chunks=${status.sync.completedChunks}/${status.sync.totalChunks}`
+  }
+  if (status.chunkCount > 0) {
+    return ` chunks=${status.chunkCount}`
+  }
+  return ''
 }
 
 export async function handleMcpJsonRpcRequest(repo: Repo, request: McpJsonRpcRequest): Promise<McpJsonRpcResponse | null> {
@@ -734,44 +867,59 @@ export async function handleMcpJsonRpcRequest(repo: Repo, request: McpJsonRpcReq
 }
 
 export function createSdkServer(repo: Repo): McpServer {
-  const router = createRouter(repo)
   const server = new McpServer(
     { name: 'codesift', version: '0.0.0' },
     { instructions: MCP_SERVER_INSTRUCTIONS }
   )
 
-  server.registerTool('search_code', { description: toolDescription('search_code'), inputSchema: searchCodeInputSchema }, async (args) =>
-    textResult(formatMcpSearchHits(await router.searchCode(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_SEARCH_MAX_TOKENS }))
+  server.registerTool('search_code', toolRegistrationOptions('search_code', searchCodeInputSchema), async (args) =>
+    textResult(await callMcpTool(repo, 'search_code', args))
   )
-  server.registerTool('find_symbol', { description: toolDescription('find_symbol'), inputSchema: findSymbolInputSchema }, async (args) =>
-    textResult(formatMcpSymbols(await router.findSymbol(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_FIND_SYMBOL_MAX_TOKENS }))
+  server.registerTool('find_symbol', toolRegistrationOptions('find_symbol', findSymbolInputSchema), async (args) =>
+    textResult(await callMcpTool(repo, 'find_symbol', args))
   )
-  server.registerTool('find_callers', { description: toolDescription('find_callers'), inputSchema: findCallersInputSchema }, async (args) =>
-    textResult(formatMcpCallers(await router.findCallers(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS }))
+  server.registerTool('find_callers', toolRegistrationOptions('find_callers', findCallersInputSchema), async (args) =>
+    textResult(await callMcpTool(repo, 'find_callers', args))
   )
-  server.registerTool('find_refs', { description: toolDescription('find_refs'), inputSchema: findRefsInputSchema }, async (args) =>
-    textResult(formatMcpReferences(await router.findReferences(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS }))
+  server.registerTool('find_refs', toolRegistrationOptions('find_refs', findRefsInputSchema), async (args) =>
+    textResult(await callMcpTool(repo, 'find_refs', args))
   )
-  server.registerTool('find_importers', { description: toolDescription('find_importers'), inputSchema: findImportersInputSchema }, async (args) =>
-    textResult(formatMcpImporters(await router.findImporters(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS }))
+  server.registerTool('find_importers', toolRegistrationOptions('find_importers', findImportersInputSchema), async (args) =>
+    textResult(await callMcpTool(repo, 'find_importers', args))
   )
-  server.registerTool('who_implements', { description: toolDescription('who_implements'), inputSchema: findImplementersInputSchema }, async (args) =>
-    textResult(formatMcpImplementers(await router.findImplementers(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS }))
+  server.registerTool('who_implements', toolRegistrationOptions('who_implements', findImplementersInputSchema), async (args) =>
+    textResult(await callMcpTool(repo, 'who_implements', args))
   )
-  server.registerTool('impact', { description: toolDescription('impact'), inputSchema: impactInputSchema }, async (args) =>
-    textResult(formatMcpImpact(await router.impact(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_RELATION_MAX_TOKENS }))
+  server.registerTool('impact', toolRegistrationOptions('impact', impactInputSchema), async (args) =>
+    textResult(await callMcpTool(repo, 'impact', args))
   )
-  server.registerTool('grep_code', { description: toolDescription('grep_code'), inputSchema: grepCodeInputSchema }, async (args) =>
-    textResult(formatMcpGrepHits(await router.grepCode(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_GREP_MAX_TOKENS }))
+  server.registerTool('changeset_context', toolRegistrationOptions('changeset_context', changesetContextInputSchema), async (args) =>
+    textResult(await callMcpTool(repo, 'changeset_context', args))
   )
-  server.registerTool('read_chunk', { description: toolDescription('read_chunk'), inputSchema: readChunkInputSchema }, async (args) =>
-    textResult(formatMcpReadChunk(await router.readChunk(args), { maxTokens: args.max_tokens ?? DEFAULT_MCP_READ_CHUNK_MAX_TOKENS }))
+  server.registerTool('grep_code', toolRegistrationOptions('grep_code', grepCodeInputSchema), async (args) =>
+    textResult(await callMcpTool(repo, 'grep_code', args))
   )
-  server.registerTool('index_status', { description: toolDescription('index_status'), inputSchema: indexStatusInputSchema }, async (args) =>
-    textResult(formatMcpIndexStatus(await router.indexStatus(), { maxTokens: args.max_tokens ?? DEFAULT_MCP_INDEX_STATUS_MAX_TOKENS }))
+  server.registerTool('read_chunk', toolRegistrationOptions('read_chunk', readChunkInputSchema), async (args) =>
+    textResult(await callMcpTool(repo, 'read_chunk', args))
+  )
+  server.registerTool('index_status', toolRegistrationOptions('index_status', indexStatusInputSchema), async (args) =>
+    textResult(await callMcpTool(repo, 'index_status', args))
   )
 
   return server
+}
+
+const READ_ONLY_TOOL_ANNOTATIONS = {
+  readOnlyHint: true,
+  openWorldHint: false
+} as const
+
+function toolRegistrationOptions<T extends z.ZodRawShape>(name: McpToolName, inputSchema: T) {
+  return {
+    description: toolDescription(name),
+    inputSchema,
+    annotations: READ_ONLY_TOOL_ANNOTATIONS
+  }
 }
 
 function textResult(text: string): { content: Array<{ type: 'text'; text: string }> } {
@@ -814,8 +962,15 @@ function toolDescription(name: McpToolName): string {
   return tool?.description ?? name
 }
 
+function resultMetadata<T>(items: T[]): ResultMetadata | undefined {
+  return (items as T[] & { meta?: ResultMetadata }).meta
+}
+
 export function formatMcpSearchHits(hits: SearchHit[], options: FormatMcpSearchHitsOptions = {}): string {
   if (hits.length === 0) {
+    if (resultMetadata(hits)?.notIndexed) {
+      return NOT_INDEXED_SENTINEL
+    }
     return 'no_hits'
   }
 
@@ -852,6 +1007,10 @@ function formatMcpSearchHit(hit: SearchHit): string {
   }
   if (hit.usages?.length) {
     sections.push(formatUsageBlock(hit.usages))
+  }
+  const relations = formatMcpSymbolRelations(hit.relations)
+  if (relations) {
+    sections.push(relations)
   }
   return joinSections(sections)
 }
@@ -1300,6 +1459,9 @@ function formatIndexStatusDetailLines(status: RepoStatus): string[] {
   if (status.sync.error) {
     lines.push(`sync_error=${compactStatusValue(status.sync.error, 140)}`)
   }
+  if (status.sync.state === 'running' && status.sync.completedChunks !== undefined && status.sync.totalChunks !== undefined) {
+    lines.push(`sync_progress=${status.sync.completedChunks}/${status.sync.totalChunks}`)
+  }
 
   if (!status.compatibility.ok) {
     if (status.compatibility.message) {
@@ -1444,17 +1606,35 @@ function formatHitSymbol(hit: SearchHit): string {
 
 export function formatMcpSymbols(definitions: SymbolDefinition[], options: FormatMcpSymbolsOptions = {}): string {
   if (definitions.length === 0) {
+    if (resultMetadata(definitions)?.notIndexed) {
+      return NOT_INDEXED_SENTINEL
+    }
     return 'no_symbols'
   }
 
+  const hints = formatSymbolLeadHints(definitions)
   const rendered = definitions.map(formatMcpSymbolDefinition)
-  const output = rendered.join('\n')
+  const output = joinSections([...hints, ...rendered])
   const maxTokens = options.maxTokens
   if (maxTokens === undefined || output.length <= maxTokens * 4) {
     return output
   }
 
-  return fitSymbolOutputForBudget(definitions, rendered, maxTokens * 4)
+  return fitSymbolOutputForBudget(definitions, rendered, maxTokens * 4, hints)
+}
+
+function formatSymbolLeadHints(definitions: SymbolDefinition[]): string[] {
+  const metadata = resultMetadata(definitions)
+  const hints: string[] = []
+  const ambiguousDefCount = definitions[0]?.ambiguousDefCount ?? metadata?.ambiguousDefCount
+  if (ambiguousDefCount && ambiguousDefCount >= 2) {
+    hints.push(`ambiguous: ${ambiguousDefCount} defs`)
+  }
+  const partialMatchCount = metadata?.partialMatchCount ?? definitions.filter((definition) => definition.matchQuality === 'partial').length
+  if (partialMatchCount > 0 && definitions.every((definition) => definition.matchQuality === 'partial')) {
+    hints.push(`exact_miss; partial_matches=${partialMatchCount}`)
+  }
+  return hints
 }
 
 function formatMcpSymbolDefinition(definition: SymbolDefinition, index: number): string {
@@ -1474,7 +1654,8 @@ function formatMcpSymbolDefinition(definition: SymbolDefinition, index: number):
 }
 
 function formatMcpSymbolHeader(definition: SymbolDefinition, index: number): string {
-  return `#${index + 1} ${definition.kind} ${definition.name} ${definition.file}:${formatRange(definition.range.startLine, definition.range.endLine)}`
+  const quality = definition.matchQuality === 'partial' ? ' partial' : ''
+  return `#${index + 1}${quality} ${definition.kind} ${definition.name} ${definition.file}:${formatRange(definition.range.startLine, definition.range.endLine)}`
 }
 
 function formatMcpSymbolRelations(relations: SymbolDefinition['relations']): string {
@@ -1517,27 +1698,29 @@ function countSymbolRelationItems(relations: SymbolDefinition['relations']): num
   return relations.sites.length + relations.neighbors.length + (relations.omitted ?? 0)
 }
 
-function fitSymbolOutputForBudget(definitions: SymbolDefinition[], rendered: string[], maxChars: number): string {
+function fitSymbolOutputForBudget(definitions: SymbolDefinition[], rendered: string[], maxChars: number, leadHints: string[] = []): string {
+  const leadBudget = joinSections(leadHints).length
+  const rowBudget = leadBudget > 0 ? Math.max(0, maxChars - leadBudget - 1) : maxChars
   const omittedAfterFirst = definitions.length - 1
   const firstHasRelations = countSymbolRelationItems(definitions[0]?.relations) > 0
   const firstOnlyMarker = omittedAfterFirst > 0
-    ? symbolOmissionMarker(omittedAfterFirst, Math.max(0, maxChars - 2))
+    ? symbolOmissionMarker(omittedAfterFirst, Math.max(0, rowBudget - 2))
     : firstHasRelations
       ? undefined
-      : symbolBodyTruncationMarker(Math.max(0, maxChars - 2))
-  const firstOnlyBudget = maxCharsForFirstHit(maxChars, firstOnlyMarker)
+      : symbolBodyTruncationMarker(Math.max(0, rowBudget - 2))
+  const firstOnlyBudget = maxCharsForFirstHit(rowBudget, firstOnlyMarker)
   if (rendered[0]!.length > firstOnlyBudget) {
     const first = formatMcpSymbolDefinitionForBudget(definitions[0]!, 0, firstOnlyBudget)
-    return firstOnlyMarker ? [first, firstOnlyMarker].filter(Boolean).join('\n') : first
+    return joinSections([...leadHints, first, firstOnlyMarker])
   }
 
   const parts = [rendered[0]!]
   for (let index = 1; index < rendered.length; index += 1) {
     const candidate = [...parts, rendered[index]!]
     const omitted = definitions.length - 1 - (candidate.length - 1)
-    const marker = omitted > 0 ? symbolOmissionMarker(omitted, Math.max(0, maxChars - 2)) : undefined
+    const marker = omitted > 0 ? symbolOmissionMarker(omitted, Math.max(0, rowBudget - 2)) : undefined
     const candidateOutput = marker ? [...candidate, marker].join('\n') : candidate.join('\n')
-    if (candidateOutput.length <= maxChars) {
+    if (candidateOutput.length <= rowBudget) {
       parts.push(rendered[index]!)
       continue
     }
@@ -1545,10 +1728,10 @@ function fitSymbolOutputForBudget(definitions: SymbolDefinition[], rendered: str
   }
 
   const omitted = definitions.length - parts.length
-  const marker = omitted > 0 ? symbolOmissionMarker(omitted, Math.max(0, maxChars - 2)) : undefined
+  const marker = omitted > 0 ? symbolOmissionMarker(omitted, Math.max(0, rowBudget - 2)) : undefined
   const outputParts = marker ? [...parts, marker] : parts
 
-  const output = outputParts.join('\n')
+  const output = joinSections([...leadHints, ...outputParts])
   return output.length <= maxChars ? output : truncateWithEllipsis(output, maxChars)
 }
 
@@ -1716,7 +1899,13 @@ export function formatMcpImplementers(results: EdgeResult[], options: FormatMcpE
 }
 
 export function formatMcpImpact(result: ImpactResult, options: FormatMcpImpactOptions = {}): string {
+  if (result.notIndexed) {
+    return NOT_INDEXED_SENTINEL
+  }
   if (result.nodes.length === 0) {
+    if (result.emptyReason === 'no_definition') {
+      return 'no_definition; refine name/kind/path_glob'
+    }
     return 'no_impact'
   }
 
@@ -1729,6 +1918,77 @@ export function formatMcpImpact(result: ImpactResult, options: FormatMcpImpactOp
   }
 
   return fitImpactOutputForBudget(rendered, notes, maxTokens * 4)
+}
+
+export function formatMcpChangesetContext(result: ChangesetContextResult, options: FormatMcpChangesetContextOptions = {}): string {
+  if (result.notIndexed) {
+    return NOT_INDEXED_SENTINEL
+  }
+  if (result.files.length === 0) {
+    return 'no_changeset_context'
+  }
+
+  const sections: string[] = []
+  if (result.stale) {
+    sections.push('stale=true')
+  }
+  for (const file of result.files) {
+    sections.push(formatMcpChangesetFile(file))
+  }
+  if (result.truncated) {
+    sections.push('changeset_truncated=true; narrow files/max_edges_per_file or raise max_tokens')
+  }
+
+  const output = joinSections(sections)
+  const maxTokens = options.maxTokens
+  if (maxTokens === undefined || output.length <= maxTokens * 4) {
+    return output
+  }
+
+  return fitChangesetOutputForBudget(sections, maxTokens * 4)
+}
+
+function formatMcpChangesetFile(file: ChangesetFileContext): string {
+  const lines = [`file ${file.file}`]
+  const renderedSymbols = file.symbols.slice(0, 8)
+  for (const symbol of renderedSymbols) {
+    lines.push(`- symbol ${symbol.kind} ${symbol.name} ${formatRange(symbol.range.startLine, symbol.range.endLine)}`)
+  }
+  const symbolsOmitted = file.symbols.length - renderedSymbols.length
+  if (symbolsOmitted > 0) {
+    lines.push(`- symbols_omitted=${symbolsOmitted}; narrow files`)
+  }
+  for (const importer of file.importers) {
+    lines.push(`- importer ${formatMcpEdgeResult(importer)}`)
+  }
+  for (const caller of file.callers) {
+    lines.push(`- caller ${formatMcpEdgeResult(caller)}`)
+  }
+  if (file.omitted && file.omitted > 0) {
+    const omittedLabel = file.omittedLowerBound ? `omitted>=${file.omitted}` : `omitted=${file.omitted}`
+    const recoveryHint = file.omittedLowerBound ? 'raise max_edges_per_file or narrow files' : 'raise max_tokens or narrow files'
+    lines.push(`- ${omittedLabel}; ${recoveryHint}`)
+  }
+  return lines.join('\n')
+}
+
+function fitChangesetOutputForBudget(sections: string[], maxChars: number): string {
+  const requiredMarker = 'changeset_truncated=true'
+  const kept: string[] = []
+  for (const section of sections) {
+    const candidate = joinSections([...kept, section, requiredMarker])
+    if (candidate.length <= maxChars) {
+      kept.push(section)
+      continue
+    }
+    break
+  }
+
+  if (kept.length === 0) {
+    return bestEffortOmissionMarker([requiredMarker], maxChars)
+  }
+
+  return joinSections([...kept, requiredMarker])
 }
 
 function buildImpactNoteLines(result: ImpactResult): string[] {
@@ -1829,18 +2089,40 @@ function formatMcpEdgeResults(
   omissionLabel: 'callers' | 'refs' | 'importers' | 'implementers',
   options: FormatMcpEdgeResultsOptions
 ): string {
+  const metadata = resultMetadata(results)
   if (results.length === 0) {
+    if (metadata?.notIndexed) {
+      return NOT_INDEXED_SENTINEL
+    }
+    if (metadata?.emptyReason === 'no_definition') {
+      return 'no_definition; refine name/kind/path_glob'
+    }
+    if (metadata?.emptyReason === 'no_edges') {
+      return `${emptyMarker}; indexed_edges=0`
+    }
     return emptyMarker
   }
 
+  const leadLines = formatEdgeLeadLines(metadata)
   const rendered = results.map((result) => formatMcpEdgeResult(result))
-  const output = rendered.join('\n')
+  const output = joinSections([...leadLines, ...rendered])
   const maxTokens = options.maxTokens
   if (maxTokens === undefined || output.length <= maxTokens * 4) {
     return output
   }
 
-  return fitEdgeResultOutputForBudget(rendered, omissionLabel, maxTokens * 4)
+  return fitEdgeResultOutputForBudget(rendered, omissionLabel, maxTokens * 4, leadLines)
+}
+
+function formatEdgeLeadLines(metadata: ResultMetadata | undefined): string[] {
+  const leadLines: string[] = []
+  if (metadata?.ambiguousDefCount && metadata.ambiguousDefCount >= 2) {
+    leadLines.push(`ambiguous: ${metadata.ambiguousDefCount} defs`)
+  }
+  if (metadata?.nameOnlyUnscoped && metadata.nameOnlyUnscoped > (metadata.nameOnlyLimit ?? 0)) {
+    leadLines.push(`name_only_unscoped=${metadata.nameOnlyUnscoped}; narrow with path_glob/kind`)
+  }
+  return leadLines
 }
 
 function formatMcpEdgeResult(result: EdgeResult, maxChars?: number): string {
@@ -1863,24 +2145,27 @@ function formatMcpEdgeResult(result: EdgeResult, maxChars?: number): string {
 function fitEdgeResultOutputForBudget(
   rendered: string[],
   omissionLabel: 'callers' | 'refs' | 'importers' | 'implementers',
-  maxChars: number
+  maxChars: number,
+  leadLines: string[] = []
 ): string {
   const kept: string[] = []
+  const leadBudget = joinSections(leadLines).length
+  const rowBudget = leadBudget > 0 ? Math.max(0, maxChars - leadBudget - 1) : maxChars
 
   for (let index = 0; index < rendered.length; index += 1) {
     const line = rendered[index]!
     const omittedAfter = rendered.length - index - 1
     const marker = omittedAfter > 0
-      ? edgeResultOmissionMarker(omissionLabel, omittedAfter, remainingCharsForTrailingLine([...kept, line], maxChars))
+      ? edgeResultOmissionMarker(omissionLabel, omittedAfter, remainingCharsForTrailingLine([...kept, line], rowBudget))
       : ''
     const candidate = joinSections([...kept, line, marker])
-    if (candidate.length <= maxChars) {
+    if (candidate.length <= rowBudget) {
       kept.push(line)
       continue
     }
 
     if (kept.length === 0) {
-      return formatSingleEdgeResultForBudget(line, omissionLabel, omittedAfter, maxChars)
+      return joinSections([...leadLines, formatSingleEdgeResultForBudget(line, omissionLabel, omittedAfter, rowBudget)])
     }
 
     break
@@ -1888,20 +2173,20 @@ function fitEdgeResultOutputForBudget(
 
   const omitted = rendered.length - kept.length
   if (omitted <= 0) {
-    return joinSections(kept)
+    return joinSections([...leadLines, ...kept])
   }
 
-  let marker = edgeResultOmissionMarker(omissionLabel, omitted, remainingCharsForTrailingLine(kept, maxChars))
+  let marker = edgeResultOmissionMarker(omissionLabel, omitted, remainingCharsForTrailingLine(kept, rowBudget))
   while (!marker && kept.length > 0) {
     kept.pop()
-    marker = edgeResultOmissionMarker(omissionLabel, rendered.length - kept.length, remainingCharsForTrailingLine(kept, maxChars))
+    marker = edgeResultOmissionMarker(omissionLabel, rendered.length - kept.length, remainingCharsForTrailingLine(kept, rowBudget))
   }
 
   if (!marker) {
-    return bestEffortOmissionMarker(edgeResultOmissionMarkerVariants(omissionLabel, omitted), maxChars)
+    return joinSections([...leadLines, bestEffortOmissionMarker(edgeResultOmissionMarkerVariants(omissionLabel, omitted), rowBudget)])
   }
 
-  return joinSections([...kept, marker])
+  return joinSections([...leadLines, ...kept, marker])
 }
 
 function formatSingleEdgeResultForBudget(
@@ -1948,6 +2233,9 @@ function formatMcpEdgeResultLineForBudget(line: string, maxChars: number): strin
 
 export function formatMcpGrepHits(hits: GrepHit[], options: FormatMcpGrepHitsOptions = {}): string {
   if (hits.length === 0) {
+    if (resultMetadata(hits)?.notIndexed) {
+      return NOT_INDEXED_SENTINEL
+    }
     return 'no_matches'
   }
 

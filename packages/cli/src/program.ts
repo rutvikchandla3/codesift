@@ -1,13 +1,19 @@
-import { rm } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { createRequire } from 'node:module'
+import { spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { createConnection } from 'node:net'
+import { dirname, resolve } from 'node:path'
 
 import { Command } from 'commander'
 
 import {
   DEFAULT_SEARCH_K,
   IndexCompatibilityError,
+  findRepoRoot,
   getDefaultEmbeddingProvider,
   isLearnedEmbeddingProvider,
+  listEmbeddingProviders,
   openRepo,
   readConfig,
   setConfigValue,
@@ -19,7 +25,17 @@ import {
   type SymbolKind,
   type SyncOptions
 } from '@codesift/core'
-import { createHttpServerHandle, createStdioServer, getToolDefinitions } from '@codesift/mcp'
+import {
+  DEFAULT_MCP_GREP_MAX_TOKENS,
+  DEFAULT_MCP_SEARCH_MAX_TOKENS,
+  NOT_INDEXED_SENTINEL,
+  createHttpServerHandle,
+  createStdioServer,
+  formatMcpGrepHits,
+  getToolDefinitions
+} from '@codesift/mcp'
+import { getDefaultDaemonSocketPath } from './daemon-path.js'
+import { supportedNodeMajors } from './supported-node-majors.js'
 
 export interface CliIo {
   stdout(message: string): void
@@ -35,6 +51,10 @@ const defaultIo: CliIo = {
   }
 }
 
+const require = createRequire(import.meta.url)
+const SUPPORTED_NODE_MAJORS = new Set<number>(supportedNodeMajors)
+const DEFAULT_INIT_CLIENT = 'project'
+
 export function getCliDescription(): string {
   const provider = getDefaultEmbeddingProvider()
   return isLearnedEmbeddingProvider(provider)
@@ -46,6 +66,7 @@ export function formatStatus(status: RepoStatus): string {
   return [
     `root: ${status.root}`,
     `index: ${status.indexPath}`,
+    `index exists: ${status.indexExists ? 'yes' : 'no'}`,
     `indexed: ${status.indexed ? 'yes' : 'no'}`,
     `stale: ${status.stale ? 'yes' : 'no'}`,
     ...(status.staleReasons?.length ? [`stale reasons: ${status.staleReasons.map((reason) => reason.message).join('; ')}`] : []),
@@ -126,7 +147,9 @@ export function formatSymbols(definitions: SymbolDefinition[]): string {
   return definitions
     .map((definition) => {
       const range = `${definition.range.startLine}-${definition.range.endLine}`
-      return `${definition.kind} ${definition.name} — ${definition.file}:${range}`
+      const quality = definition.matchQuality === 'partial' ? ' [partial]' : ''
+      const header = `${definition.kind} ${definition.name}${quality} — ${definition.file}:${range}`
+      return definition.body ? `${header}\n${definition.body}` : header
     })
     .join('\n')
 }
@@ -218,6 +241,156 @@ async function withCompatibilityHandling(io: CliIo, action: () => Promise<void>)
   }
 }
 
+function packageVersion(): string {
+  try {
+    return String(require('../package.json').version ?? '0.0.0')
+  } catch {
+    return '0.0.0'
+  }
+}
+
+function doctorLine(ok: boolean, label: string, detail: string): string {
+  return `${ok ? 'ok' : 'warn'} ${label}: ${detail}`
+}
+
+async function runDoctor(path: string): Promise<string> {
+  const root = await findRepoRoot(path)
+  const lines: string[] = []
+  const nodeMajor = Number.parseInt(process.versions.node.split('.')[0] ?? '', 10)
+  lines.push(doctorLine(SUPPORTED_NODE_MAJORS.has(nodeMajor), 'node', `${process.versions.node} (supported: ${supportedNodeMajors.join(', ')})`))
+  lines.push(doctorLine(true, 'better-sqlite3', 'native module loaded through @codesift/core'))
+
+  const rg = spawnSync(process.platform === 'win32' ? 'rg.exe' : 'rg', ['--version'], { encoding: 'utf8' })
+  lines.push(doctorLine(rg.status === 0, 'rg', rg.status === 0 ? firstLine(rg.stdout) : 'missing from PATH'))
+
+  const repo = await openRepo(root)
+  try {
+    try {
+      const status = await repo.status()
+      lines.push(doctorLine(status.indexExists, 'index', status.indexExists ? `${status.chunkCount} chunks, compat=${status.compatibility.ok ? 'ok' : status.compatibility.code ?? 'mismatch'}` : 'missing; run codesift index'))
+      if (status.sync.state === 'failed' || status.sync.state === 'aborted') {
+        lines.push(doctorLine(false, 'sync', `${status.sync.state}: ${status.sync.error ?? 'no error recorded'}`))
+      } else {
+        lines.push(doctorLine(true, 'sync', status.sync.state))
+      }
+    } catch (error) {
+      lines.push(doctorLine(false, 'index', `status unavailable: ${compactLine(extractDoctorError(error), 180)}`))
+      lines.push(doctorLine(false, 'sync', 'unknown; repair or rebuild the index'))
+    }
+  } finally {
+    await repo.close()
+  }
+  lines.push(await daemonDoctorLine())
+
+  const config = readConfig(root)
+  const providerId = config.provider?.trim()
+  const provider = providerId ? listEmbeddingProviders().find((candidate) => candidate.id === providerId) : undefined
+  if (provider?.isLearned) {
+    const keyName = provider.id.startsWith('openai') ? 'OPENAI_API_KEY' : provider.id.startsWith('voyage') ? 'VOYAGE_API_KEY' : ''
+    lines.push(doctorLine(!keyName || Boolean(process.env[keyName]?.trim()), 'cloud-key', keyName ? `${keyName} ${process.env[keyName]?.trim() ? 'set' : 'missing'}` : `${provider.id} selected`))
+    lines.push(doctorLine(config.allowSecrets === true, 'cloud-secrets', config.allowSecrets === true ? 'allowSecrets enabled' : 'secret scan blocks cloud sends unless --allow-secrets is used'))
+  } else {
+    lines.push(doctorLine(true, 'egress', 'local/offline provider path'))
+  }
+
+  return lines.join('\n')
+}
+
+function extractDoctorError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  const abi = process.versions.modules ? ` NODE_MODULE_VERSION=${process.versions.modules}` : ''
+  return /NODE_MODULE_VERSION|ERR_DLOPEN_FAILED|better-sqlite3/i.test(message)
+    ? `${message}${abi}; reinstall with a supported Node major`
+    : message
+}
+
+async function daemonDoctorLine(): Promise<string> {
+  const socketPath = process.env.CODESIFT_DAEMON_SOCKET ?? getDefaultDaemonSocketPath()
+  if (!process.env.CODESIFT_DAEMON_SOCKET && !existsSync(socketPath)) {
+    return doctorLine(true, 'daemon', 'not running; direct CLI/MCP startup is available')
+  }
+
+  const reachable = await canConnectToDaemonSocket(socketPath)
+  return doctorLine(reachable, 'daemon', reachable ? `socket reachable: ${socketPath}` : `socket not reachable: ${socketPath}`)
+}
+
+async function canConnectToDaemonSocket(socketPath: string): Promise<boolean> {
+  return new Promise((resolveConnect) => {
+    const socket = createConnection(socketPath)
+    let settled = false
+    const settle = (reachable: boolean) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      socket.destroy()
+      resolveConnect(reachable)
+    }
+    socket.setTimeout(300)
+    socket.once('connect', () => settle(true))
+    socket.once('error', () => settle(false))
+    socket.once('timeout', () => settle(false))
+  })
+}
+
+function firstLine(value: string | undefined): string {
+  return (value ?? '').split(/\r?\n/)[0]?.trim() || 'available'
+}
+
+function compactLine(value: string, maxChars: number): string {
+  const compact = value.replace(/\s+/g, ' ').trim()
+  return compact.length <= maxChars ? compact : `${compact.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`
+}
+
+function buildMcpServerConfig(root: string): Record<string, unknown> {
+  return {
+    command: 'npx',
+    args: ['-y', `codesift@${packageVersion()}`, 'mcp', root]
+  }
+}
+
+function formatMcpConfig(root: string): string {
+  return JSON.stringify({ mcpServers: { codesift: buildMcpServerConfig(root) } }, null, 2)
+}
+
+async function mergeWriteProjectMcpConfig(root: string): Promise<string> {
+  const target = resolve(root, '.mcp.json')
+  let existing: Record<string, unknown> = {}
+  try {
+    existing = JSON.parse(await readFile(target, 'utf8')) as Record<string, unknown>
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      return formatMcpConfig(root)
+    }
+  }
+
+  const backup = `${target}.bak`
+  try {
+    await copyFile(target, backup)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error
+    }
+  }
+
+  const mcpServers = typeof existing.mcpServers === 'object' && existing.mcpServers !== null
+    ? { ...(existing.mcpServers as Record<string, unknown>) }
+    : {}
+  mcpServers.codesift = buildMcpServerConfig(root)
+  const next = { ...existing, mcpServers }
+  await mkdir(dirname(target), { recursive: true })
+  const temp = `${target}.${process.pid}.tmp`
+  await writeFile(temp, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+  await rename(temp, target)
+  return `wrote ${target}${Object.keys(existing).length > 0 ? ` (backup: ${backup})` : ''}`
+}
+
+async function exampleQueries(repo: Awaited<ReturnType<typeof openRepo>>): Promise<string[]> {
+  const hits = await repo.search('function class method interface', { k: 4, context: 'min', maxTokens: 120 })
+  const symbols = [...new Set(hits.map((hit) => hit.symbol).filter((symbol): symbol is string => Boolean(symbol)))]
+  return symbols.slice(0, 2).map((symbol) => `sym ${symbol}`)
+}
+
 async function waitForTermination(stop: () => Promise<void>): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     let stopping = false
@@ -241,6 +414,13 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
   const program = new Command()
 
   program.name('codesift').description(getCliDescription()).version('0.0.0')
+
+  program
+    .command('doctor')
+    .argument('[path]', 'repository path', process.cwd())
+    .action(async (path: string) => {
+      io.stdout(await runDoctor(path))
+    })
 
   program
     .command('index')
@@ -270,6 +450,48 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
     })
 
   program
+    .command('init')
+    .argument('[path]', 'repository path', process.cwd())
+    .option('--print', 'print MCP config instead of writing it')
+    .option('--client <client>', 'client config target (project only; other values print)', DEFAULT_INIT_CLIENT)
+    .action(async (path: string, options: { print?: boolean; client: string }) => {
+      const root = await findRepoRoot(path)
+      if (options.print) {
+        io.stdout(formatMcpConfig(root))
+        return
+      }
+
+      const repo = await openRepo(root)
+      try {
+        io.stdout(`Initializing ${root}`)
+        const result = await repo.sync({
+          onProgress(event) {
+            io.stderr(`indexing batch ${event.batch}/${event.totalBatches} (${event.completedChunks}/${event.totalChunks} chunks)`)
+          }
+        })
+        const examples = await exampleQueries(repo)
+        const smoke = await repo.search(examples[0]?.replace(/^sym\s+/, '') || 'function', { k: 1, context: 'min', maxTokens: 80 })
+        if (smoke.length === 0) {
+          io.stderr('smoke query returned no hits; index exists but no symbols were detected')
+        }
+        if (options.client !== DEFAULT_INIT_CLIENT) {
+          io.stdout(formatMcpConfig(root))
+          io.stderr(`client=${options.client} is ambiguous here; printed config instead of writing`)
+          return
+        }
+
+        io.stdout(await mergeWriteProjectMcpConfig(root))
+        io.stdout(`Indexed ${result.indexedFiles} files (${result.skippedFiles} skipped, ${result.skippedSymlinks} symlink skips).`)
+        io.stdout('Local/offline by default; cloud embedding providers are opt-in only.')
+        if (examples.length > 0) {
+          io.stdout(`Try:\n${examples.map((example) => `  codesift ${example} --repo ${root}`).join('\n')}`)
+        }
+      } finally {
+        await repo.close()
+      }
+    })
+
+  program
     .command('search')
     .argument('<query>', 'natural language or symbol-aware query')
     .option('-k, --k <count>', 'number of hits', String(DEFAULT_SEARCH_K))
@@ -278,7 +500,7 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
     .option('--path <glob>', 'path glob filter, e.g. src/**')
     .option('--kind <kind>', 'symbol kind filter for matching chunks')
     .option('--max-tokens <tokens>', 'token budget for compact snippets')
-    .option('--context <mode>', 'inline policy: sig or body')
+    .option('--context <mode>', 'output policy: auto, min, sig, body, or graph')
     .option('--with-usages', 'bundle top-N import-resolved/local usage sites for the top definition hit')
     .option('--rerank', 'opt-in reranker re-scoring for NL-concept queries (requires a configured reranker)')
     .option('--json', 'print JSON results')
@@ -286,57 +508,63 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
     .action(
       async (
         query: string,
-        options: { k: string; repo: string; lang?: string; path?: string; kind?: string; maxTokens?: string; context?: 'sig' | 'body'; withUsages?: boolean; rerank?: boolean; json?: boolean; compact?: boolean }
+        options: { k: string; repo: string; lang?: string; path?: string; kind?: string; maxTokens?: string; context?: 'auto' | 'min' | 'sig' | 'body' | 'graph'; withUsages?: boolean; rerank?: boolean; json?: boolean; compact?: boolean }
       ) => {
         await withCompatibilityHandling(io, async () => {
           const repo = await openRepo(options.repo)
-          const languages = parseCsvList(options.lang)
-          const searchOptions: {
-            k: number
-            lang?: string[]
-            pathGlob?: string
-            kind?: SymbolKind
-            maxTokens?: number
-            context?: 'sig' | 'body'
-            withUsages?: boolean
-            rerank?: boolean
-          } = {
-            k: Number(options.k)
-          }
+          try {
+            const status = await repo.status()
+            if (!status.indexExists) {
+              io.stdout(NOT_INDEXED_SENTINEL)
+              return
+            }
+            const languages = parseCsvList(options.lang)
+            const searchOptions: {
+              k: number
+              lang?: string[]
+              pathGlob?: string
+              kind?: SymbolKind
+              maxTokens?: number
+              context?: 'auto' | 'min' | 'sig' | 'body' | 'graph'
+              withUsages?: boolean
+              rerank?: boolean
+            } = {
+              k: Number(options.k),
+              maxTokens: options.maxTokens === undefined ? DEFAULT_MCP_SEARCH_MAX_TOKENS : Number(options.maxTokens)
+            }
 
-          if (languages) {
-            searchOptions.lang = languages
-          }
+            if (languages) {
+              searchOptions.lang = languages
+            }
 
-          if (options.path) {
-            searchOptions.pathGlob = options.path
-          }
+            if (options.path) {
+              searchOptions.pathGlob = options.path
+            }
 
-          if (options.kind) {
-            searchOptions.kind = options.kind as SymbolKind
-          }
+            if (options.kind) {
+              searchOptions.kind = options.kind as SymbolKind
+            }
 
-          if (options.maxTokens !== undefined) {
-            searchOptions.maxTokens = Number(options.maxTokens)
-          }
-          if (options.context !== undefined) {
-            searchOptions.context = options.context
-          }
-          if (options.withUsages) {
-            searchOptions.withUsages = true
-          }
-          if (options.rerank) {
-            searchOptions.rerank = true
-          }
+            if (options.context !== undefined) {
+              searchOptions.context = options.context
+            }
+            if (options.withUsages) {
+              searchOptions.withUsages = true
+            }
+            if (options.rerank) {
+              searchOptions.rerank = true
+            }
 
-          const hits = await repo.search(query, searchOptions)
-          const output = options.json ? JSON.stringify(hits, null, 2) : options.compact ? formatCompactHits(hits) : formatHits(hits)
-          const status = await repo.status()
+            const hits = await repo.search(query, searchOptions)
+            const output = options.json ? JSON.stringify(hits, null, 2) : options.compact ? formatCompactHits(hits) : formatHits(hits)
 
-          io.stdout(output)
+            io.stdout(output)
 
-          if (status.vectorSearch.state === 'unavailable' && status.vectorSearch.message) {
-            io.stderr(formatVectorStatus(status))
+            if (status.vectorSearch.state === 'unavailable' && status.vectorSearch.message) {
+              io.stderr(formatVectorStatus(status))
+            }
+          } finally {
+            await repo.close()
           }
         })
       }
@@ -351,21 +579,31 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
     .action(async (name: string, options: { repo: string; path?: string; kind?: string }) => {
       await withCompatibilityHandling(io, async () => {
         const repo = await openRepo(options.repo)
-        const findOptions: {
-          pathGlob?: string
-          kind?: SymbolKind
-        } = {}
+        try {
+          const status = await repo.status()
+          if (!status.indexExists) {
+            io.stdout(NOT_INDEXED_SENTINEL)
+            return
+          }
+          const findOptions: {
+            pathGlob?: string
+            kind?: SymbolKind
+            maxTokens?: number
+          } = {}
 
-        if (options.path) {
-          findOptions.pathGlob = options.path
+          if (options.path) {
+            findOptions.pathGlob = options.path
+          }
+
+          if (options.kind) {
+            findOptions.kind = options.kind as SymbolKind
+          }
+
+          const definitions = await repo.findSymbol(name, findOptions)
+          io.stdout(formatSymbols(definitions))
+        } finally {
+          await repo.close()
         }
-
-        if (options.kind) {
-          findOptions.kind = options.kind as SymbolKind
-        }
-
-        const definitions = await repo.findSymbol(name, findOptions)
-        io.stdout(formatSymbols(definitions))
       })
     })
 
@@ -384,6 +622,7 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
     .option('--lang <langs>', 'comma-separated language filter, e.g. ts,typescript,python')
     .option('--path <glob>', 'path glob filter, e.g. src/**')
     .option('--max-matches <count>', 'maximum matches to print')
+    .option('--max-tokens <tokens>', 'token budget for text output')
     .option('--json', 'print JSON results')
     .option('--compact', 'print token-efficient compact results')
     .action(
@@ -402,6 +641,7 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
           lang?: string
           path?: string
           maxMatches?: string
+          maxTokens?: string
           json?: boolean
           compact?: boolean
         }
@@ -413,43 +653,57 @@ export async function runCli(argv = process.argv, io: CliIo = defaultIo): Promis
           }
 
           const repo = await openRepo(options.repo)
-          const languages = parseCsvList(options.lang)
-          const grepOptions: GrepOptions = {}
+          try {
+            const status = await repo.status()
+            if (!status.indexExists) {
+              io.stdout(NOT_INDEXED_SENTINEL)
+              return
+            }
+            const languages = parseCsvList(options.lang)
+            const grepOptions: GrepOptions = {}
 
-          if (options.regex) {
-            grepOptions.regex = true
-          }
-          if (options.ignoreCase) {
-            grepOptions.ignoreCase = true
-          }
-          if (options.wordRegexp) {
-            grepOptions.wholeWord = true
-          }
-          if (options.multiline) {
-            grepOptions.multiline = true
-          }
-          if (languages) {
-            grepOptions.lang = languages
-          }
-          if (options.path) {
-            grepOptions.pathGlob = options.path
-          }
-          if (options.context !== undefined) {
-            grepOptions.contextLines = Number(options.context)
-          }
-          if (options.beforeContext !== undefined) {
-            grepOptions.beforeContextLines = Number(options.beforeContext)
-          }
-          if (options.afterContext !== undefined) {
-            grepOptions.afterContextLines = Number(options.afterContext)
-          }
-          if (options.maxMatches !== undefined) {
-            grepOptions.maxMatches = Number(options.maxMatches)
-          }
+            if (options.regex) {
+              grepOptions.regex = true
+            }
+            if (options.ignoreCase) {
+              grepOptions.ignoreCase = true
+            }
+            if (options.wordRegexp) {
+              grepOptions.wholeWord = true
+            }
+            if (options.multiline) {
+              grepOptions.multiline = true
+            }
+            if (languages) {
+              grepOptions.lang = languages
+            }
+            if (options.path) {
+              grepOptions.pathGlob = options.path
+            }
+            if (options.context !== undefined) {
+              grepOptions.contextLines = Number(options.context)
+            }
+            if (options.beforeContext !== undefined) {
+              grepOptions.beforeContextLines = Number(options.beforeContext)
+            }
+            if (options.afterContext !== undefined) {
+              grepOptions.afterContextLines = Number(options.afterContext)
+            }
+            if (options.maxMatches !== undefined) {
+              grepOptions.maxMatches = Number(options.maxMatches)
+            }
 
-          const hits = await repo.grep(pattern, grepOptions)
-          const output = options.json ? JSON.stringify(hits, null, 2) : options.compact ? formatCompactGrepHits(hits) : formatGrepHits(hits)
-          io.stdout(output)
+            const hits = await repo.grep(pattern, grepOptions)
+            const maxTokens = options.maxTokens === undefined ? DEFAULT_MCP_GREP_MAX_TOKENS : Number(options.maxTokens)
+            const output = options.json
+              ? JSON.stringify(hits, null, 2)
+              : options.compact
+                ? formatCompactGrepHits(hits)
+                : formatMcpGrepHits(hits, { maxTokens })
+            io.stdout(output)
+          } finally {
+            await repo.close()
+          }
         })
       }
     )

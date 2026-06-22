@@ -31,6 +31,7 @@ describe('codesift CLI formatters', () => {
       formatStatus({
         root: '/tmp/codesift',
         indexPath: '/tmp/codesift/.codesift/index.db',
+        indexExists: false,
         indexed: false,
         stale: false,
         sync: { state: 'idle' },
@@ -95,6 +96,50 @@ describe('codesift CLI capability labels', () => {
 })
 
 describe('codesift CLI end-to-end', () => {
+  it('doctor reports native, index, and daemon diagnostics without requiring an index', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-cli-doctor-'))
+    temporaryDirectories.push(repoRoot)
+
+    const messages: string[] = []
+    const io: CliIo = {
+      stdout(message) {
+        messages.push(message)
+      },
+      stderr(message) {
+        messages.push(`ERR:${message}`)
+      }
+    }
+
+    await runCli(['node', 'codesift', 'doctor', repoRoot], io)
+
+    expect(messages[0]).toContain('better-sqlite3: native module loaded through @codesift/core')
+    expect(messages[0]).toContain('index: missing; run codesift index')
+    expect(messages[0]).toContain('daemon:')
+  })
+
+  it('doctor reports corrupt index status instead of throwing', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-cli-doctor-corrupt-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, '.codesift'), { recursive: true })
+    await writeFile(join(repoRoot, '.codesift', 'index.db'), 'not a sqlite database', 'utf8')
+
+    const messages: string[] = []
+    const io: CliIo = {
+      stdout(message) {
+        messages.push(message)
+      },
+      stderr(message) {
+        messages.push(`ERR:${message}`)
+      }
+    }
+
+    await runCli(['node', 'codesift', 'doctor', repoRoot], io)
+
+    expect(messages[0]).toContain('index: status unavailable:')
+    expect(messages[0]).toContain('sync: unknown; repair or rebuild the index')
+  })
+
   it('indexes, searches, and resolves symbols with repo-aware options', async () => {
     const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-cli-'))
     temporaryDirectories.push(repoRoot)

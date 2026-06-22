@@ -75,6 +75,20 @@ export interface SymbolRelations {
   omitted?: number
 }
 
+export interface ResultMetadata {
+  notIndexed?: boolean
+  emptyReason?: 'not_indexed' | 'no_definition' | 'no_edges'
+  definitionCount?: number
+  ambiguousDefCount?: number
+  partialMatchCount?: number
+  nameOnlyUnscoped?: number
+  nameOnlyLimit?: number
+}
+
+export type ResultList<T> = T[] & {
+  meta?: ResultMetadata
+}
+
 export interface SearchHit {
   id: string
   file: string
@@ -97,6 +111,11 @@ export interface SearchHit {
    * TS/JS + Python and resolved via imports/local bindings, not a type checker.
    */
   usages?: SymbolUsage[]
+  /**
+   * Bounded relation bundle for a confident definition hit. This is the same
+   * persisted-edge payload used by find_symbol, attached only when budget allows.
+   */
+  relations?: SymbolRelations
   language?: string
   symbol?: string
   parent?: string
@@ -132,6 +151,8 @@ export interface SymbolDefinition {
   signature?: string
   parent?: string
   language?: string
+  matchQuality?: 'exact' | 'partial'
+  ambiguousDefCount?: number
   /**
    * Full enclosing-symbol source for the top exact match when body inlining is
    * enabled. Dedented and blank-collapsed, then capped like a search hit body
@@ -160,7 +181,12 @@ export interface SearchOptions {
    * `'sig'` never inlines (compact only); `undefined` is AUTO — inline rank-1
    * always, rank-2 only if within the score margin of rank-1.
    */
-  context?: 'sig' | 'body'
+  context?: 'auto' | 'min' | 'sig' | 'body' | 'graph'
+  /**
+   * Attach a bounded relation bundle to a confident top definition. Undefined
+   * means AUTO: enabled for single-best definition hits when budget allows.
+   */
+  withRelations?: boolean
   /**
    * Bundle top-N usage sites for the top DEFINITION hit when supported. Honest
    * scope: import-resolved/local only, currently TS/JS + Python.
@@ -205,6 +231,15 @@ export interface FindSymbolOptions {
    * sites plus same-file neighbors. Default false.
    */
   withCallers?: boolean
+  /**
+   * Approx output token budget used to decide whether default-on relations fit.
+   */
+  maxTokens?: number
+  /**
+   * Detail tier for the top exact definition. `sig` keeps the response compact
+   * and skips body inlining; `body` is the default one-call mode.
+   */
+  detail?: 'sig' | 'body'
 }
 
 export interface FindEdgeOptions {
@@ -220,6 +255,10 @@ export interface FindEdgeOptions {
    * Approx output token budget for the returned edge rows.
    */
   maxTokens?: number
+  /**
+   * Optional hard cap for relation rows before token budgeting.
+   */
+  maxResults?: number
 }
 
 export interface FindImportersOptions {
@@ -263,11 +302,35 @@ export interface ImpactNode extends EdgeResult {
 
 export interface ImpactResult {
   nodes: ImpactNode[]
+  notIndexed?: boolean
+  emptyReason?: ResultMetadata['emptyReason']
   impactTruncated?: boolean
   depthCapped?: boolean
   nodesCapped?: boolean
   depthLimit: number
   maxNodes: number
+}
+
+export interface ChangesetFileContext {
+  file: string
+  symbols: SymbolDefinition[]
+  callers: EdgeResult[]
+  importers: EdgeResult[]
+  omitted?: number
+  omittedLowerBound?: boolean
+}
+
+export interface ChangesetContextOptions {
+  maxFiles?: number
+  maxEdgesPerFile?: number
+  maxTokens?: number
+}
+
+export interface ChangesetContextResult {
+  files: ChangesetFileContext[]
+  stale?: boolean
+  truncated?: boolean
+  notIndexed?: boolean
 }
 
 export interface SyncProgressEvent {
@@ -314,6 +377,8 @@ export interface RepoSyncStatus {
   startedAt?: string
   completedAt?: string
   error?: string
+  completedChunks?: number
+  totalChunks?: number
 }
 
 export interface WatchOptions {
@@ -367,6 +432,7 @@ export interface IndexCompatibilityStatus {
 export interface RepoStatus {
   root: string
   indexPath: string
+  indexExists: boolean
   indexed: boolean
   stale: boolean
   staleReasons?: RepoStaleReason[]
@@ -392,14 +458,15 @@ export interface ReadRangeOptions {
 export interface Repo {
   readonly root: string
   sync(options?: SyncOptions): Promise<SyncResult>
-  search(query: string, options?: SearchOptions): Promise<SearchHit[]>
-  grep(pattern: string, options?: GrepOptions): Promise<GrepHit[]>
-  findSymbol(name: string, options?: FindSymbolOptions): Promise<SymbolDefinition[]>
-  findCallers(name: string, options?: FindEdgeOptions): Promise<EdgeResult[]>
+  search(query: string, options?: SearchOptions): Promise<ResultList<SearchHit>>
+  grep(pattern: string, options?: GrepOptions): Promise<ResultList<GrepHit>>
+  findSymbol(name: string, options?: FindSymbolOptions): Promise<ResultList<SymbolDefinition>>
+  findCallers(name: string, options?: FindEdgeOptions): Promise<ResultList<EdgeResult>>
   impact(name: string, options?: ImpactOptions): Promise<ImpactResult>
-  findReferences(name: string, options?: FindEdgeOptions): Promise<EdgeResult[]>
-  findImplementers(name: string, options?: FindEdgeOptions): Promise<EdgeResult[]>
-  findImporters(file: string, options?: FindImportersOptions): Promise<EdgeResult[]>
+  findReferences(name: string, options?: FindEdgeOptions): Promise<ResultList<EdgeResult>>
+  findImplementers(name: string, options?: FindEdgeOptions): Promise<ResultList<EdgeResult>>
+  findImporters(file: string, options?: FindImportersOptions): Promise<ResultList<EdgeResult>>
+  changesetContext(files: string[], options?: ChangesetContextOptions): Promise<ChangesetContextResult>
   readChunk(id: string, options?: ReadChunkOptions): Promise<string>
   readRange(file: string, startLine: number, endLine: number, options?: ReadRangeOptions): Promise<string>
   status(): Promise<RepoStatus>

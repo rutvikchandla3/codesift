@@ -48,7 +48,6 @@
       "queryId": "escape-regexp-symbol",
       "queryType": "symbol-def",
       "axes": [
-        "latency.cold",
         "precision"
       ]
     },
@@ -90,7 +89,6 @@
       "queryType": "nl-concept",
       "axes": [
         "latency.cold",
-        "latency.warm",
         "tokens"
       ]
     },
@@ -107,7 +105,8 @@
       "queryId": "m3-go-method-symbol",
       "queryType": "symbol-def",
       "axes": [
-        "latency.cold"
+        "latency.cold",
+        "tokens"
       ]
     },
     {
@@ -123,7 +122,8 @@
       "queryId": "m3-java-method-symbol",
       "queryType": "symbol-def",
       "axes": [
-        "latency.cold"
+        "latency.cold",
+        "tokens"
       ]
     },
     {
@@ -139,7 +139,8 @@
       "queryId": "m3-ruby-method-symbol",
       "queryType": "symbol-def",
       "axes": [
-        "latency.cold"
+        "latency.cold",
+        "tokens"
       ]
     },
     {
@@ -155,7 +156,8 @@
       "queryId": "m3-rust-method-symbol",
       "queryType": "symbol-def",
       "axes": [
-        "latency.cold"
+        "latency.cold",
+        "tokens"
       ]
     }
   ]
