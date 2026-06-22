@@ -1497,7 +1497,17 @@ export class SqliteRepo implements Repo {
     }
 
     const db = new Database(this.indexPath)
-    this.configureDatabase(db, 'WAL')
+    try {
+      this.configureDatabase(db, 'WAL')
+    } catch (error) {
+      try {
+        db.close()
+      } catch {
+        // Preserve the schema/open error; this close is only to avoid leaking
+        // handles for corrupt databases, especially on Windows.
+      }
+      throw error
+    }
     this.vectorExtensionLoaded = false
     this.db = db
     return db

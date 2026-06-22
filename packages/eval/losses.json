@@ -48,6 +48,7 @@
       "queryId": "escape-regexp-symbol",
       "queryType": "symbol-def",
       "axes": [
+        "latency.cold",
         "precision"
       ]
     },
@@ -89,6 +90,7 @@
       "queryType": "nl-concept",
       "axes": [
         "latency.cold",
+        "latency.warm",
         "tokens"
       ]
     },

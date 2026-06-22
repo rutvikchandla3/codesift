@@ -44,7 +44,7 @@ afterEach(async () => {
 
   await Promise.all(
     temporaryDirectories.splice(0).map(async (directory) => {
-      await rm(directory, { recursive: true, force: true })
+      await rm(directory, { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 5 : 0, retryDelay: 100 })
     })
   )
 })
@@ -374,11 +374,15 @@ export function mintFreshToken(subject: string): string {
     )
 
     const repo = await openRepo(repoRoot)
-    await repo.sync()
-    const hits = await repo.search('common token', { k: 1, pathGlob: 'zzz/**' })
+    try {
+      await repo.sync()
+      const hits = await repo.search('common token', { k: 1, pathGlob: 'zzz/**' })
 
-    expect(hits.map((hit) => hit.file)).toEqual(['zzz/target.ts'])
-  })
+      expect(hits.map((hit) => hit.file)).toEqual(['zzz/target.ts'])
+    } finally {
+      await repo.close()
+    }
+  }, 15_000)
 
   it('registers embedding providers and routes document/query roles with batched progress', async () => {
     const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-batch-'))
