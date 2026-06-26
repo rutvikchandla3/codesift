@@ -21,6 +21,7 @@ import {
   createRouter,
   createStdioServer,
   callMcpTool,
+  handleMcpJsonRpcRequest,
   formatMcpCallers,
   formatMcpChangesetContext,
   formatMcpGrepHits,
@@ -270,6 +271,35 @@ describe('@codesift/mcp server', () => {
     expect(await router.readChunk({ id: hits[0]!.id })).toContain("return 'demo'")
     expect((await router.indexStatus()).indexed).toBe(true)
     expect(DEFAULT_SEARCH_K).toBe(8)
+  })
+
+  it('accepts top-level MCP request metadata on tools/call in the daemon-compatible JSON-RPC path', async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), 'codesift-mcp-meta-'))
+    temporaryDirectories.push(repoRoot)
+
+    await mkdir(join(repoRoot, 'src'), { recursive: true })
+    await writeFile(
+      join(repoRoot, 'src', 'demo.ts'),
+      `export function demoValue(): string {\n  return 'demo'\n}\n`,
+      'utf8'
+    )
+
+    const repo = await openRepo(repoRoot)
+    await repo.sync()
+
+    const response = await handleMcpJsonRpcRequest(repo, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: {
+        name: 'search_code',
+        arguments: { query: 'demoValue', k: 1 },
+        _meta: { progressToken: 1 }
+      }
+    })
+
+    expect(mcpText(response)).toContain('src/demo.ts')
+    expect(mcpText(response)).toContain("return 'demo'")
   })
 
   it('routes graph tool calls through the core repo contract', async () => {

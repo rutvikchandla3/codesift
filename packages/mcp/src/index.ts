@@ -351,10 +351,13 @@ const changesetContextArgsSchema = z.object(changesetContextInputSchema).strict(
 const grepCodeArgsSchema = z.object(grepCodeInputSchema).strict()
 const readChunkArgsSchema = z.object(readChunkInputSchema).strict()
 const indexStatusArgsSchema = z.object(indexStatusInputSchema).strict()
+// MCP clients may attach top-level request metadata such as `_meta.progressToken`
+// (and future protocol fields) to `tools/call` params. The daemon/stdio shim only
+// needs `name` + `arguments`, so strip unknown keys instead of rejecting them.
 const toolCallParamsSchema = z.object({
   name: z.enum(MCP_TOOL_NAMES),
   arguments: z.unknown().optional()
-}).strict()
+})
 
 class StdioMcpServerHandle implements McpServerHandle {
   readonly transport = 'stdio' as const
